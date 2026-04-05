@@ -181,6 +181,109 @@
   color: var(--text-muted);
 }
 
+/* Project Selector */
+.project-selector-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.project-selector-btn:hover {
+  background: var(--bg-surface);
+  border-color: var(--accent);
+}
+
+.project-selector-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--bg-surface);
+}
+
+.project-input {
+  flex: 1;
+  min-width: 120px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.3);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.9rem;
+}
+
+.project-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.project-submit,
+.project-cancel {
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.project-submit:hover {
+  background: var(--accent);
+  color: white;
+}
+
+.project-cancel {
+  padding: 8px 10px;
+  background: transparent;
+}
+
+.project-cancel:hover {
+  background: rgba(255, 126, 126, 0.15);
+}
+
+.recent-projects {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  width: 100%;
+  margin-top: 8px;
+}
+
+.recent-label {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.recent-project-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.recent-project-btn:hover {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
 @media (max-width: 840px) {
   .panel-shell {
     padding: 16px;

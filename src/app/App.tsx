@@ -1,13 +1,14 @@
 import { useEffect, useState } from 'react';
 import { ActivityCardHost } from '../features/activity-card/ActivityCardHost';
 import { OnboardingPanel } from '../features/onboarding/OnboardingPanel';
+import { ProjectSelector } from '../features/project-selector/ProjectSelector';
 import { BrokerClient } from '../lib/broker/client';
 import type { JumpTarget } from '../lib/jump/types';
 import type { ProjectSnapshotProjection } from '../lib/projections/types';
 import { buildProjectSnapshot } from '../lib/projections/project-snapshot';
 import { getCapabilityStatus } from '../lib/platform/capabilities';
 import { jumpToTarget } from '../lib/platform/jump';
-import { loadLocalSettings } from '../lib/settings/local-settings';
+import { loadLocalSettings, saveCurrentProject } from '../lib/settings/local-settings';
 import { useAppStore } from '../lib/store/use-app-store';
 import { PanelRoute } from './routes/panel';
 import '../styles/tokens.css';
@@ -18,6 +19,7 @@ export function App() {
   const store = useAppStore();
   const [snapshot, setSnapshot] = useState<ProjectSnapshotProjection | null>(null);
   const [pendingApprovalIds, setPendingApprovalIds] = useState<Set<string>>(new Set());
+  const [currentProject, setCurrentProject] = useState<string>(settings.currentProject);
 
   useEffect(() => {
     let disposed = false;
@@ -25,7 +27,7 @@ export function App() {
 
     const refreshSnapshot = async () => {
       try {
-        const seed = await client.loadProjectSeed('intent-broker');
+        const seed = await client.loadProjectSeed(currentProject);
 
         if (!disposed) {
           const nextSnapshot = buildProjectSnapshot(seed);
@@ -50,7 +52,12 @@ export function App() {
       unsubscribe();
       disconnect();
     };
-  }, [settings.brokerUrl]);
+  }, [settings.brokerUrl, currentProject]);
+
+  const handleProjectChange = (project: string) => {
+    setCurrentProject(project);
+    saveCurrentProject(project);
+  };
 
   const handleJump = async (target: JumpTarget) => {
     await jumpToTarget(target);
@@ -77,7 +84,7 @@ export function App() {
         decision,
       });
 
-      const seed = await client.loadProjectSeed('intent-broker');
+      const seed = await client.loadProjectSeed(currentProject);
       const nextSnapshot = buildProjectSnapshot(seed);
       store.setSnapshot(nextSnapshot);
       setSnapshot(nextSnapshot);
@@ -91,7 +98,13 @@ export function App() {
     <main className="panel-shell">
       <header className="panel-hero">
         <h1>HexDeck</h1>
-        <p>Menu bar companion bootstrap complete.</p>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <ProjectSelector
+            currentProject={currentProject}
+            recentProjects={settings.recentProjects}
+            onProjectChange={handleProjectChange}
+          />
+        </div>
       </header>
       {snapshot === null ? (
         <OnboardingPanel
