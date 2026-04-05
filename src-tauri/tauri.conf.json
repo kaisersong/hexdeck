@@ -6,19 +6,9 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
-    "devUrl": "http://localhost:1420",
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [
-      {
-        "title": "HexDeck",
-        "width": 1280,
-        "height": 800
-      }
-    ]
-  },
-  "bundle": {
-    "active": false
+    "windows": []
   }
 }
