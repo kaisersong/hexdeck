@@ -23,7 +23,7 @@
       "endpoints": [
         "https://github.com/kaisersong/hexdeck/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkLWNvbW1lbnQ6IGtleSBmb3IgaGV4ZGVjawo=MCowBQYDK2VwAyEAcK+NVUP8tvh6sxUw2QGhWk4R7mtJI+zdYa9PbREo3Zc="
+      "pubkey": "dW50cnVzdGVkLWNvbW1lbnQ6IGtleSBmb3IgaGV4ZGVjawo=MCowBQYDK2VwAyEAMGxroUukMXhLFSaf/Eluxa+tFNMW6Xfy4h6uqpM9T6k="
     }
   },
   "app": {
