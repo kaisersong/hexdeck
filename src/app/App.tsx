@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { ActivityCardHost } from '../features/activity-card/ActivityCardHost';
 import { OnboardingPanel } from '../features/onboarding/OnboardingPanel';
 import { ProjectSelector } from '../features/project-selector/ProjectSelector';
+import { SettingsPanel } from '../features/settings/SettingsPanel';
 import { BrokerClient } from '../lib/broker/client';
 import type { JumpTarget } from '../lib/jump/types';
 import type { ProjectSnapshotProjection } from '../lib/projections/types';
@@ -20,6 +21,7 @@ export function App() {
   const [snapshot, setSnapshot] = useState<ProjectSnapshotProjection | null>(null);
   const [pendingApprovalIds, setPendingApprovalIds] = useState<Set<string>>(new Set());
   const [currentProject, setCurrentProject] = useState<string>(settings.currentProject);
+  const [showSettings, setShowSettings] = useState(false);
 
   useEffect(() => {
     let disposed = false;
@@ -104,9 +106,18 @@ export function App() {
             recentProjects={settings.recentProjects}
             onProjectChange={handleProjectChange}
           />
+          <button
+            className="settings-btn"
+            onClick={() => setShowSettings(!showSettings)}
+            title="Settings"
+          >
+            {showSettings ? '←' : '⚙'}
+          </button>
         </div>
       </header>
-      {snapshot === null ? (
+      {showSettings ? (
+        <SettingsPanel />
+      ) : snapshot === null ? (
         <OnboardingPanel
           brokerUrl={settings.brokerUrl}
           globalShortcut={settings.globalShortcut}

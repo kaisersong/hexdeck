@@ -1,0 +1,19 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicerobot/tauri/dev/crates/tauri-utils/schema.json",
+  "identifier": "default",
+  "description": "Default capabilities for HexDeck",
+  "windows": ["panel"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-close",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "notification:default",
+    "global-shortcut:default",
+    "updater:default",
+    "process:allow-exit",
+    "process:allow-restart"
+  ]
+}

@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod commands;
+
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -483,10 +485,17 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             jump_with_ghostty,
             jump_with_iterm,
-            jump_with_terminal_app
+            jump_with_terminal_app,
+            commands::get_installed_broker_version,
+            commands::get_installed_broker_path,
+            commands::fetch_latest_broker_release,
+            commands::install_broker_update,
+            commands::is_broker_running
         ])
         .setup(|app| {
             let _panel = WebviewWindowBuilder::new(

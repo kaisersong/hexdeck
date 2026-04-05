@@ -306,3 +306,160 @@
     align-items: flex-start;
   }
 }
+
+/* Settings Panel */
+.settings-panel {
+  display: grid;
+  gap: 18px;
+}
+
+.update-section {
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: rgba(13, 21, 36, 0.9);
+  padding: 18px 20px;
+}
+
+.update-section h2 {
+  margin: 0 0 16px;
+  font-size: 1rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.update-status {
+  display: grid;
+  gap: 12px;
+}
+
+.update-checking,
+.update-uptodate,
+.update-complete {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+
+.update-available {
+  display: grid;
+  gap: 12px;
+}
+
+.update-available p {
+  margin: 0;
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.release-notes {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  background: var(--bg-surface);
+}
+
+.release-notes summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.release-notes pre {
+  margin: 12px 0 0;
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 8px;
+  font-size: 0.8rem;
+  overflow-x: auto;
+  white-space: pre-wrap;
+}
+
+.update-warning {
+  padding: 8px 12px;
+  border: 1px solid rgba(255, 196, 92, 0.4);
+  border-radius: 8px;
+  background: rgba(255, 196, 92, 0.1);
+  color: #ffc45c;
+  font-size: 0.85rem;
+}
+
+.update-error {
+  padding: 8px 12px;
+  border: 1px solid rgba(255, 126, 126, 0.4);
+  border-radius: 8px;
+  background: rgba(255, 126, 126, 0.1);
+  color: var(--critical);
+  font-size: 0.85rem;
+}
+
+.download-progress progress {
+  width: 100%;
+  height: 8px;
+  border-radius: 4px;
+  appearance: none;
+  background: var(--bg-surface);
+}
+
+.download-progress progress::-webkit-progress-bar {
+  background: var(--bg-surface);
+  border-radius: 4px;
+}
+
+.download-progress progress::-webkit-progress-value {
+  background: var(--accent);
+  border-radius: 4px;
+}
+
+.update-check-btn,
+.update-install-btn {
+  padding: 10px 16px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.update-check-btn:hover,
+.update-install-btn:hover {
+  background: var(--bg-surface);
+  border-color: var(--accent);
+}
+
+.update-check-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.update-install-btn {
+  background: var(--accent);
+  color: white;
+}
+
+.update-install-btn:hover {
+  background: var(--accent);
+  filter: brightness(1.1);
+}
+
+/* Settings Button */
+.settings-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 1.1rem;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.settings-btn:hover {
+  background: var(--accent-soft);
+  color: var(--text);
+}
