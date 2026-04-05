@@ -430,3 +430,57 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running hexdeck");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_new_title_returns_none_when_alias_present() {
+        let result = format_new_title("projects · @claude2", "@claude2", None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_format_new_title_appends_to_existing() {
+        let result = format_new_title("projects", "@claude2", None);
+        assert_eq!(result, Some("projects · @claude2".to_string()));
+    }
+
+    #[test]
+    fn test_format_new_title_includes_project() {
+        let result = format_new_title("projects", "@claude2", Some("hexdeck"));
+        assert_eq!(result, Some("projects · hexdeck · @claude2".to_string()));
+    }
+
+    #[test]
+    fn test_format_new_title_handles_empty_current() {
+        let result = format_new_title("", "@claude2", Some("hexdeck"));
+        assert_eq!(result, Some("hexdeck · @claude2".to_string()));
+    }
+
+    #[test]
+    fn test_format_new_title_ignores_default_titles() {
+        // "ghostty" is a default title, should be replaced
+        let result = format_new_title("ghostty", "@claude2", Some("hexdeck"));
+        assert_eq!(result, Some("hexdeck · @claude2".to_string()));
+
+        // "Terminal" is also a default
+        let result = format_new_title("Terminal", "@claude2", None);
+        assert_eq!(result, Some("@claude2".to_string()));
+    }
+
+    #[test]
+    fn test_format_new_title_avoids_duplicate_project() {
+        // If project already in title, don't duplicate
+        let result = format_new_title("hexdeck work", "@claude2", Some("hexdeck"));
+        assert_eq!(result, Some("hexdeck work · @claude2".to_string()));
+    }
+
+    #[test]
+    fn test_format_new_title_ignores_shell_prompt_titles() {
+        // Titles like "root@host:" are shell prompts, ignore them
+        let result = format_new_title("root@xiaok: ~", "@claude2", Some("hexdeck"));
+        assert_eq!(result, Some("hexdeck · @claude2".to_string()));
+    }
+}
