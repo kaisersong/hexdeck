@@ -35,5 +35,6 @@ export interface ProjectSeed {
   health: BrokerHealth;
   participants: BrokerParticipant[];
   workStates: BrokerWorkState[];
+  /** Raw broker replay slice from /events/replay?after=0; not project-scoped. */
   events: BrokerEvent[];
 }
