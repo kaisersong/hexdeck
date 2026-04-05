@@ -1,3 +1,5 @@
+import type { JumpPrecision, JumpTarget } from '../jump/types';
+
 export type ProjectionPriority = 'critical' | 'attention' | 'ambient';
 
 export interface OverviewProjection {
@@ -15,6 +17,8 @@ export interface AgentCardProjection {
   workState: string;
   summary: string;
   updatedAtLabel: string;
+  jumpPrecision?: JumpPrecision;
+  jumpTarget?: JumpTarget | null;
 }
 
 export interface AttentionItemProjection {
