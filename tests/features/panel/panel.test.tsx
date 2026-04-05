@@ -1,5 +1,6 @@
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
+import { App } from '../../../src/app/App';
 import { PanelRoute } from '../../../src/app/routes/panel';
 
 describe('PanelRoute', () => {
@@ -25,5 +26,13 @@ describe('PanelRoute', () => {
     expect(screen.getByText('Now')).toBeInTheDocument();
     expect(screen.getByText('Attention')).toBeInTheDocument();
     expect(screen.getByText('Recent')).toBeInTheDocument();
+  });
+});
+
+describe('App integration', () => {
+  it('shows onboarding when broker data has not loaded yet', () => {
+    render(<App />);
+
+    expect(screen.getByText('Broker connection')).toBeInTheDocument();
   });
 });
