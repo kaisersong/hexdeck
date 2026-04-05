@@ -40,6 +40,12 @@ enum TitleActions {
         #[arg(short, long)]
         project: Option<String>,
     },
+    /// Clear alias from the current terminal title
+    Clear {
+        /// The broker alias to remove, e.g., "@claude2"
+        #[arg(short, long)]
+        alias: String,
+    },
 }
 
 // ============================================================================
@@ -372,6 +378,62 @@ fn execute_title_append(alias: &str, project: Option<&str>) -> Result<(), String
     Ok(())
 }
 
+/// Remove alias from title, preserving the rest.
+fn clear_alias_from_title(current: &str, alias: &str) -> Option<String> {
+    if !current.contains(alias) {
+        return None; // Alias not in title, nothing to clear
+    }
+
+    let separator = " · ";
+
+    // Remove the alias and any trailing separator
+    let cleaned = current
+        .replace(&format!("{}{}", separator, alias), "")
+        .replace(&format!("{}{}{}", separator, alias, separator), separator)
+        .replace(alias, "");
+
+    // Clean up leading/trailing separators and whitespace
+    let result = cleaned
+        .trim()
+        .trim_start_matches('·')
+        .trim_end_matches('·')
+        .trim()
+        .to_string();
+
+    if result.is_empty() {
+        None // Would result in empty title
+    } else {
+        Some(result)
+    }
+}
+
+/// Execute the title clear CLI action.
+fn execute_title_clear(alias: &str) -> Result<(), String> {
+    // Get parent tty for OSC fallback
+    let tty_path = get_parent_tty()?;
+
+    // Detect terminal and try to get current title
+    let term_program = detect_terminal();
+    let current_title = match term_program.as_deref() {
+        Some("iTerm.app") | Some("Apple_Terminal") => {
+            get_terminal_title_via_applescript(&term_program.unwrap()).unwrap_or_default()
+        }
+        Some("ghostty") => {
+            get_ghostty_title_for_tty(&tty_path).unwrap_or_default()
+        }
+        _ => String::new(),
+    };
+
+    // Remove alias from title
+    let new_title = clear_alias_from_title(&current_title, alias)
+        .ok_or_else(|| "alias_not_in_title_or_would_be_empty".to_string())?;
+
+    // Set title via OSC sequence
+    set_title_via_osc(&tty_path, &new_title)?;
+
+    Ok(())
+}
+
 // ============================================================================
 // Main Entry Point (dual mode: CLI or GUI)
 // ============================================================================
@@ -388,6 +450,18 @@ fn main() {
             Some(Commands::Title { action }) => match action {
                 TitleActions::Append { alias, project } => {
                     match execute_title_append(&alias, project.as_deref()) {
+                        Ok(()) => {
+                            println!("ok");
+                            std::process::exit(0);
+                        }
+                        Err(reason) => {
+                            eprintln!("error: {reason}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                TitleActions::Clear { alias } => {
+                    match execute_title_clear(&alias) {
                         Ok(()) => {
                             println!("ok");
                             std::process::exit(0);
@@ -482,5 +556,35 @@ mod tests {
         // Titles like "root@host:" are shell prompts, ignore them
         let result = format_new_title("root@xiaok: ~", "@claude2", Some("hexdeck"));
         assert_eq!(result, Some("hexdeck · @claude2".to_string()));
+    }
+
+    #[test]
+    fn test_clear_alias_from_title_removes_alias() {
+        let result = clear_alias_from_title("projects · @claude2", "@claude2");
+        assert_eq!(result, Some("projects".to_string()));
+    }
+
+    #[test]
+    fn test_clear_alias_from_title_handles_middle_alias() {
+        let result = clear_alias_from_title("projects · @claude2 · working", "@claude2");
+        assert_eq!(result, Some("projects · working".to_string()));
+    }
+
+    #[test]
+    fn test_clear_alias_from_title_returns_none_when_alias_not_present() {
+        let result = clear_alias_from_title("projects", "@claude2");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_clear_alias_from_title_returns_none_for_empty_result() {
+        let result = clear_alias_from_title("@claude2", "@claude2");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_clear_alias_from_title_preserves_project() {
+        let result = clear_alias_from_title("hexdeck · @claude2", "@claude2");
+        assert_eq!(result, Some("hexdeck".to_string()));
     }
 }
