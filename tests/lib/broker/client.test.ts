@@ -7,7 +7,8 @@ describe('BrokerClient', () => {
       .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify([{ alias: 'codex4', context: { projectName: 'intent-broker' } }]), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify([{ participantId: 'codex-session-aa59e6ef', status: 'implementing' }]), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify([{ id: 1282, type: 'report_progress' }]), { status: 200 }));
+      .mockResolvedValueOnce(new Response(JSON.stringify([{ id: 1282, type: 'report_progress' }]), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [{ approvalId: 'approval-1', taskId: 'task-1' }] }), { status: 200 }));
 
     const client = new BrokerClient({
       brokerUrl: 'http://127.0.0.1:4318',
@@ -23,12 +24,14 @@ describe('BrokerClient', () => {
       'http://127.0.0.1:4318/health',
       'http://127.0.0.1:4318/participants?projectName=intent-broker',
       'http://127.0.0.1:4318/work-state?projectName=intent-broker',
-      'http://127.0.0.1:4318/events/replay?after=0'
+      'http://127.0.0.1:4318/events/replay?after=0',
+      'http://127.0.0.1:4318/projects/intent-broker/approvals?status=pending'
     ]);
     expect(snapshot.health.ok).toBe(true);
     expect(snapshot.participants[0].alias).toBe('codex4');
     expect(snapshot.workStates[0].status).toBe('implementing');
     expect(snapshot.events[0].id).toBe(1282);
+    expect(snapshot.approvals[0].approvalId).toBe('approval-1');
   });
 
   it('converts broker urls to websocket urls and returns a cleanup handle', () => {
@@ -134,5 +137,66 @@ describe('BrokerClient', () => {
 
     expect(received).toEqual([{ id: 1282, type: 'report_progress' }]);
     expect(fakeSocket.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('loads pending approvals for a project', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          items: [{ approvalId: 'approval-1', taskId: 'task-1', summary: 'Deploy approval needed' }],
+        }),
+        { status: 200 }
+      )
+    );
+
+    const client = new BrokerClient({
+      brokerUrl: 'http://127.0.0.1:4318',
+      fetchImpl: fetchMock as typeof fetch,
+      websocketFactory: () => {
+        throw new Error('not used');
+      },
+    });
+
+    const approvals = await client.loadPendingApprovals('intent-broker');
+
+    expect(approvals[0].approvalId).toBe('approval-1');
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:4318/projects/intent-broker/approvals?status=pending'
+    );
+  });
+
+  it('responds to an approval through the broker API', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ approval: { approvalId: 'approval-1' } }), { status: 200 })
+    );
+
+    const client = new BrokerClient({
+      brokerUrl: 'http://127.0.0.1:4318',
+      fetchImpl: fetchMock as typeof fetch,
+      websocketFactory: () => {
+        throw new Error('not used');
+      },
+    });
+
+    await client.respondToApproval({
+      approvalId: 'approval-1',
+      taskId: 'task-1',
+      fromParticipantId: 'human.local',
+      decision: 'approved',
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:4318/approvals/approval-1/respond',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          taskId: 'task-1',
+          fromParticipantId: 'human.local',
+          decision: 'approved',
+        }),
+      })
+    );
   });
 });

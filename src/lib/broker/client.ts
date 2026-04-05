@@ -1,4 +1,6 @@
 import type {
+  BrokerApprovalItem,
+  BrokerApprovalResponseInput,
   BrokerEvent,
   BrokerHealth,
   BrokerParticipant,
@@ -38,19 +40,48 @@ export class BrokerClient {
 
   async loadProjectSeed(projectName: string): Promise<ProjectSeed> {
     const encodedProjectName = encodeURIComponent(projectName);
-    const [health, participants, workStates, events] = await Promise.all([
+    const [health, participants, workStates, events, approvals] = await Promise.all([
       this.request<BrokerHealth>('/health'),
       this.request<BrokerParticipant[]>(`/participants?projectName=${encodedProjectName}`),
       this.request<BrokerWorkState[]>(`/work-state?projectName=${encodedProjectName}`),
-      this.request<BrokerEvent[]>('/events/replay?after=0')
+      this.request<BrokerEvent[]>('/events/replay?after=0'),
+      this.loadPendingApprovals(projectName),
     ]);
 
     return {
       health,
       participants,
       workStates,
-      events
+      events,
+      approvals,
     };
+  }
+
+  async loadPendingApprovals(projectName: string): Promise<BrokerApprovalItem[]> {
+    const encodedProjectName = encodeURIComponent(projectName);
+    const payload = await this.request<{ items: BrokerApprovalItem[] }>(
+      `/projects/${encodedProjectName}/approvals?status=pending`
+    );
+    return payload.items;
+  }
+
+  async respondToApproval(input: BrokerApprovalResponseInput): Promise<void> {
+    const response = await this.fetchImpl(
+      `${this.brokerUrl}/approvals/${encodeURIComponent(input.approvalId)}/respond`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          taskId: input.taskId,
+          fromParticipantId: input.fromParticipantId,
+          decision: input.decision,
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`broker_approval_failed ${response.status}`);
+    }
   }
 
   subscribe(listener: BrokerEventListener): () => void {

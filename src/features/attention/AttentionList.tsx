@@ -1,6 +1,16 @@
 import type { AttentionItemProjection } from '../../lib/projections/types';
 
-export function AttentionList({ items }: { items: AttentionItemProjection[] }) {
+export function AttentionList({
+  items,
+  pendingApprovalIds,
+  onApprove,
+  onDeny,
+}: {
+  items: AttentionItemProjection[];
+  pendingApprovalIds?: Set<string>;
+  onApprove?: (approvalId: string, taskId?: string) => void;
+  onDeny?: (approvalId: string, taskId?: string) => void;
+}) {
   return (
     <section className="panel-section" aria-labelledby="attention-title">
       <div className="panel-section-header">
@@ -14,6 +24,28 @@ export function AttentionList({ items }: { items: AttentionItemProjection[] }) {
             <li key={`${item.kind}-${index}`} className={`stack-card stack-card--${item.priority}`}>
               <span className="stack-card__badge">{item.kind}</span>
               <p className="stack-card__summary">{item.summary}</p>
+              {item.kind === 'approval' && item.approvalId ? (
+                <div className="stack-card__actions">
+                  <button
+                    type="button"
+                    className="action-button"
+                    disabled={pendingApprovalIds?.has(item.approvalId)}
+                    onClick={() => onApprove?.(item.approvalId!, item.taskId)}
+                    aria-label={`Approve ${item.approvalId}`}
+                  >
+                    Approve
+                  </button>
+                  <button
+                    type="button"
+                    className="action-button"
+                    disabled={pendingApprovalIds?.has(item.approvalId)}
+                    onClick={() => onDeny?.(item.approvalId!, item.taskId)}
+                    aria-label={`Deny ${item.approvalId}`}
+                  >
+                    Deny
+                  </button>
+                </div>
+              ) : null}
             </li>
           ))}
         </ul>

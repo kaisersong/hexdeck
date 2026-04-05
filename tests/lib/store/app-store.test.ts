@@ -19,4 +19,14 @@ describe('createAppStore', () => {
 
     expect(store.getState().snapshot?.overview.onlineCount).toBe(2);
   });
+
+  it('tracks in-flight approval actions', () => {
+    const store = createAppStore();
+
+    store.startApprovalAction('approval-1');
+    expect(store.getState().pendingApprovalIds.has('approval-1')).toBe(true);
+
+    store.finishApprovalAction('approval-1');
+    expect(store.getState().pendingApprovalIds.has('approval-1')).toBe(false);
+  });
 });

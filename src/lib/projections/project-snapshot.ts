@@ -53,12 +53,15 @@ export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjecti
       });
     }
   }
-  for (const event of seed.events) {
-    if (event.type === 'request_approval') {
+  for (const approval of seed.approvals) {
+    if ((approval.decision ?? 'pending') === 'pending') {
       attention.push({
         kind: 'approval',
         priority: 'critical',
-        summary: String(event.payload?.summary ?? 'Approval requested'),
+        summary: approval.summary ?? 'Approval requested',
+        approvalId: approval.approvalId,
+        taskId: approval.taskId,
+        approvalDecision: approval.decision ?? 'pending',
       });
     }
   }
@@ -69,7 +72,7 @@ export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjecti
       onlineCount: seed.participants.length,
       busyCount: seed.workStates.filter((item) => item.status === 'implementing').length,
       blockedCount: seed.workStates.filter((item) => item.status === 'blocked').length,
-      pendingApprovalCount: seed.events.filter((event) => event.type === 'request_approval').length,
+      pendingApprovalCount: seed.approvals.filter((approval) => (approval.decision ?? 'pending') === 'pending').length,
     },
     now,
     attention,

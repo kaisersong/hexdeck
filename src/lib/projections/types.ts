@@ -27,6 +27,9 @@ export interface AttentionItemProjection {
   summary: string;
   actorLabel?: string;
   jumpTarget?: JumpTarget | null;
+  approvalId?: string;
+  taskId?: string;
+  approvalDecision?: 'approved' | 'denied' | 'pending';
 }
 
 export interface RecentItemProjection {

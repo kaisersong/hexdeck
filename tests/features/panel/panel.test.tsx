@@ -66,6 +66,37 @@ describe('PanelRoute', () => {
 
     expect(screen.getByRole('button', { name: 'Jump to @codex4' })).toBeInTheDocument();
   });
+
+  it('renders Approve and Deny buttons for approval attention items', () => {
+    render(
+      <PanelRoute
+        snapshot={{
+          overview: {
+            brokerHealthy: true,
+            onlineCount: 1,
+            busyCount: 0,
+            blockedCount: 0,
+            pendingApprovalCount: 1,
+          },
+          now: [],
+          attention: [
+            {
+              kind: 'approval',
+              priority: 'critical',
+              summary: 'Deploy approval needed',
+              approvalId: 'approval-1',
+              taskId: 'task-1',
+              approvalDecision: 'pending',
+            },
+          ],
+          recent: [],
+        }}
+      />
+    );
+
+    expect(screen.getByRole('button', { name: 'Approve approval-1' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Deny approval-1' })).toBeInTheDocument();
+  });
 });
 
 describe('ActivityCardHost', () => {
@@ -91,6 +122,26 @@ describe('ActivityCardHost', () => {
     );
 
     expect(within(container).getByRole('button', { name: 'Jump to @codex4' })).toBeInTheDocument();
+  });
+
+  it('renders Approve and Deny buttons for approval cards', () => {
+    const { container } = render(
+      <ActivityCardHost
+        items={[
+          {
+            kind: 'approval',
+            priority: 'critical',
+            summary: 'Deploy approval needed',
+            approvalId: 'approval-1',
+            taskId: 'task-1',
+            approvalDecision: 'pending',
+          },
+        ]}
+      />
+    );
+
+    expect(within(container).getByRole('button', { name: 'Approve approval-1' })).toBeInTheDocument();
+    expect(within(container).getByRole('button', { name: 'Deny approval-1' })).toBeInTheDocument();
   });
 });
 

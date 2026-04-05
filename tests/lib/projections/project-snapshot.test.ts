@@ -15,7 +15,14 @@ describe('buildProjectSnapshot', () => {
       ],
       events: [
         { id: 1282, type: 'report_progress', payload: { summary: 'Working on HexDeck' } },
-        { id: 1283, type: 'request_approval', payload: { summary: 'Deploy approval needed' } },
+      ],
+      approvals: [
+        {
+          approvalId: 'approval-1',
+          taskId: 'task-1',
+          summary: 'Deploy approval needed',
+          decision: 'pending',
+        },
       ],
     });
 
@@ -43,6 +50,7 @@ describe('buildProjectSnapshot', () => {
       ],
       workStates: [{ participantId: 'a', status: 'implementing', summary: 'Working' }],
       events: [],
+      approvals: [],
     });
 
     expect(snapshot.now[0].jumpPrecision).toBe('exact');
@@ -53,5 +61,26 @@ describe('buildProjectSnapshot', () => {
       sessionHint: 'ghostty-tab-1',
       projectPath: '/Users/song/projects/intent-broker',
     });
+  });
+
+  it('includes pending approvals in attention with approval metadata', () => {
+    const snapshot = buildProjectSnapshot({
+      health: { ok: true },
+      participants: [],
+      workStates: [],
+      events: [],
+      approvals: [
+        {
+          approvalId: 'approval-1',
+          taskId: 'task-1',
+          summary: 'Deploy approval needed',
+          decision: 'pending',
+        },
+      ],
+    });
+
+    expect(snapshot.attention[0].kind).toBe('approval');
+    expect(snapshot.attention[0].approvalId).toBe('approval-1');
+    expect(snapshot.attention[0].approvalDecision).toBe('pending');
   });
 });

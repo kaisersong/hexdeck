@@ -8,13 +8,16 @@ import { buildProjectSnapshot } from '../lib/projections/project-snapshot';
 import { getCapabilityStatus } from '../lib/platform/capabilities';
 import { jumpToTarget } from '../lib/platform/jump';
 import { loadLocalSettings } from '../lib/settings/local-settings';
+import { useAppStore } from '../lib/store/use-app-store';
 import { PanelRoute } from './routes/panel';
 import '../styles/tokens.css';
 import '../styles/panel.css';
 
 export function App() {
   const settings = loadLocalSettings();
+  const store = useAppStore();
   const [snapshot, setSnapshot] = useState<ProjectSnapshotProjection | null>(null);
+  const [pendingApprovalIds, setPendingApprovalIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     let disposed = false;
@@ -25,7 +28,9 @@ export function App() {
         const seed = await client.loadProjectSeed('intent-broker');
 
         if (!disposed) {
-          setSnapshot(buildProjectSnapshot(seed));
+          const nextSnapshot = buildProjectSnapshot(seed);
+          store.setSnapshot(nextSnapshot);
+          setSnapshot(nextSnapshot);
         }
       } catch {
         if (!disposed) {
@@ -51,6 +56,37 @@ export function App() {
     await jumpToTarget(target);
   };
 
+  const respondToApproval = async (
+    approvalId: string,
+    taskId: string | undefined,
+    decision: 'approved' | 'denied'
+  ) => {
+    if (!taskId) {
+      return;
+    }
+
+    const client = new BrokerClient({ brokerUrl: settings.brokerUrl });
+    store.startApprovalAction(approvalId);
+    setPendingApprovalIds(new Set(store.getState().pendingApprovalIds));
+
+    try {
+      await client.respondToApproval({
+        approvalId,
+        taskId,
+        fromParticipantId: 'human.local',
+        decision,
+      });
+
+      const seed = await client.loadProjectSeed('intent-broker');
+      const nextSnapshot = buildProjectSnapshot(seed);
+      store.setSnapshot(nextSnapshot);
+      setSnapshot(nextSnapshot);
+    } finally {
+      store.finishApprovalAction(approvalId);
+      setPendingApprovalIds(new Set(store.getState().pendingApprovalIds));
+    }
+  };
+
   return (
     <main className="panel-shell">
       <header className="panel-hero">
@@ -65,8 +101,20 @@ export function App() {
         />
       ) : (
         <>
-          <ActivityCardHost items={snapshot.attention} onJump={handleJump} />
-          <PanelRoute snapshot={snapshot} onJump={handleJump} />
+          <ActivityCardHost
+            items={snapshot.attention}
+            onJump={handleJump}
+            pendingApprovalIds={pendingApprovalIds}
+            onApprove={(approvalId, taskId) => void respondToApproval(approvalId, taskId, 'approved')}
+            onDeny={(approvalId, taskId) => void respondToApproval(approvalId, taskId, 'denied')}
+          />
+          <PanelRoute
+            snapshot={snapshot}
+            onJump={handleJump}
+            pendingApprovalIds={pendingApprovalIds}
+            onApprove={(approvalId, taskId) => void respondToApproval(approvalId, taskId, 'approved')}
+            onDeny={(approvalId, taskId) => void respondToApproval(approvalId, taskId, 'denied')}
+          />
         </>
       )}
     </main>
