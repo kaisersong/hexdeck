@@ -148,6 +148,22 @@
   font-size: 0.84rem;
 }
 
+.stack-card__actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.action-button {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 8px 12px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
 .stack-card__badge {
   display: inline-flex;
   margin-bottom: 8px;

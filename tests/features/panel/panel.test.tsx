@@ -1,7 +1,8 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { App } from '../../../src/app/App';
 import { PanelRoute } from '../../../src/app/routes/panel';
+import { ActivityCardHost } from '../../../src/features/activity-card/ActivityCardHost';
 
 describe('PanelRoute', () => {
   it('renders overview, now, attention, and recent sections', () => {
@@ -26,6 +27,70 @@ describe('PanelRoute', () => {
     expect(screen.getByText('Now')).toBeInTheDocument();
     expect(screen.getByText('Attention')).toBeInTheDocument();
     expect(screen.getByText('Recent')).toBeInTheDocument();
+  });
+
+  it('renders Jump actions for jump-capable cards', () => {
+    render(
+      <PanelRoute
+        snapshot={{
+          overview: {
+            brokerHealthy: true,
+            onlineCount: 1,
+            busyCount: 1,
+            blockedCount: 0,
+            pendingApprovalCount: 0,
+          },
+          now: [
+            {
+              participantId: 'a',
+              alias: 'codex4',
+              toolLabel: 'codex',
+              workState: 'implementing',
+              summary: 'Working',
+              updatedAtLabel: 'just now',
+              jumpPrecision: 'exact',
+              jumpTarget: {
+                participantId: 'a',
+                terminalApp: 'Ghostty',
+                precision: 'exact',
+                sessionHint: 'ghostty-tab-1',
+                projectPath: '/repo',
+              },
+            },
+          ],
+          attention: [],
+          recent: [],
+        }}
+      />
+    );
+
+    expect(screen.getByRole('button', { name: 'Jump to @codex4' })).toBeInTheDocument();
+  });
+});
+
+describe('ActivityCardHost', () => {
+  it('renders a Jump action for critical cards with jump targets', () => {
+    const { container } = render(
+      <ActivityCardHost
+        items={[
+          {
+            kind: 'blocked',
+            priority: 'critical',
+            summary: 'Waiting on schema decision',
+            actorLabel: '@codex4',
+            jumpTarget: {
+              participantId: 'a',
+              terminalApp: 'Ghostty',
+              precision: 'exact',
+              sessionHint: 'ghostty-tab-1',
+              projectPath: '/repo',
+            },
+          },
+        ]}
+      />
+    );
+
+    expect(within(container).getByRole('button', { name: 'Jump to @codex4' })).toBeInTheDocument();
   });
 });
 

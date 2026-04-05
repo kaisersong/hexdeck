@@ -1,6 +1,13 @@
 import type { AgentCardProjection } from '../../lib/projections/types';
+import type { JumpTarget } from '../../lib/jump/types';
 
-export function NowList({ items }: { items: AgentCardProjection[] }) {
+export function NowList({
+  items,
+  onJump,
+}: {
+  items: AgentCardProjection[];
+  onJump?: (target: JumpTarget) => void;
+}) {
   return (
     <section className="panel-section" aria-labelledby="now-title">
       <div className="panel-section-header">
@@ -20,7 +27,20 @@ export function NowList({ items }: { items: AgentCardProjection[] }) {
               <p className="stack-card__meta">
                 <span>{item.workState}</span>
                 <span>{item.updatedAtLabel}</span>
+                {item.jumpPrecision ? <span>Jump: {item.jumpPrecision}</span> : null}
               </p>
+              {item.jumpTarget && item.jumpPrecision !== 'unsupported' ? (
+                <div className="stack-card__actions">
+                  <button
+                    type="button"
+                    className="action-button"
+                    onClick={() => onJump?.(item.jumpTarget!)}
+                    aria-label={`Jump to @${item.alias}`}
+                  >
+                    Jump
+                  </button>
+                </div>
+              ) : null}
             </li>
           ))}
         </ul>

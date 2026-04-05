@@ -1,4 +1,5 @@
 import type { ProjectSeed } from '../broker/types';
+import { buildJumpTarget } from '../jump/targets';
 import { buildRecentFeed } from './recent-feed';
 import type {
   AgentCardProjection,
@@ -9,8 +10,24 @@ import type {
 export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjection {
   const byParticipant = new Map(seed.participants.map((participant) => [participant.participantId, participant]));
 
+  const buildParticipantJumpTarget = (participantId: string) => {
+    const participant = byParticipant.get(participantId);
+    const metadata = (participant as { metadata?: Record<string, unknown> } | undefined)?.metadata;
+
+    return buildJumpTarget({
+      participantId,
+      alias: participant?.alias ?? participantId,
+      toolLabel: participant?.tool ?? 'agent',
+      terminalApp: String(metadata?.terminalApp ?? 'unknown'),
+      sessionHint: typeof metadata?.sessionHint === 'string' ? metadata.sessionHint : null,
+      projectPath: typeof metadata?.projectPath === 'string' ? metadata.projectPath : null,
+    });
+  };
+
   const now: AgentCardProjection[] = seed.workStates.slice(0, 5).map((workState) => {
     const participant = byParticipant.get(workState.participantId);
+    const jumpTarget = buildParticipantJumpTarget(workState.participantId);
+
     return {
       participantId: workState.participantId,
       alias: participant?.alias ?? workState.participantId,
@@ -18,16 +35,21 @@ export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjecti
       workState: workState.status,
       summary: workState.summary ?? workState.status,
       updatedAtLabel: workState.updatedAt ?? 'just now',
+      jumpPrecision: jumpTarget.precision,
+      jumpTarget,
     };
   });
 
   const attention: AttentionItemProjection[] = [];
   for (const workState of seed.workStates) {
     if (workState.status === 'blocked') {
+      const participant = byParticipant.get(workState.participantId);
       attention.push({
         kind: 'blocked',
         priority: 'critical',
         summary: workState.summary ?? `${workState.participantId} is blocked`,
+        actorLabel: participant ? `@${participant.alias}` : undefined,
+        jumpTarget: buildParticipantJumpTarget(workState.participantId),
       });
     }
   }

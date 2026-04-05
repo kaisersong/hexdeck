@@ -24,4 +24,34 @@ describe('buildProjectSnapshot', () => {
     expect(snapshot.attention[0].kind).toBe('blocked');
     expect(snapshot.attention[1].kind).toBe('approval');
   });
+
+  it('adds jump metadata to now cards', () => {
+    const snapshot = buildProjectSnapshot({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'a',
+          alias: 'codex4',
+          tool: 'codex',
+          context: { projectName: 'intent-broker' },
+          metadata: {
+            terminalApp: 'Ghostty',
+            sessionHint: 'ghostty-tab-1',
+            projectPath: '/Users/song/projects/intent-broker',
+          },
+        } as any,
+      ],
+      workStates: [{ participantId: 'a', status: 'implementing', summary: 'Working' }],
+      events: [],
+    });
+
+    expect(snapshot.now[0].jumpPrecision).toBe('exact');
+    expect(snapshot.now[0].jumpTarget).toEqual({
+      participantId: 'a',
+      terminalApp: 'Ghostty',
+      precision: 'exact',
+      sessionHint: 'ghostty-tab-1',
+      projectPath: '/Users/song/projects/intent-broker',
+    });
+  });
 });

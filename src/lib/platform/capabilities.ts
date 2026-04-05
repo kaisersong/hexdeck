@@ -1,6 +1,7 @@
 export interface CapabilityStatus {
   notifications: 'unknown' | 'ready' | 'blocked';
   globalShortcut: 'unknown' | 'ready' | 'blocked';
+  jumpSupport: 'exact' | 'best_effort' | 'blocked' | 'unknown';
 }
 
 function getNotificationCapability(): CapabilityStatus['notifications'] {
@@ -23,5 +24,6 @@ export function getCapabilityStatus(): CapabilityStatus {
   return {
     notifications: getNotificationCapability(),
     globalShortcut: 'unknown',
+    jumpSupport: 'unknown',
   };
 }

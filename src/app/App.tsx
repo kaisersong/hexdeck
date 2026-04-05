@@ -2,9 +2,11 @@ import { useEffect, useState } from 'react';
 import { ActivityCardHost } from '../features/activity-card/ActivityCardHost';
 import { OnboardingPanel } from '../features/onboarding/OnboardingPanel';
 import { BrokerClient } from '../lib/broker/client';
+import type { JumpTarget } from '../lib/jump/types';
 import type { ProjectSnapshotProjection } from '../lib/projections/types';
 import { buildProjectSnapshot } from '../lib/projections/project-snapshot';
 import { getCapabilityStatus } from '../lib/platform/capabilities';
+import { jumpToTarget } from '../lib/platform/jump';
 import { loadLocalSettings } from '../lib/settings/local-settings';
 import { PanelRoute } from './routes/panel';
 import '../styles/tokens.css';
@@ -45,6 +47,10 @@ export function App() {
     };
   }, [settings.brokerUrl]);
 
+  const handleJump = async (target: JumpTarget) => {
+    await jumpToTarget(target);
+  };
+
   return (
     <main className="panel-shell">
       <header className="panel-hero">
@@ -59,8 +65,8 @@ export function App() {
         />
       ) : (
         <>
-          <ActivityCardHost items={snapshot.attention} />
-          <PanelRoute snapshot={snapshot} />
+          <ActivityCardHost items={snapshot.attention} onJump={handleJump} />
+          <PanelRoute snapshot={snapshot} onJump={handleJump} />
         </>
       )}
     </main>

@@ -25,6 +25,8 @@ export interface AttentionItemProjection {
   kind: 'blocked' | 'approval' | 'broker-alert' | 'handoff';
   priority: ProjectionPriority;
   summary: string;
+  actorLabel?: string;
+  jumpTarget?: JumpTarget | null;
 }
 
 export interface RecentItemProjection {

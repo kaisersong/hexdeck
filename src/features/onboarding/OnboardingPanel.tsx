@@ -32,6 +32,10 @@ export function OnboardingPanel({
           <dt>Shortcut status</dt>
           <dd>{capabilities.globalShortcut}</dd>
         </div>
+        <div>
+          <dt>Jump support</dt>
+          <dd>{capabilities.jumpSupport}</dd>
+        </div>
       </dl>
     </section>
   );
