@@ -313,188 +313,134 @@
   gap: 18px;
 }
 
-/* Onboarding Panel with Agent Status */
+/* Onboarding Panel - Simplified */
 .panel-onboarding {
   display: grid;
-  gap: 24px;
+  gap: 20px;
 }
 
-.hexdeck-logo {
-  text-align: center;
-  padding: 20px 0;
-}
-
-.hexdeck-logo-img {
-  width: 120px;
-  height: 120px;
-  margin: 0 auto 16px;
-  display: block;
-  filter: drop-shadow(0 0 20px rgba(56, 189, 248, 0.3));
-}
-
-.hexdeck-title {
-  margin: 0;
-  font-size: 2rem;
-  letter-spacing: -0.03em;
-  background: linear-gradient(135deg, #38bdf8 0%, #a78bfa 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
-
-.hexdeck-subtitle {
-  margin: 8px 0 0;
-  color: var(--text-muted);
-  font-size: 0.95rem;
-}
-
-.connection-status {
-  display: grid;
-  gap: 8px;
-  padding: 16px;
-  background: rgba(0, 0, 0, 0.2);
-  border-radius: 12px;
-  border: 1px solid var(--border);
-}
-
-.status-indicator {
+.onboarding-header {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 0.9rem;
-  color: var(--text);
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
 }
 
-.status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  display: inline-block;
+.onboarding-logo {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  opacity: 0.9;
 }
 
-.status-dot.online {
-  background: #6bdf9c;
-  box-shadow: 0 0 8px rgba(107, 223, 156, 0.5);
+.onboarding-title h1 {
+  margin: 0;
+  font-size: 1.2rem;
+  letter-spacing: -0.02em;
 }
 
-.status-dot.offline {
-  background: #ff7e7e;
-  box-shadow: 0 0 8px rgba(255, 126, 126, 0.5);
-}
-
-.broker-url {
-  font-size: 0.85rem;
+.onboarding-title p {
+  margin: 4px 0 0;
+  font-size: 0.8rem;
   color: var(--text-muted);
-  padding: 8px 12px;
-  background: rgba(0, 0, 0, 0.3);
-  border-radius: 8px;
-  font-family: monospace;
 }
 
+/* Agent Status */
 .agent-status-section {
   display: grid;
-  gap: 12px;
+  gap: 10px;
 }
 
 .agent-status-section h2 {
   margin: 0;
-  font-size: 0.85rem;
-  letter-spacing: 0.08em;
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--text-muted);
 }
 
-.agent-grid {
+.agent-list {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-  gap: 12px;
+  gap: 6px;
 }
 
-.agent-card {
-  padding: 14px;
-  background: rgba(0, 0, 0, 0.2);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  display: grid;
-  gap: 8px;
-  transition: border-color 0.15s, box-shadow 0.15s;
-}
-
-.agent-card:hover {
-  border-color: var(--accent);
-  box-shadow: 0 0 12px rgba(56, 189, 248, 0.15);
-}
-
-.agent-card.placeholder {
-  grid-column: 1 / -1;
-  text-align: center;
-  padding: 24px;
-}
-
-.agent-card.placeholder p {
-  margin: 0;
-  color: var(--text-muted);
-}
-
-.agent-hint {
-  font-size: 0.85rem;
-  margin-top: 8px !important;
-  opacity: 0.7;
-}
-
-.agent-header {
+.agent-item {
   display: flex;
   align-items: center;
   gap: 8px;
+  padding: 8px 10px;
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 8px;
+  font-size: 0.9rem;
 }
 
-.agent-dot {
-  width: 8px;
-  height: 8px;
+.agent-status-dot {
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
+  background: #6bdf9c;
+  box-shadow: 0 0 6px rgba(107, 223, 156, 0.6);
   flex-shrink: 0;
 }
 
-.agent-dot.online {
-  background: #6bdf9c;
-  box-shadow: 0 0 6px rgba(107, 223, 156, 0.5);
+.agent-alias {
+  font-weight: 500;
 }
 
-.agent-dot.offline {
-  background: #64748b;
+.agent-project {
+  color: var(--text-muted);
+  font-size: 0.85rem;
 }
 
-.agent-name {
-  font-weight: 600;
-  font-size: 0.95rem;
+.no-agents {
+  margin: 0;
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.1);
+  border-radius: 8px;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+/* Status Grid */
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.status-item {
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 10px;
+  border: 1px solid var(--border);
+}
+
+.status-item dt {
+  margin: 0 0 6px;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.status-value {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.status-value.online {
+  color: #6bdf9c;
+}
+
+.status-value.url {
+  font-family: monospace;
+  font-size: 0.75rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.agent-info {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.agent-kind,
-.agent-project {
-  font-size: 0.75rem;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: rgba(56, 189, 248, 0.15);
-  color: #38bdf8;
-}
-
-.agent-project {
-  background: rgba(167, 139, 250, 0.15);
-  color: #a78bfa;
-}
-
-.agent-last-seen {
-  font-size: 0.75rem;
-  color: var(--text-muted);
 }
 
 .update-section {
