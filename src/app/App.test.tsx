@@ -6,7 +6,7 @@ describe('App shell', () => {
   it('renders the HexDeck bootstrap copy', () => {
     render(<App />);
 
-    expect(screen.getByRole('heading', { level: 1, name: 'HexDeck' })).toBeTruthy();
-    expect(screen.getByText('Menu bar companion bootstrap complete.')).toBeTruthy();
+    expect(screen.getByRole('heading', { level: 1, name: 'HexDeck' })).toBeInTheDocument();
+    expect(screen.getByText('Menu bar companion bootstrap complete.')).toBeInTheDocument();
   });
 });
