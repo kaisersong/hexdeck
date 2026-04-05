@@ -45,6 +45,7 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.target }}
+          npmScript: tauri:build
 
   generate-latest-json:
     needs: build
