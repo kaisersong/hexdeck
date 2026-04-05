@@ -4,6 +4,7 @@ import { OnboardingPanel } from '../features/onboarding/OnboardingPanel';
 import { ProjectSelector } from '../features/project-selector/ProjectSelector';
 import { SettingsPanel } from '../features/settings/SettingsPanel';
 import { BrokerClient } from '../lib/broker/client';
+import type { BrokerParticipant } from '../lib/broker/types';
 import type { JumpTarget } from '../lib/jump/types';
 import type { ProjectSnapshotProjection } from '../lib/projections/types';
 import { buildProjectSnapshot } from '../lib/projections/project-snapshot';
@@ -22,6 +23,7 @@ export function App() {
   const [pendingApprovalIds, setPendingApprovalIds] = useState<Set<string>>(new Set());
   const [currentProject, setCurrentProject] = useState<string>(settings.currentProject);
   const [showSettings, setShowSettings] = useState(false);
+  const [participants, setParticipants] = useState<BrokerParticipant[]>([]);
 
   useEffect(() => {
     let disposed = false;
@@ -35,6 +37,7 @@ export function App() {
           const nextSnapshot = buildProjectSnapshot(seed);
           store.setSnapshot(nextSnapshot);
           setSnapshot(nextSnapshot);
+          setParticipants(seed.participants);
         }
       } catch {
         if (!disposed) {
@@ -122,6 +125,7 @@ export function App() {
           brokerUrl={settings.brokerUrl}
           globalShortcut={settings.globalShortcut}
           capabilities={getCapabilityStatus()}
+          participants={participants}
         />
       ) : (
         <>
