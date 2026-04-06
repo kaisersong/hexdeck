@@ -20,10 +20,18 @@ function getNotificationCapability(): CapabilityStatus['notifications'] {
   return 'unknown';
 }
 
+function getGlobalShortcutCapability(): CapabilityStatus['globalShortcut'] {
+  if (typeof window === 'undefined') {
+    return 'blocked';
+  }
+
+  return '__TAURI_INTERNALS__' in window ? 'ready' : 'unknown';
+}
+
 export function getCapabilityStatus(): CapabilityStatus {
   return {
     notifications: getNotificationCapability(),
-    globalShortcut: 'unknown',
+    globalShortcut: getGlobalShortcutCapability(),
     jumpSupport: 'unknown',
   };
 }

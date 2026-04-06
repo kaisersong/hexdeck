@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 mod commands;
 
@@ -8,7 +8,22 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::Command;
-use tauri::{WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    menu::MenuBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder, WindowEvent,
+};
+use tauri_plugin_positioner::{Position, WindowExt};
+
+const PANEL_LABEL: &str = "panel";
+const EXPANDED_LABEL: &str = "expanded";
+const PANEL_WIDTH: f64 = 340.0;
+const PANEL_HEIGHT: f64 = 460.0;
+const EXPANDED_WIDTH: f64 = 920.0;
+const EXPANDED_HEIGHT: f64 = 680.0;
+const MENU_OPEN_ID: &str = "open";
+const MENU_QUIT_ID: &str = "quit";
 
 // ============================================================================
 // CLI Subcommand Definitions
@@ -209,6 +224,7 @@ fn detect_terminal() -> Option<String> {
 }
 
 /// Get the tty device by walking up the process chain to find a process with a tty.
+#[cfg(unix)]
 fn get_parent_tty() -> Result<String, String> {
     let mut pid = std::os::unix::process::parent_id();
 
@@ -249,6 +265,11 @@ fn get_parent_tty() -> Result<String, String> {
     }
 
     Err("no_tty_found_in_process_chain".to_string())
+}
+
+#[cfg(not(unix))]
+fn get_parent_tty() -> Result<String, String> {
+    Err("terminal_title_cli_is_only_supported_on_unix".to_string())
 }
 
 /// Get the current terminal window title by querying the terminal process.
@@ -436,6 +457,152 @@ fn execute_title_clear(alias: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn build_panel(app: &AppHandle) -> tauri::Result<WebviewWindow> {
+    let panel = WebviewWindowBuilder::new(app, PANEL_LABEL, WebviewUrl::App("index.html".into()))
+        .title("HexDeck")
+        .inner_size(PANEL_WIDTH, PANEL_HEIGHT)
+        .min_inner_size(PANEL_WIDTH, PANEL_HEIGHT)
+        .resizable(false)
+        .maximizable(false)
+        .minimizable(false)
+        .closable(true)
+        .visible(false)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .build()?;
+
+    let panel_handle = panel.clone();
+    panel.on_window_event(move |event| match event {
+        WindowEvent::Focused(false) => {
+            let _ = panel_handle.hide();
+        }
+        WindowEvent::CloseRequested { api, .. } => {
+            api.prevent_close();
+            let _ = panel_handle.hide();
+        }
+        _ => {}
+    });
+
+    Ok(panel)
+}
+
+fn build_expanded_window(app: &AppHandle, section: &str) -> tauri::Result<WebviewWindow> {
+    let url = format!("index.html?view=expanded&section={section}");
+    WebviewWindowBuilder::new(app, EXPANDED_LABEL, WebviewUrl::App(url.into()))
+        .title("HexDeck")
+        .inner_size(EXPANDED_WIDTH, EXPANDED_HEIGHT)
+        .min_inner_size(720.0, 520.0)
+        .visible(true)
+        .resizable(true)
+        .maximizable(true)
+        .minimizable(true)
+        .build()
+}
+
+fn show_panel(app: &AppHandle, from_tray: bool) {
+    if let Some(panel) = app.get_webview_window(PANEL_LABEL) {
+        let _ = panel.set_size(LogicalSize::new(PANEL_WIDTH, PANEL_HEIGHT));
+        if from_tray {
+            let _ = panel.move_window_constrained(Position::TrayCenter);
+        }
+        let _ = panel.show();
+        let _ = panel.unminimize();
+        let _ = panel.set_focus();
+    }
+}
+
+fn toggle_panel(app: &AppHandle, from_tray: bool, cursor_position: Option<(f64, f64)>) {
+    let Some(panel) = app.get_webview_window(PANEL_LABEL) else {
+        return;
+    };
+
+    if panel.is_visible().unwrap_or(false) {
+        let _ = panel.hide();
+        return;
+    }
+
+    let _ = panel.set_size(LogicalSize::new(PANEL_WIDTH, PANEL_HEIGHT));
+
+    if from_tray {
+        let _ = panel.move_window_constrained(Position::TrayCenter);
+    } else if let Some((_x, _y)) = cursor_position {
+        // Reserved for future non-tray entrypoints.
+    }
+
+    let _ = panel.show();
+    let _ = panel.unminimize();
+    let _ = panel.set_focus();
+}
+
+fn open_expanded_window_inner(app: &AppHandle, section: &str) -> Result<(), String> {
+    if let Some(expanded) = app.get_webview_window(EXPANDED_LABEL) {
+        let script = format!(
+            "window.location.replace(`${{window.location.pathname}}?view=expanded&section={section}`);"
+        );
+        let _ = expanded.eval(&script);
+        let _ = expanded.show();
+        let _ = expanded.unminimize();
+        let _ = expanded.set_focus();
+        return Ok(());
+    }
+
+    build_expanded_window(app, section)
+        .map(|window| {
+            let _ = window.set_focus();
+        })
+        .map_err(|error| format!("failed_to_open_expanded_window: {error}"))
+}
+
+#[tauri::command]
+fn toggle_panel_command(app: AppHandle) {
+    toggle_panel(&app, false, None);
+}
+
+#[tauri::command]
+fn open_expanded_window(app: AppHandle, section: Option<String>) -> Result<(), String> {
+    let section = section.as_deref().unwrap_or("overview");
+    open_expanded_window_inner(&app, section)
+}
+
+fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
+    let menu = MenuBuilder::new(app)
+        .text(MENU_OPEN_ID, "Open HexDeck")
+        .text(MENU_QUIT_ID, "Quit")
+        .build()?;
+
+    let mut tray_builder = TrayIconBuilder::new()
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            tauri_plugin_positioner::on_tray_event(&tray.app_handle(), &event);
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                position,
+                ..
+            } = event
+            {
+                toggle_panel(&tray.app_handle(), true, Some((position.x, position.y)));
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon().cloned() {
+        tray_builder = tray_builder.icon(icon);
+    }
+
+    let _tray = tray_builder.build(app)?;
+    Ok(())
+}
+
+fn configure_platform_shell(_app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = _app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+        let _ = _app.set_dock_visibility(false);
+    }
+}
+
 // ============================================================================
 // Main Entry Point (dual mode: CLI or GUI)
 // ============================================================================
@@ -483,11 +650,20 @@ fn main() {
 
     // GUI mode: run Tauri application
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {}))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_positioner::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            MENU_OPEN_ID => show_panel(app, false),
+            MENU_QUIT_ID => app.exit(0),
+            _ => {}
+        })
         .invoke_handler(tauri::generate_handler![
+            toggle_panel_command,
+            open_expanded_window,
             jump_with_ghostty,
             jump_with_iterm,
             jump_with_terminal_app,
@@ -498,15 +674,9 @@ fn main() {
             commands::is_broker_running
         ])
         .setup(|app| {
-            let _panel = WebviewWindowBuilder::new(
-                app,
-                "panel",
-                WebviewUrl::App("index.html".into()),
-            )
-            .title("HexDeck")
-            .inner_size(420.0, 620.0)
-            .visible(true)
-            .build()?;
+            build_panel(app.handle())?;
+            setup_tray(app.handle())?;
+            configure_platform_shell(app.handle());
 
             Ok(())
         })

@@ -5,7 +5,7 @@ import { PanelRoute } from '../../../src/app/routes/panel';
 import { ActivityCardHost } from '../../../src/features/activity-card/ActivityCardHost';
 
 describe('PanelRoute', () => {
-  it('renders overview, now, attention, and recent sections', () => {
+  it('renders broker status, active agents, queue, and recent activity sections', () => {
     render(
       <PanelRoute
         snapshot={{
@@ -23,10 +23,10 @@ describe('PanelRoute', () => {
       />
     );
 
-    expect(screen.getByText('Overview')).toBeInTheDocument();
-    expect(screen.getByText('Now')).toBeInTheDocument();
-    expect(screen.getByText('Attention')).toBeInTheDocument();
-    expect(screen.getByText('Recent')).toBeInTheDocument();
+    expect(screen.getByText('Broker status')).toBeInTheDocument();
+    expect(screen.getByText('Active agents')).toBeInTheDocument();
+    expect(screen.getByText('Queue')).toBeInTheDocument();
+    expect(screen.getByText('Recent activity')).toBeInTheDocument();
   });
 
   it('renders Jump actions for jump-capable cards', () => {

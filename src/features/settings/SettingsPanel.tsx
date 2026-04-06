@@ -33,8 +33,6 @@ export function SettingsPanel() {
     progress: { downloaded: 0, total: null },
   });
 
-  const [brokerDownloadUrl, setBrokerDownloadUrl] = useState<string | null>(null);
-
   const handleCheckHexdeck = () => {
     void checkHexDeckUpdate(setHexdeckStatus);
   };
@@ -44,24 +42,12 @@ export function SettingsPanel() {
   };
 
   const handleCheckBroker = () => {
-    void checkBrokerUpdate((status) => {
-      setBrokerStatus(status);
-      if (status.available && status.version) {
-        // Store download URL for later use
-        setBrokerDownloadUrl('placeholder');
-      }
-    });
+    void checkBrokerUpdate(setBrokerStatus);
   };
 
   const handleInstallBroker = async () => {
     if (!brokerStatus.version) return;
 
-    // Re-fetch to get download URL
-    const latest = await import('../../lib/update/broker-updater').then((m) =>
-      m.checkBrokerUpdate(() => {})
-    );
-
-    // Fetch latest release info again to get URL
     const { invoke } = await import('@tauri-apps/api/core');
     try {
       const info = await invoke<{ version: string; download_url: string }>(

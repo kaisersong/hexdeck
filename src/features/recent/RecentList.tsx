@@ -2,9 +2,12 @@ import type { RecentItemProjection } from '../../lib/projections/types';
 
 export function RecentList({ items }: { items: RecentItemProjection[] }) {
   return (
-    <section className="panel-section" aria-labelledby="recent-title">
+    <section className="panel-section" aria-labelledby="recent-activity-title">
       <div className="panel-section-header">
-        <h2 id="recent-title">Recent</h2>
+        <div>
+          <h2 id="recent-activity-title">Recent activity</h2>
+          <p className="section-kicker">Latest broker events across the selected project</p>
+        </div>
       </div>
       {items.length === 0 ? (
         <p className="empty-state">Recent activity will show up here.</p>

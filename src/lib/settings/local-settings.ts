@@ -6,7 +6,7 @@ export interface LocalSettings {
 }
 
 const DEFAULT_BROKER_URL = 'http://127.0.0.1:4318';
-const DEFAULT_GLOBAL_SHORTCUT = 'CmdOrCtrl+Shift+H';
+const DEFAULT_GLOBAL_SHORTCUT = 'CommandOrControl+Shift+H';
 const DEFAULT_PROJECT = 'intent-broker';
 
 function readStoredValue(key: string): string | null {

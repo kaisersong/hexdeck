@@ -13,19 +13,17 @@ export function OnboardingPanel({
   participants?: BrokerParticipant[];
 }) {
   return (
-    <section className="panel-section panel-onboarding">
-      {/* Header with small logo */}
-      <div className="onboarding-header">
-        <img src="/hexdeck.png" alt="HexDeck" className="onboarding-logo" />
-        <div className="onboarding-title">
-          <h1>HexDeck</h1>
-          <p>Agent Desktop Companion</p>
+    <section className="panel-section panel-onboarding" aria-labelledby="broker-connection-title">
+      <div className="panel-section-header">
+        <div>
+          <h2 id="broker-connection-title">Broker connection</h2>
+          <p className="section-kicker">Waiting for live project data</p>
         </div>
+        <span className="health-pill">Setup</span>
       </div>
 
-      {/* Agent Status */}
       <div className="agent-status-section">
-        <h2>Agents</h2>
+        <div className="compact-section-title">Connected agents</div>
         {participants.length > 0 ? (
           <div className="agent-list">
             {participants.map((agent) => (
@@ -43,15 +41,14 @@ export function OnboardingPanel({
         )}
       </div>
 
-      {/* Status Info */}
       <dl className="status-grid">
         <div className="status-item">
-          <dt>Broker</dt>
-          <dd className="status-value online">Connected</dd>
+          <dt>Broker URL</dt>
+          <dd className="status-value url">{brokerUrl}</dd>
         </div>
         <div className="status-item">
-          <dt>URL</dt>
-          <dd className="status-value url">{brokerUrl}</dd>
+          <dt>Shortcut</dt>
+          <dd className="status-value">{globalShortcut}</dd>
         </div>
         <div className="status-item">
           <dt>Jump</dt>

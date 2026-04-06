@@ -12,9 +12,12 @@ export function AttentionList({
   onDeny?: (approvalId: string, taskId?: string) => void;
 }) {
   return (
-    <section className="panel-section" aria-labelledby="attention-title">
+    <section className="panel-section" aria-labelledby="queue-title">
       <div className="panel-section-header">
-        <h2 id="attention-title">Attention</h2>
+        <div>
+          <h2 id="queue-title">Queue</h2>
+          <p className="section-kicker">Items that still need explicit human attention</p>
+        </div>
       </div>
       {items.length === 0 ? (
         <p className="empty-state">Nothing needs attention right now.</p>
