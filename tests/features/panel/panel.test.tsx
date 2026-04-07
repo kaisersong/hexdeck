@@ -5,7 +5,7 @@ import { PanelRoute } from '../../../src/app/routes/panel';
 import { ActivityCardHost } from '../../../src/features/activity-card/ActivityCardHost';
 
 describe('PanelRoute', () => {
-  it('renders overview, now, attention, and recent sections', () => {
+  it('renders compact project groups, quick action, and footer metrics', () => {
     render(
       <PanelRoute
         snapshot={{
@@ -16,20 +16,53 @@ describe('PanelRoute', () => {
             blockedCount: 1,
             pendingApprovalCount: 1,
           },
-          now: [],
-          attention: [],
+          now: [
+            {
+              participantId: 'agent-a',
+              alias: 'Agent-A',
+              toolLabel: 'codex',
+              workState: 'implementing',
+              summary: 'Working',
+              updatedAtLabel: 'just now',
+            },
+          ],
+          attention: [
+            {
+              kind: 'approval',
+              priority: 'critical',
+              summary: 'Deploy approval needed',
+              approvalId: 'approval-1',
+              taskId: 'task-1',
+              approvalDecision: 'pending',
+            },
+          ],
           recent: [],
         }}
+        participants={[
+          {
+            participantId: 'agent-a',
+            alias: 'Agent-A',
+            context: { projectName: 'HexDeck' },
+          },
+          {
+            participantId: 'agent-b',
+            alias: 'Agent-B',
+            context: { projectName: 'Internal Tools' },
+          },
+        ]}
+        currentProject="HexDeck"
       />
     );
 
-    expect(screen.getByText('Overview')).toBeInTheDocument();
-    expect(screen.getByText('Now')).toBeInTheDocument();
-    expect(screen.getByText('Attention')).toBeInTheDocument();
-    expect(screen.getByText('Recent')).toBeInTheDocument();
+    expect(screen.getByText('Project: HexDeck')).toBeInTheDocument();
+    expect(screen.getByText('Project: Internal Tools')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Open Main Panel' })).toBeInTheDocument();
+    expect(screen.getByText('2 Total')).toBeInTheDocument();
+    expect(screen.getByText('Healthy')).toBeInTheDocument();
+    expect(screen.getByText('1 approvals pending')).toBeInTheDocument();
   });
 
-  it('renders Jump actions for jump-capable cards', () => {
+  it('renders jump actions on agent rows when the agent can be focused', () => {
     render(
       <PanelRoute
         snapshot={{
@@ -61,41 +94,18 @@ describe('PanelRoute', () => {
           attention: [],
           recent: [],
         }}
+        participants={[
+          {
+            participantId: 'a',
+            alias: 'codex4',
+            context: { projectName: 'HexDeck' },
+          },
+        ]}
+        currentProject="HexDeck"
       />
     );
 
     expect(screen.getByRole('button', { name: 'Jump to @codex4' })).toBeInTheDocument();
-  });
-
-  it('renders Approve and Deny buttons for approval attention items', () => {
-    render(
-      <PanelRoute
-        snapshot={{
-          overview: {
-            brokerHealthy: true,
-            onlineCount: 1,
-            busyCount: 0,
-            blockedCount: 0,
-            pendingApprovalCount: 1,
-          },
-          now: [],
-          attention: [
-            {
-              kind: 'approval',
-              priority: 'critical',
-              summary: 'Deploy approval needed',
-              approvalId: 'approval-1',
-              taskId: 'task-1',
-              approvalDecision: 'pending',
-            },
-          ],
-          recent: [],
-        }}
-      />
-    );
-
-    expect(screen.getByRole('button', { name: 'Approve approval-1' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Deny approval-1' })).toBeInTheDocument();
   });
 });
 
@@ -146,10 +156,10 @@ describe('ActivityCardHost', () => {
 });
 
 describe('App integration', () => {
-  it('shows the agent status page while broker data is still loading', () => {
+  it('shows the compact dropdown shell when broker data has not loaded yet', () => {
     render(<App />);
 
-    expect(screen.getByText('Overview')).toBeInTheDocument();
-    expect(screen.queryByText('Agent Desktop Companion')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Open Main Panel' })).toBeInTheDocument();
+    expect(screen.getByText(/Project:/)).toBeInTheDocument();
   });
 });

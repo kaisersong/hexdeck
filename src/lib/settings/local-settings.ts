@@ -43,6 +43,30 @@ function readStoredArray(key: string): string[] {
   }
 }
 
+function writeStoredValue(key: string, value: string): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+function writeStoredArray(key: string, value: string[]): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
 export function loadLocalSettings(): LocalSettings {
   return {
     brokerUrl: readStoredValue('hexdeck.brokerUrl') ?? DEFAULT_BROKER_URL,
@@ -52,23 +76,36 @@ export function loadLocalSettings(): LocalSettings {
   };
 }
 
-export function saveCurrentProject(project: string): void {
+export function saveLocalSettings(
+  next: Partial<Pick<LocalSettings, 'globalShortcut' | 'currentProject'>>
+): LocalSettings {
+  const current = loadLocalSettings();
+  const brokerUrl = DEFAULT_BROKER_URL;
+  const globalShortcut = next.globalShortcut?.trim() || current.globalShortcut;
+  const currentProject = next.currentProject?.trim() || current.currentProject;
+
+  writeStoredValue('hexdeck.shortcut', globalShortcut);
+  writeStoredValue('hexdeck.currentProject', currentProject);
+
+  const recent = readStoredArray('hexdeck.recentProjects');
+  const updatedRecentProjects =
+    currentProject === ALL_AGENTS_PROJECT
+      ? recent.filter((project) => project !== ALL_AGENTS_PROJECT)
+      : [currentProject, ...recent.filter((project) => project !== currentProject)].slice(0, 5);
+
+  writeStoredArray('hexdeck.recentProjects', updatedRecentProjects);
+
+  return {
+    brokerUrl,
+    globalShortcut,
+    currentProject,
+    recentProjects: updatedRecentProjects,
+  };
+}
+
+export function saveCurrentProject(project: string): LocalSettings {
   if (typeof window === 'undefined') {
-    return;
+    return loadLocalSettings();
   }
-
-  try {
-    window.localStorage.setItem('hexdeck.currentProject', project);
-
-    if (project === ALL_AGENTS_PROJECT) {
-      return;
-    }
-
-    // Update recent projects list
-    const recent = readStoredArray('hexdeck.recentProjects');
-    const updated = [project, ...recent.filter((p) => p !== project)].slice(0, 5);
-    window.localStorage.setItem('hexdeck.recentProjects', JSON.stringify(updated));
-  } catch {
-    // Ignore storage errors
-  }
+  return saveLocalSettings({ currentProject: project });
 }

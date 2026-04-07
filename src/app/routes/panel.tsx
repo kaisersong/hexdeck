@@ -218,24 +218,8 @@ export function PanelRoute({
           <span className="menu-dropdown__title">HEXDECK PRO</span>
         </div>
         <div className="menu-dropdown__header-actions">
-          <span className={`menu-live-pill ${brokerLive ? 'menu-live-pill--live' : ''}`}>
-            <span className="menu-live-pill__dot" />
-            {brokerLive ? 'LIVE' : 'SETUP'}
-          </span>
           <button type="button" className="menu-icon-btn" onClick={onOpenSettings} aria-label="Settings" title="Settings">
             <SettingsIcon />
-          </button>
-          <button type="button" className="menu-icon-btn" onClick={onMinimize} aria-label="Minimize" title="Minimize">
-            -
-          </button>
-          <button
-            type="button"
-            className="menu-icon-btn menu-icon-btn--close"
-            onClick={onClose}
-            aria-label="Close panel"
-            title="Close panel"
-          >
-            x
           </button>
         </div>
       </header>
