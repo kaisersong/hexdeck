@@ -3,29 +3,26 @@ import { BrokerClient } from '../../../src/lib/broker/client';
 
 describe('BrokerClient', () => {
   it('loads health, participants, work-state, and replay slices for a project', async () => {
-    const responses = new Map<string, Response>([
-      ['http://127.0.0.1:4318/health', new Response(JSON.stringify({ ok: true }), { status: 200 })],
-      [
-        'http://127.0.0.1:4318/participants?projectName=intent-broker',
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+      .mockResolvedValueOnce(
         new Response(
-          JSON.stringify([{ participantId: 'codex-session-aa59e6ef', alias: 'codex4', context: { projectName: 'intent-broker' } }]),
+          JSON.stringify({
+            participants: [{ alias: 'codex4', context: { projectName: 'intent-broker' } }],
+          }),
           { status: 200 }
-        ),
-      ],
-      [
-        'http://127.0.0.1:4318/work-state?projectName=intent-broker',
-        new Response(JSON.stringify([{ participantId: 'codex-session-aa59e6ef', status: 'implementing' }]), { status: 200 }),
-      ],
-      [
-        'http://127.0.0.1:4318/events/replay?after=0',
-        new Response(JSON.stringify([{ id: 1282, type: 'report_progress' }]), { status: 200 }),
-      ],
-      [
-        'http://127.0.0.1:4318/projects/intent-broker/approvals?status=pending',
-        new Response(JSON.stringify({ items: [{ approvalId: 'approval-1', taskId: 'task-1' }] }), { status: 200 }),
-      ],
-    ]);
-    const fetchMock = vi.fn(async (url: string) => responses.get(url));
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [{ participantId: 'codex-session-aa59e6ef', status: 'implementing' }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify([{ id: 1282, type: 'report_progress' }]), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [{ approvalId: 'approval-1', taskId: 'task-1' }] }), { status: 200 }));
 
     const client = new BrokerClient({
       brokerUrl: 'http://127.0.0.1:4318',
@@ -49,6 +46,90 @@ describe('BrokerClient', () => {
     expect(snapshot.workStates[0].status).toBe('implementing');
     expect(snapshot.events[0].id).toBe(1282);
     expect(snapshot.approvals[0].approvalId).toBe('approval-1');
+  });
+
+  it('loads the full broker service view without project filtering', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ alias: 'codex16', kind: 'agent', context: { projectName: 'projects' } }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [{ participantId: 'codex-session-019d671b', status: 'implementing', projectName: 'projects' }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify([{ id: 2001, type: 'report_progress' }]), { status: 200 }));
+
+    const client = new BrokerClient({
+      brokerUrl: 'http://127.0.0.1:4318',
+      fetchImpl: fetchMock as typeof fetch,
+      websocketFactory: () => {
+        throw new Error('not used in this test');
+      }
+    });
+
+    const snapshot = await client.loadServiceSeed();
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      'http://127.0.0.1:4318/health',
+      'http://127.0.0.1:4318/participants',
+      'http://127.0.0.1:4318/work-state',
+      'http://127.0.0.1:4318/events/replay?after=0',
+    ]);
+    expect(snapshot.participants[0].alias).toBe('codex16');
+    expect(snapshot.workStates[0].status).toBe('implementing');
+    expect(snapshot.approvals).toEqual([]);
+  });
+
+  it('binds the default global fetch implementation before using it', async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchCalls: string[] = [];
+
+    const fetchOwner = {
+      fetch(input: RequestInfo | URL): Promise<Response> {
+        if (this !== globalThis) {
+          throw new TypeError('unbound fetch');
+        }
+
+        fetchCalls.push(String(input));
+        return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+      },
+    };
+
+    Object.defineProperty(globalThis, 'fetch', {
+      configurable: true,
+      writable: true,
+      value: fetchOwner.fetch,
+    });
+
+    try {
+      const client = new BrokerClient({
+        brokerUrl: 'http://127.0.0.1:4318',
+        websocketFactory: () => {
+          throw new Error('not used in this test');
+        },
+      });
+
+      const health = await client['request']<{ ok: boolean }>('/health');
+
+      expect(health.ok).toBe(true);
+      expect(fetchCalls).toEqual(['http://127.0.0.1:4318/health']);
+    } finally {
+      Object.defineProperty(globalThis, 'fetch', {
+        configurable: true,
+        writable: true,
+        value: originalFetch,
+      });
+    }
   });
 
   it('converts broker urls to websocket urls and returns a cleanup handle', () => {
@@ -75,7 +156,7 @@ describe('BrokerClient', () => {
     const cleanup = client.connectRealtime();
 
     expect(websocketFactory).toHaveBeenCalledTimes(1);
-    expect(websocketFactory).toHaveBeenCalledWith('wss://broker.example.com/root/ws?participantId=hexdeck.desktop');
+    expect(websocketFactory).toHaveBeenCalledWith('wss://broker.example.com/root');
 
     listeners.get('message')?.({
       data: JSON.stringify({ id: 1282, type: 'report_progress' })
@@ -180,147 +261,6 @@ describe('BrokerClient', () => {
     expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:4318/projects/intent-broker/approvals?status=pending'
     );
-  });
-
-  it('falls back to unscoped broker endpoints and normalizes wrapped payloads', async () => {
-    const responses = new Map<string, Response>([
-      ['http://127.0.0.1:4318/health', new Response(JSON.stringify({ status: 'healthy' }), { status: 200 })],
-      ['http://127.0.0.1:4318/participants?projectName=HexDeck', new Response(JSON.stringify([]), { status: 200 })],
-      [
-        'http://127.0.0.1:4318/participants',
-        new Response(
-          JSON.stringify({
-            items: [
-              {
-                id: 'agent-1',
-                name: 'codex4',
-                projectName: 'HexDeck',
-                metadata: { terminalApp: 'Ghostty', sessionHint: 'ghostty-1' },
-              },
-            ],
-          }),
-          { status: 200 }
-        ),
-      ],
-      ['http://127.0.0.1:4318/work-state?projectName=HexDeck', new Response(JSON.stringify([]), { status: 200 })],
-      [
-        'http://127.0.0.1:4318/work-state',
-        new Response(
-          JSON.stringify({
-            workStates: [{ participant_id: 'agent-1', state: 'working', message: 'Implementing settings' }],
-          }),
-          { status: 200 }
-        ),
-      ],
-      [
-        'http://127.0.0.1:4318/events/replay?after=0',
-        new Response(JSON.stringify({ events: [{ id: '42', event: 'report_progress' }] }), { status: 200 }),
-      ],
-      ['http://127.0.0.1:4318/projects/HexDeck/approvals?status=pending', new Response('missing', { status: 404 })],
-    ]);
-    const fetchMock = vi.fn(async (url: string) => responses.get(url));
-
-    const client = new BrokerClient({
-      brokerUrl: 'http://127.0.0.1:4318',
-      fetchImpl: fetchMock as typeof fetch,
-      websocketFactory: () => {
-        throw new Error('not used');
-      },
-    });
-
-    const snapshot = await client.loadProjectSeed('HexDeck');
-
-    expect(snapshot.health.ok).toBe(true);
-    expect(snapshot.participants).toEqual([
-      expect.objectContaining({
-        participantId: 'agent-1',
-        alias: 'codex4',
-        context: { projectName: 'HexDeck' },
-      }),
-    ]);
-    expect(snapshot.workStates).toEqual([
-      expect.objectContaining({
-        participantId: 'agent-1',
-        status: 'working',
-        summary: 'Implementing settings',
-      }),
-    ]);
-    expect(snapshot.events[0]).toEqual(expect.objectContaining({ id: 42, type: 'report_progress' }));
-    expect(snapshot.approvals).toEqual([]);
-    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-      'http://127.0.0.1:4318/health',
-      'http://127.0.0.1:4318/participants?projectName=HexDeck',
-      'http://127.0.0.1:4318/participants',
-      'http://127.0.0.1:4318/work-state?projectName=HexDeck',
-      'http://127.0.0.1:4318/events/replay?after=0',
-      'http://127.0.0.1:4318/projects/HexDeck/approvals?status=pending',
-      'http://127.0.0.1:4318/work-state',
-    ]);
-  });
-
-  it('loads an unscoped workspace snapshot and merges approvals across projects', async () => {
-    const responses = new Map<string, Response>([
-      ['http://127.0.0.1:4318/health', new Response(JSON.stringify({ ok: true }), { status: 200 })],
-      [
-        'http://127.0.0.1:4318/participants',
-        new Response(
-          JSON.stringify({
-            participants: [
-              { participantId: 'agent-1', alias: 'codex4', context: { projectName: 'HexDeck' } },
-              { participantId: 'agent-2', alias: 'claude2', context: { projectName: 'BrokerOps' } },
-            ],
-          }),
-          { status: 200 }
-        ),
-      ],
-      [
-        'http://127.0.0.1:4318/work-state',
-        new Response(
-          JSON.stringify({
-            items: [
-              { participantId: 'agent-1', status: 'implementing' },
-              { participantId: 'agent-2', status: 'blocked' },
-            ],
-          }),
-          { status: 200 }
-        ),
-      ],
-      [
-        'http://127.0.0.1:4318/events/replay?after=0',
-        new Response(JSON.stringify({ items: [{ id: 7, type: 'report_progress' }] }), { status: 200 }),
-      ],
-      [
-        'http://127.0.0.1:4318/projects/HexDeck/approvals?status=pending',
-        new Response(JSON.stringify({ items: [{ approvalId: 'approval-1', taskId: 'task-1' }] }), { status: 200 }),
-      ],
-      [
-        'http://127.0.0.1:4318/projects/BrokerOps/approvals?status=pending',
-        new Response(JSON.stringify({ items: [{ approvalId: 'approval-2', taskId: 'task-2' }] }), { status: 200 }),
-      ],
-    ]);
-    const fetchMock = vi.fn(async (url: string) => responses.get(url));
-
-    const client = new BrokerClient({
-      brokerUrl: 'http://127.0.0.1:4318',
-      fetchImpl: fetchMock as typeof fetch,
-      websocketFactory: () => {
-        throw new Error('not used');
-      },
-    });
-
-    const snapshot = await client.loadProjectSeed();
-
-    expect(snapshot.participants).toHaveLength(2);
-    expect(snapshot.workStates).toHaveLength(2);
-    expect(snapshot.approvals.map((item) => item.approvalId)).toEqual(['approval-1', 'approval-2']);
-    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-      'http://127.0.0.1:4318/health',
-      'http://127.0.0.1:4318/participants',
-      'http://127.0.0.1:4318/work-state',
-      'http://127.0.0.1:4318/events/replay?after=0',
-      'http://127.0.0.1:4318/projects/HexDeck/approvals?status=pending',
-      'http://127.0.0.1:4318/projects/BrokerOps/approvals?status=pending',
-    ]);
   });
 
   it('responds to an approval through the broker API', async () => {

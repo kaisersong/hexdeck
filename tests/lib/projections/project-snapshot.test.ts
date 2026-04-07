@@ -6,8 +6,9 @@ describe('buildProjectSnapshot', () => {
     const snapshot = buildProjectSnapshot({
       health: { ok: true },
       participants: [
-        { participantId: 'a', alias: 'codex4', context: { projectName: 'intent-broker' } },
-        { participantId: 'b', alias: 'claude2', context: { projectName: 'intent-broker' } },
+        { participantId: 'a', alias: 'codex4', kind: 'agent', context: { projectName: 'intent-broker' } },
+        { participantId: 'b', alias: 'claude2', kind: 'agent', context: { projectName: 'intent-broker' } },
+        { participantId: 'human.local', alias: 'human', kind: 'human', context: { projectName: 'intent-broker' } },
       ],
       workStates: [
         { participantId: 'a', status: 'implementing', summary: 'Working on HexDeck' },

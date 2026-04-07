@@ -14,6 +14,7 @@ export interface AgentCardProjection {
   participantId: string;
   alias: string;
   toolLabel: string;
+  projectName?: string;
   workState: string;
   summary: string;
   updatedAtLabel: string;

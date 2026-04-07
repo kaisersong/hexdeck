@@ -9,6 +9,10 @@ import type {
 
 export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjection {
   const byParticipant = new Map(seed.participants.map((participant) => [participant.participantId, participant]));
+  const agentParticipants = seed.participants.filter(
+    (participant) => participant.kind !== 'human' && participant.kind !== 'adapter'
+  );
+  const agentParticipantIds = new Set(agentParticipants.map((participant) => participant.participantId));
 
   const buildParticipantJumpTarget = (participantId: string) => {
     const participant = byParticipant.get(participantId);
@@ -24,7 +28,10 @@ export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjecti
     });
   };
 
-  const now: AgentCardProjection[] = seed.workStates.map((workState) => {
+  const now: AgentCardProjection[] = seed.workStates
+    .filter((workState) => agentParticipantIds.has(workState.participantId) || !byParticipant.has(workState.participantId))
+    .slice(0, 5)
+    .map((workState) => {
     const participant = byParticipant.get(workState.participantId);
     const jumpTarget = buildParticipantJumpTarget(workState.participantId);
 
@@ -32,16 +39,20 @@ export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjecti
       participantId: workState.participantId,
       alias: participant?.alias ?? workState.participantId,
       toolLabel: participant?.tool ?? 'agent',
+      projectName: participant?.context?.projectName ?? workState.projectName ?? undefined,
       workState: workState.status,
       summary: workState.summary ?? workState.status,
       updatedAtLabel: workState.updatedAt ?? 'just now',
       jumpPrecision: jumpTarget.precision,
       jumpTarget,
     };
-  });
+    });
 
   const attention: AttentionItemProjection[] = [];
   for (const workState of seed.workStates) {
+    if (byParticipant.has(workState.participantId) && !agentParticipantIds.has(workState.participantId)) {
+      continue;
+    }
     if (workState.status === 'blocked') {
       const participant = byParticipant.get(workState.participantId);
       attention.push({
@@ -69,9 +80,13 @@ export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjecti
   return {
     overview: {
       brokerHealthy: seed.health.ok,
-      onlineCount: seed.participants.length,
-      busyCount: seed.workStates.filter((item) => item.status === 'implementing').length,
-      blockedCount: seed.workStates.filter((item) => item.status === 'blocked').length,
+      onlineCount: agentParticipants.length,
+      busyCount: seed.workStates.filter(
+        (item) => item.status === 'implementing' && (agentParticipantIds.has(item.participantId) || !byParticipant.has(item.participantId))
+      ).length,
+      blockedCount: seed.workStates.filter(
+        (item) => item.status === 'blocked' && (agentParticipantIds.has(item.participantId) || !byParticipant.has(item.participantId))
+      ).length,
       pendingApprovalCount: seed.approvals.filter((approval) => (approval.decision ?? 'pending') === 'pending').length,
     },
     now,

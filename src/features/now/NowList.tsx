@@ -9,26 +9,23 @@ export function NowList({
   onJump?: (target: JumpTarget) => void;
 }) {
   return (
-    <section className="panel-section" aria-labelledby="agents-title">
+    <section className="panel-section" aria-labelledby="now-title">
       <div className="panel-section-header">
-        <div>
-          <h2 id="agents-title">Active agents</h2>
-          <p className="section-kicker">Current work surfaced from the broker feed</p>
-        </div>
+        <h2 id="now-title">Now</h2>
       </div>
       {items.length === 0 ? (
-        <p className="empty-state">No active agents yet.</p>
+        <p className="empty-state">No active agent cards yet.</p>
       ) : (
         <ul className="stack-list">
           {items.map((item) => (
             <li key={item.participantId} className="stack-card">
               <div className="stack-card__topline">
                 <strong>@{item.alias}</strong>
-                <span className="stack-card__pill">{item.workState}</span>
+                <span>{item.toolLabel}</span>
+                {item.projectName ? <span>{item.projectName}</span> : null}
               </div>
               <p className="stack-card__summary">{item.summary}</p>
               <p className="stack-card__meta">
-                <span>{item.toolLabel}</span>
                 <span>{item.workState}</span>
                 <span>{item.updatedAtLabel}</span>
                 {item.jumpPrecision ? <span>Jump: {item.jumpPrecision}</span> : null}

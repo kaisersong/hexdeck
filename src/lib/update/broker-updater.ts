@@ -1,5 +1,10 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { UpdateStatus, UpdateEventCallback, BrokerVersionInfo } from './types';
+import type {
+  UpdateStatus,
+  UpdateEventCallback,
+  BrokerVersionInfo,
+  BrokerStartResult,
+} from './types';
 
 const initialStatus: UpdateStatus = {
   checking: false,
@@ -95,4 +100,16 @@ export async function isBrokerRunning(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+export async function ensureBrokerReady(
+  brokerUrl = 'http://127.0.0.1:4318',
+  timeoutMs = 15000
+): Promise<BrokerStartResult> {
+  const result = await invoke<BrokerStartResult>('ensure_broker_ready', {
+    brokerUrl,
+    timeoutMs,
+  });
+
+  return result;
 }

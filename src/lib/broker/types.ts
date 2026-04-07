@@ -17,6 +17,7 @@ export interface BrokerParticipant {
 export interface BrokerWorkState {
   participantId: string;
   status: string;
+  projectName?: string | null;
   taskId?: string;
   threadId?: string;
   summary?: string;

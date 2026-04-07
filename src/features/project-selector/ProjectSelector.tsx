@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { ALL_AGENTS_PROJECT, formatProjectLabel } from '../../lib/settings/local-settings';
 
 interface ProjectSelectorProps {
   currentProject: string;
@@ -12,7 +13,7 @@ export function ProjectSelector({
   onProjectChange,
 }: ProjectSelectorProps) {
   const [isEditing, setIsEditing] = useState(false);
-  const [inputValue, setInputValue] = useState(currentProject);
+  const [inputValue, setInputValue] = useState(currentProject === ALL_AGENTS_PROJECT ? '' : currentProject);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -46,11 +47,18 @@ export function ProjectSelector({
           type="button"
           className="project-cancel"
           onClick={() => {
-            setInputValue(currentProject);
+            setInputValue(currentProject === ALL_AGENTS_PROJECT ? '' : currentProject);
             setIsEditing(false);
           }}
         >
           ×
+        </button>
+        <button
+          type="button"
+          className="recent-project-btn"
+          onClick={() => handleSelect(ALL_AGENTS_PROJECT)}
+        >
+          All agents
         </button>
         {recentProjects.length > 0 && (
           <div className="recent-projects">
@@ -77,7 +85,7 @@ export function ProjectSelector({
       onClick={() => setIsEditing(true)}
       title="Click to change project"
     >
-      {currentProject}
+      {formatProjectLabel(currentProject)}
     </button>
   );
 }

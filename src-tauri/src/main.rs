@@ -1,4 +1,4 @@
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
 
@@ -8,26 +8,7 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::Command;
-use tauri::{
-    menu::MenuBuilder,
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindow,
-    WebviewWindowBuilder, WindowEvent,
-};
-use tauri_plugin_positioner::{Position, WindowExt};
-
-const PANEL_LABEL: &str = "panel";
-const EXPANDED_LABEL: &str = "expanded";
-const DRAG_DEMO_LABEL: &str = "drag-demo";
-const PANEL_WIDTH: f64 = 340.0;
-const PANEL_HEIGHT: f64 = 460.0;
-const EXPANDED_WIDTH: f64 = 920.0;
-const EXPANDED_HEIGHT: f64 = 680.0;
-const DRAG_DEMO_WIDTH: f64 = 680.0;
-const DRAG_DEMO_HEIGHT: f64 = 760.0;
-const MENU_OPEN_ID: &str = "open";
-const MENU_DRAG_DEMO_ID: &str = "drag-demo";
-const MENU_QUIT_ID: &str = "quit";
+use tauri::{WebviewUrl, WebviewWindowBuilder};
 
 // ============================================================================
 // CLI Subcommand Definitions
@@ -158,7 +139,11 @@ end tell
     );
 
     match execute_osascript(&script) {
-        Ok(result) => Ok(jump_result(true, &normalize_precision(&result, "best_effort"), None)),
+        Ok(result) => Ok(jump_result(
+            true,
+            &normalize_precision(&result, "best_effort"),
+            None,
+        )),
         Err(reason) => Ok(jump_result(false, "unsupported", Some(reason))),
     }
 }
@@ -191,7 +176,11 @@ end tell
     );
 
     match execute_osascript(&script) {
-        Ok(result) => Ok(jump_result(true, &normalize_precision(&result, "best_effort"), None)),
+        Ok(result) => Ok(jump_result(
+            true,
+            &normalize_precision(&result, "best_effort"),
+            None,
+        )),
         Err(reason) => Ok(jump_result(false, "unsupported", Some(reason))),
     }
 }
@@ -213,7 +202,11 @@ return "best_effort"
     );
 
     match execute_osascript(&script) {
-        Ok(result) => Ok(jump_result(true, &normalize_precision(&result, "best_effort"), None)),
+        Ok(result) => Ok(jump_result(
+            true,
+            &normalize_precision(&result, "best_effort"),
+            None,
+        )),
         Err(reason) => Ok(jump_result(false, "unsupported", Some(reason))),
     }
 }
@@ -228,7 +221,6 @@ fn detect_terminal() -> Option<String> {
 }
 
 /// Get the tty device by walking up the process chain to find a process with a tty.
-#[cfg(unix)]
 fn get_parent_tty() -> Result<String, String> {
     let mut pid = std::os::unix::process::parent_id();
 
@@ -271,27 +263,26 @@ fn get_parent_tty() -> Result<String, String> {
     Err("no_tty_found_in_process_chain".to_string())
 }
 
-#[cfg(not(unix))]
-fn get_parent_tty() -> Result<String, String> {
-    Err("terminal_title_cli_is_only_supported_on_unix".to_string())
-}
-
 /// Get the current terminal window title by querying the terminal process.
 /// This uses AppleScript for iTerm2 and Terminal.app, and falls back to a heuristic for Ghostty.
 fn get_terminal_title_via_applescript(term_program: &str) -> Option<String> {
     let script = match term_program {
-        "iTerm.app" => r#"
+        "iTerm.app" => {
+            r#"
 tell application "iTerm2"
     tell current session of current window
         return name
     end tell
 end tell
-"#,
-        "Apple_Terminal" => r#"
+"#
+        }
+        "Apple_Terminal" => {
+            r#"
 tell application "Terminal"
     return custom title of front window
 end tell
-"#,
+"#
+        }
         _ => return None,
     };
 
@@ -300,7 +291,6 @@ end tell
 
 /// Get Ghostty terminal title by finding the terminal with matching tty.
 fn get_ghostty_title_for_tty(_tty_path: &str) -> Option<String> {
-
     // Get list of Ghostty terminals and find the one matching our tty
     let script = r#"
 tell application "Ghostty"
@@ -445,9 +435,7 @@ fn execute_title_clear(alias: &str) -> Result<(), String> {
         Some("iTerm.app") | Some("Apple_Terminal") => {
             get_terminal_title_via_applescript(&term_program.unwrap()).unwrap_or_default()
         }
-        Some("ghostty") => {
-            get_ghostty_title_for_tty(&tty_path).unwrap_or_default()
-        }
+        Some("ghostty") => get_ghostty_title_for_tty(&tty_path).unwrap_or_default(),
         _ => String::new(),
     };
 
@@ -459,197 +447,6 @@ fn execute_title_clear(alias: &str) -> Result<(), String> {
     set_title_via_osc(&tty_path, &new_title)?;
 
     Ok(())
-}
-
-fn build_panel(app: &AppHandle) -> tauri::Result<WebviewWindow> {
-    let panel = WebviewWindowBuilder::new(app, PANEL_LABEL, WebviewUrl::App("index.html".into()))
-        .title("HexDeck")
-        .inner_size(PANEL_WIDTH, PANEL_HEIGHT)
-        .min_inner_size(PANEL_WIDTH, PANEL_HEIGHT)
-        .resizable(false)
-        .maximizable(false)
-        .minimizable(false)
-        .closable(true)
-        .visible(false)
-        .decorations(false)
-        .always_on_top(false)
-        .skip_taskbar(true)
-        .build()?;
-
-    let panel_handle = panel.clone();
-    panel.on_window_event(move |event| match event {
-        WindowEvent::CloseRequested { api, .. } => {
-            api.prevent_close();
-            let _ = panel_handle.hide();
-        }
-        _ => {}
-    });
-
-    Ok(panel)
-}
-
-fn build_expanded_window(app: &AppHandle, section: &str) -> tauri::Result<WebviewWindow> {
-    let url = format!("index.html?view=expanded&section={section}");
-    WebviewWindowBuilder::new(app, EXPANDED_LABEL, WebviewUrl::App(url.into()))
-        .title("HexDeck")
-        .inner_size(EXPANDED_WIDTH, EXPANDED_HEIGHT)
-        .min_inner_size(720.0, 520.0)
-        .visible(true)
-        .resizable(true)
-        .maximizable(true)
-        .minimizable(true)
-        .build()
-}
-
-fn build_drag_demo_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
-    WebviewWindowBuilder::new(
-        app,
-        DRAG_DEMO_LABEL,
-        WebviewUrl::App("index.html?view=drag-demo".into()),
-    )
-    .title("HexDeck Drag Lab")
-    .inner_size(DRAG_DEMO_WIDTH, DRAG_DEMO_HEIGHT)
-    .min_inner_size(560.0, 620.0)
-    .visible(true)
-    .decorations(true)
-    .resizable(true)
-    .maximizable(false)
-    .minimizable(true)
-    .build()
-}
-
-fn quit_app(app: &AppHandle) {
-    app.cleanup_before_exit();
-    app.exit(0);
-}
-
-fn show_panel(app: &AppHandle, from_tray: bool) {
-    if let Some(panel) = app.get_webview_window(PANEL_LABEL) {
-        let _ = panel.set_size(LogicalSize::new(PANEL_WIDTH, PANEL_HEIGHT));
-        if from_tray {
-            let _ = panel.move_window_constrained(Position::TrayCenter);
-        }
-        let _ = panel.show();
-        let _ = panel.unminimize();
-        let _ = panel.set_focus();
-    }
-}
-
-fn toggle_panel(app: &AppHandle, from_tray: bool, cursor_position: Option<(f64, f64)>) {
-    let Some(panel) = app.get_webview_window(PANEL_LABEL) else {
-        return;
-    };
-
-    if panel.is_visible().unwrap_or(false) {
-        let _ = panel.hide();
-        return;
-    }
-
-    let _ = panel.set_size(LogicalSize::new(PANEL_WIDTH, PANEL_HEIGHT));
-
-    if from_tray {
-        let _ = panel.move_window_constrained(Position::TrayCenter);
-    } else if let Some((_x, _y)) = cursor_position {
-        // Reserved for future non-tray entrypoints.
-    }
-
-    let _ = panel.show();
-    let _ = panel.unminimize();
-    let _ = panel.set_focus();
-}
-
-fn open_expanded_window_inner(app: &AppHandle, section: &str) -> Result<(), String> {
-    if let Some(expanded) = app.get_webview_window(EXPANDED_LABEL) {
-        let script = format!(
-            "window.location.replace(`${{window.location.pathname}}?view=expanded&section={section}`);"
-        );
-        let _ = expanded.eval(&script);
-        let _ = expanded.show();
-        let _ = expanded.unminimize();
-        let _ = expanded.set_focus();
-        return Ok(());
-    }
-
-    build_expanded_window(app, section)
-        .map(|window| {
-            let _ = window.set_focus();
-        })
-        .map_err(|error| format!("failed_to_open_expanded_window: {error}"))
-}
-
-fn open_drag_demo_window_inner(app: &AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window(DRAG_DEMO_LABEL) {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-        return Ok(());
-    }
-
-    build_drag_demo_window(app)
-        .map(|window| {
-            let _ = window.set_focus();
-        })
-        .map_err(|error| format!("failed_to_open_drag_demo_window: {error}"))
-}
-
-#[tauri::command]
-fn toggle_panel_command(app: AppHandle) {
-    toggle_panel(&app, false, None);
-}
-
-#[tauri::command]
-fn open_expanded_window(app: AppHandle, section: Option<String>) -> Result<(), String> {
-    let section = section.as_deref().unwrap_or("overview");
-    open_expanded_window_inner(&app, section)
-}
-
-#[tauri::command]
-fn open_drag_demo_window(app: AppHandle) -> Result<(), String> {
-    open_drag_demo_window_inner(&app)
-}
-
-#[tauri::command]
-fn quit_app_command(app: AppHandle) {
-    quit_app(&app);
-}
-
-fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    let menu = MenuBuilder::new(app)
-        .text(MENU_OPEN_ID, "Open HexDeck")
-        .text(MENU_DRAG_DEMO_ID, "Open Drag Lab")
-        .text(MENU_QUIT_ID, "Quit")
-        .build()?;
-
-    let mut tray_builder = TrayIconBuilder::new()
-        .menu(&menu)
-        .show_menu_on_left_click(false)
-        .on_tray_icon_event(|tray, event| {
-            tauri_plugin_positioner::on_tray_event(&tray.app_handle(), &event);
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                position,
-                ..
-            } = event
-            {
-                toggle_panel(&tray.app_handle(), true, Some((position.x, position.y)));
-            }
-        });
-
-    if let Some(icon) = app.default_window_icon().cloned() {
-        tray_builder = tray_builder.icon(icon);
-    }
-
-    let _tray = tray_builder.build(app)?;
-    Ok(())
-}
-
-fn configure_platform_shell(_app: &AppHandle) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = _app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-        let _ = _app.set_dock_visibility(false);
-    }
 }
 
 // ============================================================================
@@ -678,18 +475,16 @@ fn main() {
                         }
                     }
                 }
-                TitleActions::Clear { alias } => {
-                    match execute_title_clear(&alias) {
-                        Ok(()) => {
-                            println!("ok");
-                            std::process::exit(0);
-                        }
-                        Err(reason) => {
-                            eprintln!("error: {reason}");
-                            std::process::exit(1);
-                        }
+                TitleActions::Clear { alias } => match execute_title_clear(&alias) {
+                    Ok(()) => {
+                        println!("ok");
+                        std::process::exit(0);
                     }
-                }
+                    Err(reason) => {
+                        eprintln!("error: {reason}");
+                        std::process::exit(1);
+                    }
+                },
             },
             None => {
                 // No subcommand, proceed to GUI
@@ -699,34 +494,11 @@ fn main() {
 
     // GUI mode: run Tauri application
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(expanded) = app.get_webview_window(EXPANDED_LABEL) {
-                let _ = expanded.show();
-                let _ = expanded.unminimize();
-                let _ = expanded.set_focus();
-                return;
-            }
-
-            show_panel(app, false);
-        }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .plugin(tauri_plugin_positioner::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .on_menu_event(|app, event| match event.id().as_ref() {
-            MENU_OPEN_ID => show_panel(app, false),
-            MENU_DRAG_DEMO_ID => {
-                let _ = open_drag_demo_window_inner(app);
-            }
-            MENU_QUIT_ID => quit_app(app),
-            _ => {}
-        })
         .invoke_handler(tauri::generate_handler![
-            toggle_panel_command,
-            open_expanded_window,
-            open_drag_demo_window,
-            quit_app_command,
             jump_with_ghostty,
             jump_with_iterm,
             jump_with_terminal_app,
@@ -735,16 +507,16 @@ fn main() {
             commands::fetch_latest_broker_release,
             commands::install_broker_update,
             commands::is_broker_running,
-            commands::get_broker_runtime_status,
-            commands::ensure_broker_running,
-            commands::restart_broker_runtime,
-            commands::open_project_path
+            commands::start_broker,
+            commands::ensure_broker_ready
         ])
         .setup(|app| {
-            build_panel(app.handle())?;
-            setup_tray(app.handle())?;
-            configure_platform_shell(app.handle());
-            show_panel(app.handle(), false);
+            let _panel =
+                WebviewWindowBuilder::new(app, "panel", WebviewUrl::App("index.html".into()))
+                    .title("HexDeck")
+                    .inner_size(420.0, 620.0)
+                    .visible(true)
+                    .build()?;
 
             Ok(())
         })
