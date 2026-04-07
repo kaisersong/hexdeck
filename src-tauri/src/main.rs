@@ -18,11 +18,15 @@ use tauri_plugin_positioner::{Position, WindowExt};
 
 const PANEL_LABEL: &str = "panel";
 const EXPANDED_LABEL: &str = "expanded";
+const DRAG_DEMO_LABEL: &str = "drag-demo";
 const PANEL_WIDTH: f64 = 340.0;
 const PANEL_HEIGHT: f64 = 460.0;
 const EXPANDED_WIDTH: f64 = 920.0;
 const EXPANDED_HEIGHT: f64 = 680.0;
+const DRAG_DEMO_WIDTH: f64 = 680.0;
+const DRAG_DEMO_HEIGHT: f64 = 760.0;
 const MENU_OPEN_ID: &str = "open";
+const MENU_DRAG_DEMO_ID: &str = "drag-demo";
 const MENU_QUIT_ID: &str = "quit";
 
 // ============================================================================
@@ -468,15 +472,12 @@ fn build_panel(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .closable(true)
         .visible(false)
         .decorations(false)
-        .always_on_top(true)
+        .always_on_top(false)
         .skip_taskbar(true)
         .build()?;
 
     let panel_handle = panel.clone();
     panel.on_window_event(move |event| match event {
-        WindowEvent::Focused(false) => {
-            let _ = panel_handle.hide();
-        }
         WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
             let _ = panel_handle.hide();
@@ -498,6 +499,28 @@ fn build_expanded_window(app: &AppHandle, section: &str) -> tauri::Result<Webvie
         .maximizable(true)
         .minimizable(true)
         .build()
+}
+
+fn build_drag_demo_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
+    WebviewWindowBuilder::new(
+        app,
+        DRAG_DEMO_LABEL,
+        WebviewUrl::App("index.html?view=drag-demo".into()),
+    )
+    .title("HexDeck Drag Lab")
+    .inner_size(DRAG_DEMO_WIDTH, DRAG_DEMO_HEIGHT)
+    .min_inner_size(560.0, 620.0)
+    .visible(true)
+    .decorations(true)
+    .resizable(true)
+    .maximizable(false)
+    .minimizable(true)
+    .build()
+}
+
+fn quit_app(app: &AppHandle) {
+    app.cleanup_before_exit();
+    app.exit(0);
 }
 
 fn show_panel(app: &AppHandle, from_tray: bool) {
@@ -554,6 +577,21 @@ fn open_expanded_window_inner(app: &AppHandle, section: &str) -> Result<(), Stri
         .map_err(|error| format!("failed_to_open_expanded_window: {error}"))
 }
 
+fn open_drag_demo_window_inner(app: &AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(DRAG_DEMO_LABEL) {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+
+    build_drag_demo_window(app)
+        .map(|window| {
+            let _ = window.set_focus();
+        })
+        .map_err(|error| format!("failed_to_open_drag_demo_window: {error}"))
+}
+
 #[tauri::command]
 fn toggle_panel_command(app: AppHandle) {
     toggle_panel(&app, false, None);
@@ -565,9 +603,20 @@ fn open_expanded_window(app: AppHandle, section: Option<String>) -> Result<(), S
     open_expanded_window_inner(&app, section)
 }
 
+#[tauri::command]
+fn open_drag_demo_window(app: AppHandle) -> Result<(), String> {
+    open_drag_demo_window_inner(&app)
+}
+
+#[tauri::command]
+fn quit_app_command(app: AppHandle) {
+    quit_app(&app);
+}
+
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let menu = MenuBuilder::new(app)
         .text(MENU_OPEN_ID, "Open HexDeck")
+        .text(MENU_DRAG_DEMO_ID, "Open Drag Lab")
         .text(MENU_QUIT_ID, "Quit")
         .build()?;
 
@@ -650,7 +699,16 @@ fn main() {
 
     // GUI mode: run Tauri application
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {}))
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(expanded) = app.get_webview_window(EXPANDED_LABEL) {
+                let _ = expanded.show();
+                let _ = expanded.unminimize();
+                let _ = expanded.set_focus();
+                return;
+            }
+
+            show_panel(app, false);
+        }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_positioner::init())
@@ -658,12 +716,17 @@ fn main() {
         .plugin(tauri_plugin_process::init())
         .on_menu_event(|app, event| match event.id().as_ref() {
             MENU_OPEN_ID => show_panel(app, false),
-            MENU_QUIT_ID => app.exit(0),
+            MENU_DRAG_DEMO_ID => {
+                let _ = open_drag_demo_window_inner(app);
+            }
+            MENU_QUIT_ID => quit_app(app),
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             toggle_panel_command,
             open_expanded_window,
+            open_drag_demo_window,
+            quit_app_command,
             jump_with_ghostty,
             jump_with_iterm,
             jump_with_terminal_app,
@@ -671,12 +734,17 @@ fn main() {
             commands::get_installed_broker_path,
             commands::fetch_latest_broker_release,
             commands::install_broker_update,
-            commands::is_broker_running
+            commands::is_broker_running,
+            commands::get_broker_runtime_status,
+            commands::ensure_broker_running,
+            commands::restart_broker_runtime,
+            commands::open_project_path
         ])
         .setup(|app| {
             build_panel(app.handle())?;
             setup_tray(app.handle())?;
             configure_platform_shell(app.handle());
+            show_panel(app.handle(), false);
 
             Ok(())
         })

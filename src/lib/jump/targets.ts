@@ -10,12 +10,19 @@ interface JumpSeed {
 }
 
 const EXACT_TERMINAL_APPS = new Set(['Ghostty', 'iTerm']);
-const BEST_EFFORT_TERMINAL_APPS = new Set(['Terminal.app']);
+const BEST_EFFORT_TERMINAL_APPS = new Set([
+  'Terminal.app',
+  'Windows Terminal',
+  'WezTerm',
+  'PowerShell',
+  'pwsh',
+  'cmd',
+]);
 
 export function buildJumpTarget(seed: JumpSeed): JumpTarget {
   const precision = EXACT_TERMINAL_APPS.has(seed.terminalApp)
     ? 'exact'
-    : BEST_EFFORT_TERMINAL_APPS.has(seed.terminalApp)
+    : BEST_EFFORT_TERMINAL_APPS.has(seed.terminalApp) || Boolean(seed.projectPath)
       ? 'best_effort'
       : 'unsupported';
 

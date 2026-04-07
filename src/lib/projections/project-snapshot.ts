@@ -24,7 +24,7 @@ export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjecti
     });
   };
 
-  const now: AgentCardProjection[] = seed.workStates.slice(0, 5).map((workState) => {
+  const now: AgentCardProjection[] = seed.workStates.map((workState) => {
     const participant = byParticipant.get(workState.participantId);
     const jumpTarget = buildParticipantJumpTarget(workState.participantId);
 

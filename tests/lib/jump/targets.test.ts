@@ -20,4 +20,17 @@ describe('buildJumpTarget', () => {
       projectPath: '/Users/song/projects/intent-broker',
     });
   });
+
+  it('returns best_effort when only a project path is available', () => {
+    const target = buildJumpTarget({
+      participantId: 'codex-session-win',
+      alias: 'codex-win',
+      toolLabel: 'codex',
+      terminalApp: 'Warp',
+      sessionHint: null,
+      projectPath: 'D:/projects/hexdeck',
+    });
+
+    expect(target.precision).toBe('best_effort');
+  });
 });

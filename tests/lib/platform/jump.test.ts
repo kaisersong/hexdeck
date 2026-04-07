@@ -34,7 +34,7 @@ describe('jumpToTarget', () => {
       terminalApp: 'Warp',
       precision: 'unsupported',
       sessionHint: null,
-      projectPath: '/repo',
+      projectPath: null,
     });
 
     expect(result).toEqual({
@@ -42,5 +42,26 @@ describe('jumpToTarget', () => {
       precision: 'unsupported',
       reason: 'unsupported_terminal',
     });
+  });
+
+  it('opens the project path when the terminal is unsupported but a repo path exists', async () => {
+    const openProjectPath = vi.fn().mockResolvedValue(undefined);
+
+    const result = await jumpToTarget(
+      {
+        participantId: 'a',
+        terminalApp: 'Warp',
+        precision: 'best_effort',
+        sessionHint: null,
+        projectPath: 'D:/projects/hexdeck',
+      },
+      { openProjectPath }
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      precision: 'best_effort',
+    });
+    expect(openProjectPath).toHaveBeenCalledWith('D:/projects/hexdeck');
   });
 });

@@ -3,11 +3,11 @@ import { describe, expect, it } from 'vitest';
 import { App } from './App';
 
 describe('App shell', () => {
-  it('renders the HexDeck header with project selector', () => {
+  it('renders the compact dropdown shell header and primary action', () => {
     render(<App />);
 
-    expect(screen.getByRole('heading', { level: 1, name: 'HexDeck' })).toBeInTheDocument();
-    // The project selector button shows the current project name
-    expect(screen.getByRole('button', { name: 'intent-broker' })).toBeInTheDocument();
+    expect(screen.getByText('HEXDECK PRO')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Settings' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Open Main Panel' })).toBeInTheDocument();
   });
 });

@@ -8,6 +8,7 @@ export interface BrokerParticipant {
   alias: string;
   kind?: string;
   tool?: string;
+  metadata?: Record<string, unknown>;
   context?: {
     projectName?: string;
   };
