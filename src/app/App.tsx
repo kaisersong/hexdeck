@@ -55,7 +55,7 @@ function buildEmptySnapshot(participants: BrokerParticipant[], brokerHealthy = f
   return {
     overview: {
       brokerHealthy,
-      onlineCount: participants.length,
+      onlineCount: participants.filter((participant) => participant.presence === 'online').length,
       busyCount: 0,
       blockedCount: 0,
       pendingApprovalCount: 0,
@@ -411,7 +411,6 @@ export function App() {
         currentProject={currentProject}
         brokerLive={brokerLive}
         onJump={handleJump}
-        onOpenExpanded={() => void openExpandedWindow('overview')}
         onOpenSettings={() => void openExpandedWindow('settings')}
         onMinimize={() => void minimizeCurrentWindow()}
         onClose={() => void hidePanelWindow()}

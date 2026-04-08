@@ -13,6 +13,29 @@ export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjecti
     (participant) => participant.kind !== 'human' && participant.kind !== 'adapter'
   );
   const agentParticipantIds = new Set(agentParticipants.map((participant) => participant.participantId));
+  const workStateParticipantIds = new Set(seed.workStates.map((workState) => workState.participantId));
+  const onlineAgentCount = agentParticipants.filter((participant) => {
+    if (participant.presence === 'online') {
+      const connectionCount = participant.presenceMetadata?.connectionCount;
+      const hasLiveTransport =
+        participant.presenceMetadata?.transport === 'websocket' ||
+        (typeof connectionCount === 'number' && connectionCount > 0);
+
+      if (hasLiveTransport) {
+        return true;
+      }
+    }
+
+    if (participant.presence === 'offline') {
+      return false;
+    }
+
+    if (workStateParticipantIds.has(participant.participantId)) {
+      return true;
+    }
+
+    return false;
+  }).length;
 
   const buildParticipantJumpTarget = (participantId: string) => {
     const participant = byParticipant.get(participantId);
@@ -80,7 +103,7 @@ export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjecti
   return {
     overview: {
       brokerHealthy: seed.health.ok,
-      onlineCount: agentParticipants.length,
+      onlineCount: onlineAgentCount,
       busyCount: seed.workStates.filter(
         (item) => item.status === 'implementing' && (agentParticipantIds.has(item.participantId) || !byParticipant.has(item.participantId))
       ).length,

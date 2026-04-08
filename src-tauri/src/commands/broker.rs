@@ -1,6 +1,8 @@
 use chrono::Utc;
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -36,6 +38,29 @@ pub struct BrokerStartResult {
     pub log_path: String,
     pub node_path: Option<String>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerRuntimeStatus {
+    pub installed: bool,
+    pub running: bool,
+    pub healthy: bool,
+    pub version: Option<String>,
+    pub path: Option<String>,
+    pub heartbeat_path: Option<String>,
+    pub stdout_path: Option<String>,
+    pub stderr_path: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerApprovalResponsePayload {
+    pub approval_id: String,
+    pub task_id: String,
+    pub from_participant_id: String,
+    pub decision: String,
 }
 
 #[derive(Debug, Clone)]
@@ -228,6 +253,282 @@ fn heartbeat_is_running(heartbeat: &serde_json::Value, expected_pid: Option<u32>
         Some(pid) => heartbeat_pid(heartbeat) == Some(pid),
         None => true,
     }
+}
+
+fn heartbeat_error(heartbeat: &serde_json::Value) -> Option<String> {
+    heartbeat
+        .get("error")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+}
+
+fn build_runtime_status(
+    manifest: Option<&BrokerManifest>,
+    healthy: bool,
+    runtime_paths: Option<&BrokerRuntimePaths>,
+    heartbeat: Option<&serde_json::Value>,
+    last_error: Option<String>,
+) -> BrokerRuntimeStatus {
+    let installed = manifest.is_some();
+    let running = healthy
+        || heartbeat
+            .map(|payload| heartbeat_is_running(payload, None))
+            .unwrap_or(false);
+
+    BrokerRuntimeStatus {
+        installed,
+        running,
+        healthy,
+        version: manifest.map(|item| item.version.clone()),
+        path: manifest.map(|item| item.path.clone()),
+        heartbeat_path: runtime_paths.map(|paths| paths.heartbeat.to_string_lossy().to_string()),
+        stdout_path: runtime_paths.map(|paths| paths.stdout.to_string_lossy().to_string()),
+        stderr_path: runtime_paths.map(|paths| paths.stderr.to_string_lossy().to_string()),
+        last_error: last_error
+            .or_else(|| heartbeat.and_then(heartbeat_error))
+            .filter(|value| !value.is_empty()),
+    }
+}
+
+async fn collect_broker_runtime_status(
+    app: &AppHandle,
+    broker_url: &str,
+    last_error: Option<String>,
+) -> Result<BrokerRuntimeStatus, String> {
+    let manifest = read_broker_manifest(app).await?;
+    let runtime_paths = manifest
+        .as_ref()
+        .map(|item| PathBuf::from(&item.path))
+        .filter(|path| path.exists())
+        .map(|path| resolve_broker_runtime_paths(&path));
+    let heartbeat = match runtime_paths.as_ref() {
+        Some(paths) => read_heartbeat(&paths.heartbeat).await,
+        None => None,
+    };
+    let healthy = broker_health_ok(broker_url).await;
+
+    Ok(build_runtime_status(
+        manifest.as_ref(),
+        healthy,
+        runtime_paths.as_ref(),
+        heartbeat.as_ref(),
+        last_error,
+    ))
+}
+
+async fn broker_get_json(broker_url: &str, path: &str) -> Result<serde_json::Value, String> {
+    let url = format!("{}{}", broker_url.trim_end_matches('/'), path);
+    let response = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("broker_request_failed {} {}", path, e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "broker_request_failed {} {}",
+            response.status().as_u16(),
+            path
+        ));
+    }
+
+    response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("broker_response_parse_failed {} {}", path, e))
+}
+
+fn value_items(payload: serde_json::Value, key: &str) -> serde_json::Value {
+    if payload.is_array() {
+        return payload;
+    }
+
+    payload
+        .get(key)
+        .cloned()
+        .filter(|value| value.is_array())
+        .unwrap_or_else(|| json!([]))
+}
+
+fn merge_participants_with_presence(participants: Value, presence: Value) -> Value {
+    let mut participants = value_items(participants, "participants");
+    let presence_items = value_items(presence, "participants");
+    let presence_by_participant: HashMap<String, String> = presence_items
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let participant_id = item.get("participantId")?.as_str()?.to_string();
+            let status = item.get("status")?.as_str()?.to_string();
+            Some((participant_id, status))
+        })
+        .collect();
+    let presence_metadata_by_participant: HashMap<String, Value> = presence_items
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let participant_id = item.get("participantId")?.as_str()?.to_string();
+            let metadata = item.get("metadata")?.clone();
+            Some((participant_id, metadata))
+        })
+        .collect();
+
+    if let Some(items) = participants.as_array_mut() {
+        for participant in items.iter_mut() {
+            let Some(participant_id) = participant
+                .get("participantId")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let Some(status) = presence_by_participant.get(&participant_id) else {
+                continue;
+            };
+            let Some(object) = participant.as_object_mut() else {
+                continue;
+            };
+            object.insert("presence".to_string(), json!(status));
+            if let Some(metadata) = presence_metadata_by_participant.get(&participant_id).cloned() {
+                object.insert("presenceMetadata".to_string(), metadata);
+            }
+        }
+    }
+
+    participants
+}
+
+#[tauri::command]
+pub async fn load_broker_service_seed(
+    broker_url: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let broker_url = broker_url.unwrap_or_else(|| "http://127.0.0.1:4318".to_string());
+    let health = broker_get_json(&broker_url, "/health").await?;
+    let participants = broker_get_json(&broker_url, "/participants").await?;
+    let work_states = broker_get_json(&broker_url, "/work-state").await?;
+    let presence = broker_get_json(&broker_url, "/presence")
+        .await
+        .unwrap_or_else(|_| json!({ "participants": [] }));
+    let events = broker_get_json(&broker_url, "/events/replay?after=0").await?;
+
+    Ok(json!({
+        "health": health,
+        "participants": merge_participants_with_presence(participants, presence),
+        "workStates": value_items(work_states, "items"),
+        "events": value_items(events, "items"),
+        "approvals": []
+    }))
+}
+
+#[tauri::command]
+pub async fn load_broker_project_seed(
+    broker_url: Option<String>,
+    project_name: String,
+) -> Result<serde_json::Value, String> {
+    let broker_url = broker_url.unwrap_or_else(|| "http://127.0.0.1:4318".to_string());
+    let encoded_project_name = urlencoding::encode(&project_name);
+    let approvals_path = format!(
+        "/projects/{}/approvals?status=pending",
+        encoded_project_name
+    );
+    let participants_path = format!("/participants?projectName={}", encoded_project_name);
+    let work_state_path = format!("/work-state?projectName={}", encoded_project_name);
+
+    let health = broker_get_json(&broker_url, "/health").await?;
+    let participants = broker_get_json(&broker_url, &participants_path).await?;
+    let work_states = broker_get_json(&broker_url, &work_state_path).await?;
+    let presence = broker_get_json(&broker_url, "/presence")
+        .await
+        .unwrap_or_else(|_| json!({ "participants": [] }));
+    let events = broker_get_json(&broker_url, "/events/replay?after=0").await?;
+    let approvals = broker_get_json(&broker_url, &approvals_path).await?;
+
+    Ok(json!({
+        "health": health,
+        "participants": merge_participants_with_presence(participants, presence),
+        "workStates": value_items(work_states, "items"),
+        "events": value_items(events, "items"),
+        "approvals": value_items(approvals, "items")
+    }))
+}
+
+#[tauri::command]
+pub async fn load_broker_pending_approvals(
+    broker_url: Option<String>,
+    project_name: String,
+) -> Result<serde_json::Value, String> {
+    let broker_url = broker_url.unwrap_or_else(|| "http://127.0.0.1:4318".to_string());
+    let encoded_project_name = urlencoding::encode(&project_name);
+    let path = format!(
+        "/projects/{}/approvals?status=pending",
+        encoded_project_name
+    );
+    let approvals = broker_get_json(&broker_url, &path).await?;
+    Ok(value_items(approvals, "items"))
+}
+
+#[tauri::command]
+pub async fn respond_to_broker_approval(
+    broker_url: Option<String>,
+    input: BrokerApprovalResponsePayload,
+) -> Result<(), String> {
+    let broker_url = broker_url.unwrap_or_else(|| "http://127.0.0.1:4318".to_string());
+    let url = format!(
+        "{}/approvals/{}/respond",
+        broker_url.trim_end_matches('/'),
+        urlencoding::encode(&input.approval_id)
+    );
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&json!({
+            "taskId": input.task_id,
+            "fromParticipantId": input.from_participant_id,
+            "decision": input.decision,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("broker_approval_failed {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "broker_approval_failed {}",
+            response.status().as_u16()
+        ));
+    }
+
+    Ok(())
+}
+
+async fn stop_running_broker(
+    log_path: &Path,
+    broker_url: &str,
+    heartbeat_path: &PathBuf,
+) -> Result<(), String> {
+    let heartbeat = read_heartbeat(heartbeat_path).await;
+    let pid = heartbeat.as_ref().and_then(heartbeat_pid);
+    if let Some(pid) = pid {
+        maybe_log(
+            Some(log_path),
+            &format!("restart_broker_runtime: sending TERM to pid={}", pid),
+        );
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status()
+            .map_err(|e| format!("failed_to_stop_broker: {}", e))?;
+        if !status.success() {
+            return Err(format!("failed_to_stop_broker_pid_{}", pid));
+        }
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !broker_health_ok(broker_url).await {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    Err("broker_did_not_stop_before_timeout".to_string())
 }
 
 /// Get the currently installed broker version
@@ -609,6 +910,53 @@ pub async fn is_broker_running() -> Result<bool, String> {
     Ok(broker_health_ok("http://127.0.0.1:4318").await)
 }
 
+#[tauri::command]
+pub async fn get_broker_runtime_status(app: AppHandle) -> Result<BrokerRuntimeStatus, String> {
+    collect_broker_runtime_status(&app, "http://127.0.0.1:4318", None).await
+}
+
+#[tauri::command]
+pub async fn ensure_broker_running(app: AppHandle) -> Result<BrokerRuntimeStatus, String> {
+    let result = ensure_broker_ready(app.clone(), None, None).await?;
+    collect_broker_runtime_status(&app, "http://127.0.0.1:4318", result.last_error).await
+}
+
+#[tauri::command]
+pub async fn restart_broker_runtime(app: AppHandle) -> Result<BrokerRuntimeStatus, String> {
+    let broker_url = "http://127.0.0.1:4318";
+    let log_path = get_bootstrap_log_path(&app)?;
+    append_bootstrap_log(log_path.as_path(), "=== restart_broker_runtime begin ===");
+
+    if let Some(manifest) = read_broker_manifest(&app).await? {
+        let installed_path = PathBuf::from(&manifest.path);
+        if installed_path.exists() {
+            let runtime_paths = resolve_broker_runtime_paths(&installed_path);
+            if broker_health_ok(broker_url).await {
+                if let Err(error) =
+                    stop_running_broker(log_path.as_path(), broker_url, &runtime_paths.heartbeat).await
+                {
+                    append_bootstrap_log(
+                        log_path.as_path(),
+                        &format!("restart_broker_runtime: stop failed error={}", error),
+                    );
+                    return collect_broker_runtime_status(&app, broker_url, Some(error)).await;
+                }
+            }
+        }
+    }
+
+    let result = start_broker_internal(
+        app.clone(),
+        broker_url.to_string(),
+        15000,
+        Some(log_path.as_path()),
+    )
+    .await
+    .map_err(|error| format!("restart_broker_runtime_failed: {}", error))?;
+
+    collect_broker_runtime_status(&app, broker_url, result.last_error).await
+}
+
 async fn start_broker_internal(
     app: AppHandle,
     broker_url: String,
@@ -950,5 +1298,72 @@ pub async fn ensure_broker_ready(
                 error,
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn build_runtime_status_reports_installed_healthy_runtime() {
+        let manifest = BrokerManifest {
+            version: "0.2.0".to_string(),
+            path: "/tmp/intent-broker-0.2.0".to_string(),
+            installed_at: "2026-04-08T00:00:00Z".to_string(),
+        };
+        let runtime_paths = BrokerRuntimePaths {
+            stdout: PathBuf::from("/tmp/intent-broker-0.2.0/.tmp/broker.stdout.log"),
+            stderr: PathBuf::from("/tmp/intent-broker-0.2.0/.tmp/broker.stderr.log"),
+            heartbeat: PathBuf::from("/tmp/intent-broker-0.2.0/.tmp/broker.heartbeat.json"),
+        };
+        let heartbeat = json!({
+            "pid": 1234,
+            "status": "running",
+            "error": null
+        });
+
+        let status = build_runtime_status(
+            Some(&manifest),
+            true,
+            Some(&runtime_paths),
+            Some(&heartbeat),
+            None,
+        );
+
+        assert!(status.installed);
+        assert!(status.running);
+        assert!(status.healthy);
+        assert_eq!(status.version.as_deref(), Some("0.2.0"));
+        assert_eq!(status.path.as_deref(), Some("/tmp/intent-broker-0.2.0"));
+        assert_eq!(
+            status.heartbeat_path.as_deref(),
+            Some("/tmp/intent-broker-0.2.0/.tmp/broker.heartbeat.json")
+        );
+        assert_eq!(status.last_error, None);
+    }
+
+    #[test]
+    fn build_runtime_status_uses_runtime_error_when_present() {
+        let manifest = BrokerManifest {
+            version: "0.2.0".to_string(),
+            path: "/tmp/intent-broker-0.2.0".to_string(),
+            installed_at: "2026-04-08T00:00:00Z".to_string(),
+        };
+        let heartbeat = json!({
+            "status": "stopped",
+            "error": "broker_not_ready_before_timeout"
+        });
+
+        let status = build_runtime_status(Some(&manifest), false, None, Some(&heartbeat), None);
+
+        assert!(status.installed);
+        assert!(!status.running);
+        assert!(!status.healthy);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("broker_not_ready_before_timeout")
+        );
     }
 }

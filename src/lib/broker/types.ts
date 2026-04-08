@@ -3,11 +3,21 @@ export interface BrokerHealth {
   status?: 'healthy' | 'degraded';
 }
 
+export type BrokerPresenceStatus = 'online' | 'offline';
+
+export interface BrokerPresence {
+  participantId: string;
+  status: BrokerPresenceStatus;
+  metadata?: Record<string, unknown>;
+}
+
 export interface BrokerParticipant {
   participantId: string;
   alias: string;
   kind?: string;
   tool?: string;
+  presence?: BrokerPresenceStatus;
+  presenceMetadata?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   context?: {
     projectName?: string;

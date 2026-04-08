@@ -6,9 +6,9 @@ describe('buildProjectSnapshot', () => {
     const snapshot = buildProjectSnapshot({
       health: { ok: true },
       participants: [
-        { participantId: 'a', alias: 'codex4', kind: 'agent', context: { projectName: 'intent-broker' } },
-        { participantId: 'b', alias: 'claude2', kind: 'agent', context: { projectName: 'intent-broker' } },
-        { participantId: 'human.local', alias: 'human', kind: 'human', context: { projectName: 'intent-broker' } },
+        { participantId: 'a', alias: 'codex4', kind: 'agent', presence: 'online', context: { projectName: 'intent-broker' } },
+        { participantId: 'b', alias: 'claude2', kind: 'agent', presence: 'offline', context: { projectName: 'intent-broker' } },
+        { participantId: 'human.local', alias: 'human', kind: 'human', presence: 'online', context: { projectName: 'intent-broker' } },
       ],
       workStates: [
         { participantId: 'a', status: 'implementing', summary: 'Working on HexDeck' },
@@ -27,10 +27,54 @@ describe('buildProjectSnapshot', () => {
       ],
     });
 
-    expect(snapshot.overview.onlineCount).toBe(2);
+    expect(snapshot.overview.onlineCount).toBe(1);
     expect(snapshot.overview.blockedCount).toBe(1);
     expect(snapshot.attention[0].kind).toBe('blocked');
     expect(snapshot.attention[1].kind).toBe('approval');
+  });
+
+  it('falls back to work-state presence when explicit broker presence is missing', () => {
+    const snapshot = buildProjectSnapshot({
+      health: { ok: true },
+      participants: [
+        { participantId: 'a', alias: 'codex4', kind: 'agent', context: { projectName: 'intent-broker' } },
+        { participantId: 'b', alias: 'claude2', kind: 'agent', context: { projectName: 'intent-broker' } },
+      ],
+      workStates: [{ participantId: 'a', status: 'idle', summary: 'Available' }],
+      events: [],
+      approvals: [],
+    });
+
+    expect(snapshot.overview.onlineCount).toBe(1);
+  });
+
+  it('does not count registration-only broker presence as online without work-state activity', () => {
+    const snapshot = buildProjectSnapshot({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'a',
+          alias: 'codex4',
+          kind: 'agent',
+          presence: 'online',
+          presenceMetadata: { source: 'registration' },
+          context: { projectName: 'intent-broker' },
+        },
+        {
+          participantId: 'b',
+          alias: 'claude2',
+          kind: 'agent',
+          presence: 'online',
+          presenceMetadata: { transport: 'websocket', connectionCount: 1 },
+          context: { projectName: 'intent-broker' },
+        },
+      ],
+      workStates: [],
+      events: [],
+      approvals: [],
+    });
+
+    expect(snapshot.overview.onlineCount).toBe(1);
   });
 
   it('adds jump metadata to now cards', () => {

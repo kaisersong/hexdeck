@@ -1,8 +1,10 @@
+import { invoke } from '@tauri-apps/api/core';
 import type {
   BrokerApprovalItem,
   BrokerApprovalResponseInput,
   BrokerEvent,
   BrokerHealth,
+  BrokerPresence,
   BrokerParticipant,
   BrokerWorkState,
   ProjectSeed
@@ -15,6 +17,27 @@ interface BrokerClientOptions {
 }
 
 type BrokerEventListener = (event: BrokerEvent) => void;
+
+function mergeParticipantsWithPresence(
+  participants: BrokerParticipant[],
+  presence: BrokerPresence[]
+): BrokerParticipant[] {
+  if (presence.length === 0) {
+    return participants;
+  }
+
+  const presenceByParticipant = new Map(presence.map((item) => [item.participantId, item]));
+  return participants.map((participant) => ({
+    ...participant,
+    presence: presenceByParticipant.get(participant.participantId)?.status ?? participant.presence,
+    presenceMetadata:
+      presenceByParticipant.get(participant.participantId)?.metadata ?? participant.presenceMetadata,
+  }));
+}
+
+function isTauriEnvironment(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+}
 
 function isBrokerEvent(value: unknown): value is BrokerEvent {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -47,18 +70,26 @@ export class BrokerClient {
   }
 
   async loadProjectSeed(projectName: string): Promise<ProjectSeed> {
+    if (isTauriEnvironment()) {
+      return invoke<ProjectSeed>('load_broker_project_seed', {
+        brokerUrl: this.brokerUrl,
+        projectName,
+      });
+    }
+
     const encodedProjectName = encodeURIComponent(projectName);
-    const [health, participants, workStates, events, approvals] = await Promise.all([
+    const [health, participants, workStates, presence, events, approvals] = await Promise.all([
       this.request<BrokerHealth>('/health'),
       this.requestList<BrokerParticipant>(`/participants?projectName=${encodedProjectName}`, 'participants'),
       this.requestList<BrokerWorkState>(`/work-state?projectName=${encodedProjectName}`, 'items'),
-      this.request<BrokerEvent[]>('/events/replay?after=0'),
+      this.loadPresence(),
+      this.requestList<BrokerEvent>('/events/replay?after=0', 'items'),
       this.loadPendingApprovals(projectName),
     ]);
 
     return {
       health,
-      participants,
+      participants: mergeParticipantsWithPresence(participants, presence),
       workStates,
       events,
       approvals,
@@ -66,16 +97,23 @@ export class BrokerClient {
   }
 
   async loadServiceSeed(): Promise<ProjectSeed> {
-    const [health, participants, workStates, events] = await Promise.all([
+    if (isTauriEnvironment()) {
+      return invoke<ProjectSeed>('load_broker_service_seed', {
+        brokerUrl: this.brokerUrl,
+      });
+    }
+
+    const [health, participants, workStates, presence, events] = await Promise.all([
       this.request<BrokerHealth>('/health'),
       this.requestList<BrokerParticipant>('/participants', 'participants'),
       this.requestList<BrokerWorkState>('/work-state', 'items'),
-      this.request<BrokerEvent[]>('/events/replay?after=0'),
+      this.loadPresence(),
+      this.requestList<BrokerEvent>('/events/replay?after=0', 'items'),
     ]);
 
     return {
       health,
-      participants,
+      participants: mergeParticipantsWithPresence(participants, presence),
       workStates,
       events,
       approvals: [],
@@ -83,6 +121,13 @@ export class BrokerClient {
   }
 
   async loadPendingApprovals(projectName: string): Promise<BrokerApprovalItem[]> {
+    if (isTauriEnvironment()) {
+      return invoke<BrokerApprovalItem[]>('load_broker_pending_approvals', {
+        brokerUrl: this.brokerUrl,
+        projectName,
+      });
+    }
+
     const encodedProjectName = encodeURIComponent(projectName);
     const payload = await this.request<{ items: BrokerApprovalItem[] }>(
       `/projects/${encodedProjectName}/approvals?status=pending`
@@ -91,6 +136,14 @@ export class BrokerClient {
   }
 
   async respondToApproval(input: BrokerApprovalResponseInput): Promise<void> {
+    if (isTauriEnvironment()) {
+      await invoke('respond_to_broker_approval', {
+        brokerUrl: this.brokerUrl,
+        input,
+      });
+      return;
+    }
+
     const response = await this.fetchImpl(
       `${this.brokerUrl}/approvals/${encodeURIComponent(input.approvalId)}/respond`,
       {
@@ -117,6 +170,10 @@ export class BrokerClient {
   }
 
   connectRealtime(): () => void {
+    if (isTauriEnvironment()) {
+      return () => undefined;
+    }
+
     if (this.realtimeCleanup) {
       return this.realtimeCleanup;
     }
@@ -182,5 +239,13 @@ export class BrokerClient {
 
     const items = payload[key];
     return Array.isArray(items) ? (items as T[]) : [];
+  }
+
+  private async loadPresence(): Promise<BrokerPresence[]> {
+    try {
+      return await this.requestList<BrokerPresence>('/presence', 'participants');
+    } catch {
+      return [];
+    }
   }
 }

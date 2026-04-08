@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from 'react';
 import type { BrokerParticipant } from '../../lib/broker/types';
 import type { JumpTarget } from '../../lib/jump/types';
 import { startWindowDragging } from '../../lib/platform/window-controls';
@@ -21,6 +22,11 @@ type MenuProjectGroup = {
   agents: MenuAgentItem[];
 };
 
+type MenuGroups = {
+  onlineGroups: MenuProjectGroup[];
+  offlineAgents: MenuAgentItem[];
+};
+
 function toStateTone(workState?: string): MenuAgentItem['stateTone'] {
   if (workState === 'blocked') {
     return 'blocked';
@@ -41,14 +47,34 @@ function toStateLabel(workState?: string): string {
   return workState ?? 'idle';
 }
 
+function isParticipantOnline(participant: BrokerParticipant, nowByParticipant: Map<string, AgentCardProjection>): boolean {
+  if (participant.presence === 'online') {
+    const connectionCount = participant.presenceMetadata?.connectionCount;
+    const hasLiveTransport =
+      participant.presenceMetadata?.transport === 'websocket' ||
+      (typeof connectionCount === 'number' && connectionCount > 0);
+
+    if (hasLiveTransport) {
+      return true;
+    }
+  }
+
+  if (participant.presence === 'offline') {
+    return false;
+  }
+
+  return nowByParticipant.has(participant.participantId);
+}
+
 function buildProjectGroups(
   participants: BrokerParticipant[],
   currentProject: string,
   now: AgentCardProjection[]
-): MenuProjectGroup[] {
+): MenuGroups {
   const currentProjectKey = currentProject.trim() || 'Current Project';
   const nowByParticipant = new Map(now.map((item) => [item.participantId, item]));
   const groups = new Map<string, MenuProjectGroup>();
+  const offlineAgents: MenuAgentItem[] = [];
 
   const ensureGroup = (name: string) => {
     const normalized = name.trim() || currentProjectKey;
@@ -63,17 +89,24 @@ function buildProjectGroups(
   for (const participant of participants) {
     const groupName = participant.context?.projectName ?? currentProjectKey;
     const currentState = nowByParticipant.get(participant.participantId);
+    const isOnline = isParticipantOnline(participant, nowByParticipant);
     const stateLabel = toStateLabel(currentState?.workState);
     const stateTone = toStateTone(currentState?.workState);
-    const group = ensureGroup(groupName);
-
-    group.agents.push({
+    const agent: MenuAgentItem = {
       participantId: participant.participantId,
       alias: participant.alias,
-      stateLabel,
-      stateTone,
+      stateLabel: isOnline ? stateLabel : 'offline',
+      stateTone: isOnline ? stateTone : 'idle',
       jumpTarget: currentState?.jumpTarget,
-    });
+    };
+
+    if (!isOnline) {
+      offlineAgents.push(agent);
+      continue;
+    }
+
+    const group = ensureGroup(groupName);
+    group.agents.push(agent);
 
     if (stateTone !== 'idle') {
       group.activeCount += 1;
@@ -99,26 +132,40 @@ function buildProjectGroups(
     }
   }
 
-  return Array.from(groups.values())
-    .map((group) => ({
-      ...group,
-      agents: group.agents.sort((left, right) => left.alias.localeCompare(right.alias)),
-    }))
-    .sort((left, right) => {
-      if (left.name === currentProjectKey) {
-        return -1;
-      }
+  return {
+    onlineGroups: Array.from(groups.values())
+      .map((group) => ({
+        ...group,
+        agents: group.agents.sort((left, right) => left.alias.localeCompare(right.alias)),
+      }))
+      .sort((left, right) => {
+        if (left.name === currentProjectKey) {
+          return -1;
+        }
 
-      if (right.name === currentProjectKey) {
-        return 1;
-      }
+        if (right.name === currentProjectKey) {
+          return 1;
+        }
 
-      if (right.activeCount !== left.activeCount) {
-        return right.activeCount - left.activeCount;
-      }
+        if (right.activeCount !== left.activeCount) {
+          return right.activeCount - left.activeCount;
+        }
 
-      return left.name.localeCompare(right.name);
-    });
+        return left.name.localeCompare(right.name);
+      }),
+    offlineAgents: offlineAgents.sort((left, right) => left.alias.localeCompare(right.alias)),
+  };
+}
+
+function ChevronIcon({ expanded }: { expanded: boolean }) {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <path
+        d={expanded ? 'M5.47 12.03a.75.75 0 0 0 1.06 0L10 8.56l3.47 3.47a.75.75 0 0 0 1.06-1.06l-4-4a.75.75 0 0 0-1.06 0l-4 4a.75.75 0 0 0 0 1.06Z' : 'M7.97 5.47a.75.75 0 0 0 0 1.06L11.44 10l-3.47 3.47a.75.75 0 1 0 1.06 1.06l4-4a.75.75 0 0 0 0-1.06l-4-4a.75.75 0 0 0-1.06 0Z'}
+        fill="currentColor"
+      />
+    </svg>
+  );
 }
 
 function renderAttentionBadge(items: AttentionItemProjection[]): string | null {
@@ -151,28 +198,6 @@ function SettingsIcon() {
   );
 }
 
-function DashboardIcon() {
-  return (
-    <svg viewBox="0 0 20 20" aria-hidden="true">
-      <path
-        d="M3 4.5A1.5 1.5 0 0 1 4.5 3h4A1.5 1.5 0 0 1 10 4.5v4A1.5 1.5 0 0 1 8.5 10h-4A1.5 1.5 0 0 1 3 8.5v-4Zm7 0A1.5 1.5 0 0 1 11.5 3h4A1.5 1.5 0 0 1 17 4.5v4A1.5 1.5 0 0 1 15.5 10h-4A1.5 1.5 0 0 1 10 8.5v-4Zm-7 7A1.5 1.5 0 0 1 4.5 10h4A1.5 1.5 0 0 1 10 11.5v4A1.5 1.5 0 0 1 8.5 17h-4A1.5 1.5 0 0 1 3 15.5v-4Zm7 0A1.5 1.5 0 0 1 11.5 10h4A1.5 1.5 0 0 1 17 11.5v4A1.5 1.5 0 0 1 15.5 17h-4A1.5 1.5 0 0 1 10 15.5v-4Z"
-        fill="currentColor"
-      />
-    </svg>
-  );
-}
-
-function ArrowRightIcon() {
-  return (
-    <svg viewBox="0 0 20 20" aria-hidden="true">
-      <path
-        d="M5.25 10a.75.75 0 0 1 .75-.75h6.19L9.97 7.03a.75.75 0 1 1 1.06-1.06l3.5 3.5a.75.75 0 0 1 0 1.06l-3.5 3.5a.75.75 0 1 1-1.06-1.06l2.22-2.22H6a.75.75 0 0 1-.75-.75Z"
-        fill="currentColor"
-      />
-    </svg>
-  );
-}
-
 function TerminalIcon() {
   return (
     <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -190,7 +215,6 @@ export function PanelRoute({
   currentProject,
   brokerLive,
   onJump,
-  onOpenExpanded,
   onOpenSettings,
   onMinimize,
   onClose,
@@ -200,16 +224,32 @@ export function PanelRoute({
   currentProject: string;
   brokerLive?: boolean;
   onJump?: (target: JumpTarget) => void;
-  onOpenExpanded?: () => void;
   onOpenSettings?: () => void;
   onMinimize?: () => void;
   onClose?: () => void;
 }) {
-  const groups = buildProjectGroups(participants, currentProject, snapshot.now);
+  const [offlineExpanded, setOfflineExpanded] = useState(false);
+  const firstOfflineRowRef = useRef<HTMLButtonElement | null>(null);
+  const { onlineGroups, offlineAgents } = buildProjectGroups(participants, currentProject, snapshot.now);
   const attentionBadge = renderAttentionBadge(snapshot.attention);
+  const brokerStatusLive = brokerLive ?? snapshot.overview.brokerHealthy;
+  const brokerChipLabel = brokerStatusLive ? 'Live' : 'Degraded';
+  const brokerFooterLabel = brokerStatusLive ? 'Healthy' : 'Degraded';
+  const currentProjectLabel = currentProject.trim() || 'Current Project';
+
+  useEffect(() => {
+    if (!offlineExpanded) {
+      return;
+    }
+
+    if (typeof firstOfflineRowRef.current?.scrollIntoView === 'function') {
+      firstOfflineRowRef.current.scrollIntoView({ block: 'nearest' });
+    }
+  }, [offlineExpanded]);
 
   return (
     <div className="menu-dropdown">
+      <div className="menu-dropdown__chrome" aria-hidden="true" />
       <header
         className="menu-dropdown__header panel-header--draggable"
         onMouseDown={(event) => void startWindowDragging(event.target, event.currentTarget)}
@@ -218,86 +258,125 @@ export function PanelRoute({
           <span className="menu-dropdown__title">HEXDECK PRO</span>
         </div>
         <div className="menu-dropdown__header-actions">
+          <span className={`menu-live-chip menu-live-chip--${brokerStatusLive ? 'live' : 'degraded'}`}>
+            <span className="menu-live-chip__dot" aria-hidden="true" />
+            <span>{brokerChipLabel}</span>
+          </span>
           <button type="button" className="menu-icon-btn" onClick={onOpenSettings} aria-label="Settings" title="Settings">
             <SettingsIcon />
           </button>
         </div>
       </header>
 
-      <div className="menu-dropdown__groups" aria-label="Project groups">
-        {groups.length === 0 ? (
-          <div className="menu-project-group">
-            <div className="menu-project-group__header">
-              <span className="menu-project-group__title">Project: {currentProject}</span>
-              <span className="menu-project-group__meta">0 Active</span>
-            </div>
-            <p className="menu-empty-state">No agents available yet.</p>
-          </div>
-        ) : (
-          groups.map((group) => (
-            <section key={group.name} className="menu-project-group">
+      <div className="menu-dropdown__body">
+        <div className="menu-dropdown__groups" aria-label="Project groups">
+          {onlineGroups.length === 0 ? (
+            <section className="menu-project-group menu-project-group--empty">
               <div className="menu-project-group__header">
-                <span className="menu-project-group__title">Project: {group.name}</span>
-                <span className="menu-project-group__meta">
-                  {group.activeCount > 0 ? `${group.activeCount} Active` : `${group.agents.length} Agents`}
-                </span>
+                <span className="menu-project-group__title">Project: {currentProjectLabel}</span>
+                <span className="menu-project-group__meta">0 Active</span>
               </div>
-              <ul className="menu-agent-list">
-                {group.agents.map((agent) => (
-                  <li key={agent.participantId}>
-                    <button
-                      type="button"
-                      className={`menu-agent-row menu-agent-row--${agent.stateTone}`}
-                      onClick={() => {
-                        if (agent.jumpTarget) {
-                          onJump?.(agent.jumpTarget);
-                        }
-                      }}
-                      disabled={!agent.jumpTarget}
-                      aria-label={agent.jumpTarget ? `Jump to @${agent.alias}` : undefined}
-                    >
-                      <span className="menu-agent-row__identity">
-                        <span className={`menu-agent-dot menu-agent-dot--${agent.stateTone}`} />
-                        <span className="menu-agent-name">{agent.alias}</span>
-                      </span>
-                      <span className={`menu-agent-pill menu-agent-pill--${agent.stateTone}`}>
-                        {agent.stateLabel}
-                      </span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
+              <p className="menu-empty-state">No agents available yet.</p>
             </section>
-          ))
-        )}
-      </div>
+          ) : (
+            onlineGroups.map((group) => (
+              <section key={group.name} className="menu-project-group">
+                <div className="menu-project-group__header">
+                  <span className="menu-project-group__title">Project: {group.name}</span>
+                  <span className="menu-project-group__meta">
+                    {group.activeCount > 0 ? `${group.activeCount} Active` : `${group.agents.length} Agents`}
+                  </span>
+                </div>
+                <ul className="menu-agent-list">
+                  {group.agents.map((agent) => {
+                    const canJump = Boolean(agent.jumpTarget);
 
-      {attentionBadge ? <div className="menu-attention-banner">{attentionBadge}</div> : null}
+                    return (
+                      <li key={agent.participantId}>
+                        <button
+                          type="button"
+                          className={`menu-agent-row menu-agent-row--${agent.stateTone}`}
+                          onClick={() => {
+                            if (agent.jumpTarget) {
+                              onJump?.(agent.jumpTarget);
+                            }
+                          }}
+                          disabled={!canJump}
+                          aria-label={canJump ? `Jump to @${agent.alias}` : `${agent.alias} unavailable`}
+                        >
+                          <span className="menu-agent-row__identity">
+                            <span className={`menu-agent-dot menu-agent-dot--${agent.stateTone}`} />
+                            <span className="menu-agent-name">{agent.alias}</span>
+                          </span>
+                          <span className={`menu-agent-pill menu-agent-pill--${agent.stateTone}`}>
+                            {agent.stateLabel}
+                          </span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </section>
+            ))
+          )}
 
-      <div className="menu-dropdown__actions">
-        <button type="button" className="menu-primary-action" onClick={onOpenExpanded}>
-          <span className="menu-primary-action__content">
-            <span className="menu-primary-action__icon">
-              <DashboardIcon />
-            </span>
-            <span className="menu-primary-action__label">Open Main Panel</span>
-          </span>
-          <span className="menu-primary-action__arrow">
-            <ArrowRightIcon />
-          </span>
-        </button>
+          {offlineAgents.length > 0 ? (
+            <section className="menu-project-group menu-project-group--offline">
+              <button
+                type="button"
+                className="menu-project-group__toggle"
+                onClick={() => setOfflineExpanded((expanded) => !expanded)}
+                aria-expanded={offlineExpanded}
+                aria-label={offlineExpanded ? 'Hide offline agents' : 'Show offline agents'}
+              >
+                <span className="menu-project-group__header">
+                  <span className="menu-project-group__title">Offline</span>
+                  <span className="menu-project-group__meta">{offlineAgents.length} Agents</span>
+                </span>
+                <span className="menu-project-group__toggle-icon">
+                  <ChevronIcon expanded={offlineExpanded} />
+                </span>
+              </button>
+
+              {offlineExpanded ? (
+                <ul className="menu-agent-list">
+                  {offlineAgents.map((agent, index) => (
+                    <li key={agent.participantId}>
+                      <button
+                        ref={index === 0 ? firstOfflineRowRef : undefined}
+                        type="button"
+                        className="menu-agent-row menu-agent-row--idle"
+                        disabled
+                        aria-label={`${agent.alias} unavailable`}
+                        data-scroll-target={`offline-agent-${agent.participantId}`}
+                      >
+                        <span className="menu-agent-row__identity">
+                          <span className="menu-agent-dot menu-agent-dot--idle" />
+                          <span className="menu-agent-name">{agent.alias}</span>
+                        </span>
+                        <span className="menu-agent-pill menu-agent-pill--idle">{agent.stateLabel}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </section>
+          ) : null}
+        </div>
+
+        {attentionBadge ? <div className="menu-attention-banner">{attentionBadge}</div> : null}
       </div>
 
       <footer className="menu-dropdown__footer" aria-label="Panel summary">
         <div className="menu-footer-metrics">
-          <div className="menu-footer-metric">
-            <span>Agents</span>
-            <strong>{snapshot.overview.onlineCount} Total</strong>
-          </div>
+        <div className="menu-footer-metric">
+          <span>Agents</span>
+          <strong>{snapshot.overview.onlineCount} Online</strong>
+        </div>
           <div className="menu-footer-divider" />
           <div className="menu-footer-metric">
             <span>Broker</span>
-            <strong>{snapshot.overview.brokerHealthy ? 'Healthy' : 'Degraded'}</strong>
+            <strong>{brokerFooterLabel}</strong>
           </div>
         </div>
         <button type="button" className="menu-footer-link" onClick={onOpenSettings}>

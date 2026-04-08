@@ -112,6 +112,14 @@ fn jump_result(ok: bool, precision: &str, reason: Option<String>) -> JumpResultP
     }
 }
 
+fn panel_window_size() -> (f64, f64) {
+    (344.0, 540.0)
+}
+
+fn panel_window_resizable() -> bool {
+    false
+}
+
 #[tauri::command]
 fn jump_with_ghostty(target: JumpTargetPayload) -> Result<JumpResultPayload, String> {
     let session_hint = escape_applescript(target.session_hint.as_deref().unwrap_or(""));
@@ -507,14 +515,23 @@ fn main() {
             commands::fetch_latest_broker_release,
             commands::install_broker_update,
             commands::is_broker_running,
+            commands::load_broker_service_seed,
+            commands::load_broker_project_seed,
+            commands::load_broker_pending_approvals,
+            commands::respond_to_broker_approval,
+            commands::get_broker_runtime_status,
+            commands::ensure_broker_running,
+            commands::restart_broker_runtime,
             commands::start_broker,
             commands::ensure_broker_ready
         ])
         .setup(|app| {
+            let (panel_width, panel_height) = panel_window_size();
             let _panel =
                 WebviewWindowBuilder::new(app, "panel", WebviewUrl::App("index.html".into()))
                     .title("HexDeck")
-                    .inner_size(420.0, 620.0)
+                    .inner_size(panel_width, panel_height)
+                    .resizable(panel_window_resizable())
                     .visible(true)
                     .build()?;
 
@@ -527,6 +544,17 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panel_window_size_matches_compact_dropdown_shell() {
+        let (width, height) = panel_window_size();
+        assert_eq!((width, height), (344.0, 540.0));
+    }
+
+    #[test]
+    fn panel_window_disables_manual_resize() {
+        assert!(!panel_window_resizable());
+    }
 
     #[test]
     fn test_format_new_title_returns_none_when_alias_present() {

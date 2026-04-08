@@ -1,6 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BrokerClient } from '../../../src/lib/broker/client';
 
+const { invokeMock } = vi.hoisted(() => ({
+  invokeMock: vi.fn(),
+}));
+
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: invokeMock,
+}));
+
 describe('BrokerClient', () => {
   it('loads health, participants, work-state, and replay slices for a project', async () => {
     const fetchMock = vi.fn()
@@ -8,7 +16,7 @@ describe('BrokerClient', () => {
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            participants: [{ alias: 'codex4', context: { projectName: 'intent-broker' } }],
+            participants: [{ participantId: 'codex-session-aa59e6ef', alias: 'codex4', context: { projectName: 'intent-broker' } }],
           }),
           { status: 200 }
         )
@@ -17,6 +25,14 @@ describe('BrokerClient', () => {
         new Response(
           JSON.stringify({
             items: [{ participantId: 'codex-session-aa59e6ef', status: 'implementing' }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ participantId: 'codex-session-aa59e6ef', status: 'online', metadata: { source: 'registration' } }],
           }),
           { status: 200 }
         )
@@ -38,11 +54,14 @@ describe('BrokerClient', () => {
       'http://127.0.0.1:4318/health',
       'http://127.0.0.1:4318/participants?projectName=intent-broker',
       'http://127.0.0.1:4318/work-state?projectName=intent-broker',
+      'http://127.0.0.1:4318/presence',
       'http://127.0.0.1:4318/events/replay?after=0',
       'http://127.0.0.1:4318/projects/intent-broker/approvals?status=pending'
     ]);
     expect(snapshot.health.ok).toBe(true);
     expect(snapshot.participants[0].alias).toBe('codex4');
+    expect(snapshot.participants[0].presence).toBe('online');
+    expect(snapshot.participants[0].presenceMetadata).toEqual({ source: 'registration' });
     expect(snapshot.workStates[0].status).toBe('implementing');
     expect(snapshot.events[0].id).toBe(1282);
     expect(snapshot.approvals[0].approvalId).toBe('approval-1');
@@ -54,7 +73,7 @@ describe('BrokerClient', () => {
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            participants: [{ alias: 'codex16', kind: 'agent', context: { projectName: 'projects' } }],
+            participants: [{ participantId: 'codex-session-019d671b', alias: 'codex16', kind: 'agent', context: { projectName: 'projects' } }],
           }),
           { status: 200 }
         )
@@ -63,6 +82,14 @@ describe('BrokerClient', () => {
         new Response(
           JSON.stringify({
             items: [{ participantId: 'codex-session-019d671b', status: 'implementing', projectName: 'projects' }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ participantId: 'codex-session-019d671b', status: 'online', metadata: { source: 'registration' } }],
           }),
           { status: 200 }
         )
@@ -83,11 +110,99 @@ describe('BrokerClient', () => {
       'http://127.0.0.1:4318/health',
       'http://127.0.0.1:4318/participants',
       'http://127.0.0.1:4318/work-state',
+      'http://127.0.0.1:4318/presence',
       'http://127.0.0.1:4318/events/replay?after=0',
     ]);
     expect(snapshot.participants[0].alias).toBe('codex16');
+    expect(snapshot.participants[0].presence).toBe('online');
+    expect(snapshot.participants[0].presenceMetadata).toEqual({ source: 'registration' });
     expect(snapshot.workStates[0].status).toBe('implementing');
     expect(snapshot.approvals).toEqual([]);
+  });
+
+  it('accepts replay payloads wrapped in an items array', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ participantId: 'codex-session-019d671b', alias: 'codex16', kind: 'agent', context: { projectName: 'projects' } }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [{ participantId: 'codex-session-019d671b', status: 'implementing', projectName: 'projects' }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ participantId: 'codex-session-019d671b', status: 'online', metadata: { source: 'registration' } }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [{ id: 2001, type: 'report_progress' }],
+          }),
+          { status: 200 }
+        )
+      );
+
+    const client = new BrokerClient({
+      brokerUrl: 'http://127.0.0.1:4318',
+      fetchImpl: fetchMock as typeof fetch,
+      websocketFactory: () => {
+        throw new Error('not used in this test');
+      }
+    });
+
+    const snapshot = await client.loadServiceSeed();
+
+    expect(snapshot.events).toEqual([{ id: 2001, type: 'report_progress' }]);
+  });
+
+  it('keeps loading participants when presence lookup is unavailable', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ participantId: 'a', alias: 'codex16', kind: 'agent', context: { projectName: 'projects' } }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [{ participantId: 'a', status: 'implementing', projectName: 'projects' }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(new Response('not found', { status: 404 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [{ id: 2001, type: 'report_progress' }] }), { status: 200 }));
+
+    const client = new BrokerClient({
+      brokerUrl: 'http://127.0.0.1:4318',
+      fetchImpl: fetchMock as typeof fetch,
+      websocketFactory: () => {
+        throw new Error('not used in this test');
+      }
+    });
+
+    const snapshot = await client.loadServiceSeed();
+
+    expect(snapshot.participants[0].presence).toBeUndefined();
+    expect(snapshot.events).toEqual([{ id: 2001, type: 'report_progress' }]);
   });
 
   it('binds the default global fetch implementation before using it', async () => {
@@ -296,5 +411,82 @@ describe('BrokerClient', () => {
         }),
       })
     );
+  });
+
+  it('uses Tauri invoke to load the broker service seed inside the desktop app', async () => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValueOnce({
+      health: { ok: true },
+      participants: [{ participantId: 'a', alias: 'codex6', presence: 'online', context: { projectName: 'projects' } }],
+      workStates: [{ participantId: 'a', status: 'implementing', projectName: 'projects' }],
+      events: [{ id: 1, type: 'report_progress' }],
+      approvals: [],
+    });
+
+    Object.defineProperty(window, '__TAURI_INTERNALS__', {
+      configurable: true,
+      value: {},
+    });
+
+    try {
+      const client = new BrokerClient({
+        brokerUrl: 'http://127.0.0.1:4318',
+        fetchImpl: vi.fn() as typeof fetch,
+        websocketFactory: () => {
+          throw new Error('not used in this test');
+        },
+      });
+
+      const snapshot = await client.loadServiceSeed();
+
+      expect(invokeMock).toHaveBeenCalledWith('load_broker_service_seed', {
+        brokerUrl: 'http://127.0.0.1:4318',
+      });
+      expect(snapshot.participants[0].alias).toBe('codex6');
+      expect(snapshot.participants[0].presence).toBe('online');
+    } finally {
+      delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    }
+  });
+
+  it('uses Tauri invoke to respond to approvals inside the desktop app', async () => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValueOnce(undefined);
+
+    Object.defineProperty(window, '__TAURI_INTERNALS__', {
+      configurable: true,
+      value: {},
+    });
+
+    try {
+      const fetchMock = vi.fn();
+      const client = new BrokerClient({
+        brokerUrl: 'http://127.0.0.1:4318',
+        fetchImpl: fetchMock as typeof fetch,
+        websocketFactory: () => {
+          throw new Error('not used in this test');
+        },
+      });
+
+      await client.respondToApproval({
+        approvalId: 'approval-1',
+        taskId: 'task-1',
+        fromParticipantId: 'human.local',
+        decision: 'approved',
+      });
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(invokeMock).toHaveBeenCalledWith('respond_to_broker_approval', {
+        brokerUrl: 'http://127.0.0.1:4318',
+        input: {
+          approvalId: 'approval-1',
+          taskId: 'task-1',
+          fromParticipantId: 'human.local',
+          decision: 'approved',
+        },
+      });
+    } finally {
+      delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    }
   });
 });
