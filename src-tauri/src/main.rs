@@ -8,7 +8,7 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::Command;
-use tauri::{WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 // ============================================================================
 // CLI Subcommand Definitions
@@ -122,6 +122,122 @@ fn panel_window_size() -> (f64, f64) {
 
 fn panel_window_resizable() -> bool {
     false
+}
+
+fn activity_card_window_size() -> (f64, f64) {
+    (420.0, 120.0)
+}
+
+fn activity_card_window_resizable() -> bool {
+    false
+}
+
+fn expanded_window_size() -> (f64, f64) {
+    (960.0, 720.0)
+}
+
+fn expanded_window_resizable() -> bool {
+    true
+}
+
+fn ensure_panel_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> {
+    if let Some(window) = app.get_webview_window("panel") {
+        return Ok(window);
+    }
+
+    let (width, height) = panel_window_size();
+    WebviewWindowBuilder::new(app, "panel", WebviewUrl::App("index.html".into()))
+        .title("HexDeck")
+        .inner_size(width, height)
+        .resizable(panel_window_resizable())
+        .visible(true)
+        .build()
+}
+
+fn expanded_window_location(section: &str) -> String {
+    format!("index.html?view=expanded&section={section}")
+}
+
+fn sync_window_location(window: &WebviewWindow, location: &str) -> tauri::Result<()> {
+    window.eval(&format!("window.location.replace({location:?});"))
+}
+
+fn ensure_expanded_window(app: &tauri::AppHandle, section: &str) -> tauri::Result<WebviewWindow> {
+    let location = expanded_window_location(section);
+
+    if let Some(window) = app.get_webview_window("expanded") {
+        sync_window_location(&window, &location)?;
+        return Ok(window);
+    }
+
+    let (width, height) = expanded_window_size();
+    WebviewWindowBuilder::new(app, "expanded", WebviewUrl::App(location.into()))
+        .title("HexDeck Expanded")
+        .inner_size(width, height)
+        .resizable(expanded_window_resizable())
+        .visible(false)
+        .build()
+}
+
+fn ensure_activity_card_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> {
+    if let Some(window) = app.get_webview_window("activity-card") {
+        return Ok(window);
+    }
+
+    let (width, height) = activity_card_window_size();
+    WebviewWindowBuilder::new(
+        app,
+        "activity-card",
+        WebviewUrl::App("index.html?view=activity-card".into()),
+    )
+    .title("HexDeck Activity Card")
+    .inner_size(width, height)
+    .resizable(activity_card_window_resizable())
+    .visible(false)
+    .always_on_top(true)
+    .decorations(false)
+    .skip_taskbar(true)
+    .build()
+}
+
+#[tauri::command]
+fn toggle_panel_command(app: tauri::AppHandle) -> Result<(), String> {
+    let window = ensure_panel_window(&app).map_err(|error| error.to_string())?;
+    let visible = window.is_visible().map_err(|error| error.to_string())?;
+
+    if visible {
+        window.hide().map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    window.show().map_err(|error| error.to_string())?;
+    window.set_focus().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn open_expanded_window(app: tauri::AppHandle, section: String) -> Result<(), String> {
+    let window = ensure_expanded_window(&app, &section).map_err(|error| error.to_string())?;
+    window.show().map_err(|error| error.to_string())?;
+    window.set_focus().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn show_activity_card_window(app: tauri::AppHandle) -> Result<(), String> {
+    let window = ensure_activity_card_window(&app).map_err(|error| error.to_string())?;
+    window.show().map_err(|error| error.to_string())?;
+    window.set_focus().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn hide_activity_card_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("activity-card") {
+        window.hide().map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -583,6 +699,10 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
+            toggle_panel_command,
+            open_expanded_window,
+            show_activity_card_window,
+            hide_activity_card_window,
             jump_with_ghostty,
             jump_with_iterm,
             jump_with_terminal_app,
@@ -603,14 +723,7 @@ fn main() {
             commands::ensure_broker_ready
         ])
         .setup(|app| {
-            let (panel_width, panel_height) = panel_window_size();
-            let _panel =
-                WebviewWindowBuilder::new(app, "panel", WebviewUrl::App("index.html".into()))
-                    .title("HexDeck")
-                    .inner_size(panel_width, panel_height)
-                    .resizable(panel_window_resizable())
-                    .visible(true)
-                    .build()?;
+            let _panel = ensure_panel_window(app.handle())?;
 
             Ok(())
         })
@@ -631,6 +744,12 @@ mod tests {
     #[test]
     fn panel_window_disables_manual_resize() {
         assert!(!panel_window_resizable());
+    }
+
+    #[test]
+    fn activity_card_window_size_is_compact_and_non_resizable() {
+        assert_eq!(activity_card_window_size(), (420.0, 120.0));
+        assert!(!activity_card_window_resizable());
     }
 
     #[test]
