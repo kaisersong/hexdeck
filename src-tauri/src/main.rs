@@ -8,7 +8,7 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::Command;
-use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{Manager, PhysicalPosition, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 // ============================================================================
 // CLI Subcommand Definitions
@@ -132,6 +132,25 @@ fn activity_card_window_resizable() -> bool {
     false
 }
 
+fn activity_card_window_top_margin() -> i32 {
+    16
+}
+
+fn activity_card_window_focuses_on_show() -> bool {
+    false
+}
+
+fn activity_card_window_position(
+    work_area_position: PhysicalPosition<i32>,
+    work_area_width: u32,
+) -> PhysicalPosition<i32> {
+    let (window_width, _) = activity_card_window_size();
+    let centered_x = work_area_position.x + ((work_area_width as i32 - window_width as i32).max(0) / 2);
+    let top_y = work_area_position.y + activity_card_window_top_margin();
+
+    PhysicalPosition::new(centered_x, top_y)
+}
+
 fn expanded_window_size() -> (f64, f64) {
     (960.0, 720.0)
 }
@@ -200,6 +219,21 @@ fn ensure_activity_card_window(app: &tauri::AppHandle) -> tauri::Result<WebviewW
     .build()
 }
 
+fn position_activity_card_window(
+    app: &tauri::AppHandle,
+    window: &WebviewWindow,
+) -> tauri::Result<()> {
+    let monitor = window.current_monitor()?.or(app.primary_monitor()?);
+
+    if let Some(monitor) = monitor {
+        let work_area = monitor.work_area();
+        let position = activity_card_window_position(work_area.position, work_area.size.width);
+        window.set_position(position)?;
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 fn toggle_panel_command(app: tauri::AppHandle) -> Result<(), String> {
     let window = ensure_panel_window(&app).map_err(|error| error.to_string())?;
@@ -226,8 +260,13 @@ fn open_expanded_window(app: tauri::AppHandle, section: String) -> Result<(), St
 #[tauri::command]
 fn show_activity_card_window(app: tauri::AppHandle) -> Result<(), String> {
     let window = ensure_activity_card_window(&app).map_err(|error| error.to_string())?;
+    position_activity_card_window(&app, &window).map_err(|error| error.to_string())?;
     window.show().map_err(|error| error.to_string())?;
-    window.set_focus().map_err(|error| error.to_string())?;
+
+    if activity_card_window_focuses_on_show() {
+        window.set_focus().map_err(|error| error.to_string())?;
+    }
+
     Ok(())
 }
 
@@ -750,6 +789,19 @@ mod tests {
     fn activity_card_window_size_is_compact_and_non_resizable() {
         assert_eq!(activity_card_window_size(), (420.0, 120.0));
         assert!(!activity_card_window_resizable());
+    }
+
+    #[test]
+    fn activity_card_window_position_centers_at_top_of_work_area() {
+        let position = activity_card_window_position(PhysicalPosition::new(100, 40), 1600);
+
+        assert_eq!(position.x, 690);
+        assert_eq!(position.y, 56);
+    }
+
+    #[test]
+    fn activity_card_window_show_policy_does_not_focus() {
+        assert!(!activity_card_window_focuses_on_show());
     }
 
     #[test]
