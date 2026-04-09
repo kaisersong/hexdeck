@@ -4,6 +4,7 @@ import type {
   BrokerApprovalResponseInput,
   BrokerEvent,
   BrokerHealth,
+  BrokerClarificationAnswerInput,
   BrokerPresence,
   BrokerParticipant,
   BrokerWorkState,
@@ -85,6 +86,23 @@ function normalizeProjectSeed(seed: ProjectSeed): ProjectSeed {
     ...seed,
     events: normalizeBrokerEvents(seed.events),
   };
+}
+
+function createIntentId(prefix: string): string {
+  if (typeof globalThis.crypto !== 'undefined' && typeof globalThis.crypto.randomUUID === 'function') {
+    return `${prefix}:${globalThis.crypto.randomUUID()}`;
+  }
+
+  return `${prefix}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function isUnavailableBrokerError(error: unknown): boolean {
+  return error instanceof TypeError
+    || (error instanceof Error && error.message.startsWith('broker_request_failed'));
+}
+
+function isMalformedBrokerResponseError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith('broker_response_malformed');
 }
 
 export class BrokerClient {
@@ -192,12 +210,42 @@ export class BrokerClient {
           taskId: input.taskId,
           fromParticipantId: input.fromParticipantId,
           decision: input.decision,
+          decisionMode: input.decisionMode,
         }),
       }
     );
 
     if (!response.ok) {
       throw new Error(`broker_approval_failed ${response.status}`);
+    }
+  }
+
+  async answerClarification(input: BrokerClarificationAnswerInput): Promise<void> {
+    const response = await this.fetchImpl(`${this.brokerUrl}/intents`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        intentId: input.intentId ?? createIntentId('clarification'),
+        kind: 'answer_clarification',
+        fromParticipantId: input.fromParticipantId,
+        taskId: input.taskId,
+        threadId: input.threadId,
+        to: {
+          mode: 'participant',
+          participants: [input.toParticipantId],
+        },
+        payload: {
+          body: { summary: input.summary },
+          delivery: {
+            semantic: 'informational',
+            source: 'default',
+          },
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`broker_intent_failed ${response.status}`);
     }
   }
 
@@ -283,20 +331,38 @@ export class BrokerClient {
   }
 
   private async requestList<T>(path: string, key: string): Promise<T[]> {
-    const payload = await this.request<T[] | Record<string, unknown>>(path);
+    let payload: T[] | Record<string, unknown>;
+
+    try {
+      payload = await this.request<T[] | Record<string, unknown>>(path);
+    } catch (error) {
+      if (isUnavailableBrokerError(error)) {
+        throw error;
+      }
+
+      throw new Error(`broker_response_malformed ${path}: ${error instanceof Error ? error.message : String(error)}`);
+    }
 
     if (Array.isArray(payload)) {
       return payload;
     }
 
     const items = payload[key];
-    return Array.isArray(items) ? (items as T[]) : [];
+    if (!Array.isArray(items)) {
+      throw new Error(`broker_response_malformed ${path}: expected ${key} array`);
+    }
+
+    return items as T[];
   }
 
   private async loadPresence(): Promise<BrokerPresence[]> {
     try {
       return await this.requestList<BrokerPresence>('/presence', 'participants');
-    } catch {
+    } catch (error) {
+      if (isMalformedBrokerResponseError(error)) {
+        throw error;
+      }
+
       return [];
     }
   }

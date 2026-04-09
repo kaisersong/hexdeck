@@ -5,7 +5,12 @@ import {
   restartBrokerRuntime,
   type BrokerRuntimeStatus,
 } from '../lib/broker/runtime';
-import type { BrokerParticipant } from '../lib/broker/types';
+import type {
+  BrokerApprovalDecisionMode,
+  BrokerApprovalResponseInput,
+  BrokerClarificationAnswerInput,
+  BrokerParticipant,
+} from '../lib/broker/types';
 import type { JumpTarget } from '../lib/jump/types';
 import type { ProjectSnapshotProjection } from '../lib/projections/types';
 import { buildProjectSnapshot } from '../lib/projections/project-snapshot';
@@ -83,6 +88,67 @@ function derivePreferredProject(participants: BrokerParticipant[], fallback: str
     ?.context?.projectName?.trim() ?? '';
 }
 
+export type AppActivityApprovalAction = {
+  kind: 'approval';
+  approvalId: string;
+  taskId?: string;
+  decisionMode: BrokerApprovalDecisionMode;
+};
+
+export type AppActivityQuestionAction = {
+  kind: 'question';
+  questionId: string;
+  participantId: string;
+  taskId?: string;
+  threadId?: string;
+  answer: string;
+};
+
+export type AppActivityAction = AppActivityApprovalAction | AppActivityQuestionAction;
+
+export interface AppActivityTransportClient {
+  respondToApproval(input: BrokerApprovalResponseInput): Promise<void>;
+  answerClarification(input: BrokerClarificationAnswerInput): Promise<void>;
+}
+
+function createClarificationIntentId(questionId: string): string {
+  if (typeof globalThis.crypto !== 'undefined' && typeof globalThis.crypto.randomUUID === 'function') {
+    return `clarification:${questionId}:${globalThis.crypto.randomUUID()}`;
+  }
+
+  return `clarification:${questionId}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`;
+}
+
+export async function dispatchActivityCardAction(
+  client: AppActivityTransportClient,
+  action: AppActivityAction,
+  fromParticipantId = 'human.local'
+): Promise<void> {
+  if (action.kind === 'approval') {
+    if (!action.taskId) {
+      return;
+    }
+
+    await client.respondToApproval({
+      approvalId: action.approvalId,
+      taskId: action.taskId,
+      fromParticipantId,
+      decision: action.decisionMode === 'no' ? 'denied' : 'approved',
+      decisionMode: action.decisionMode,
+    });
+    return;
+  }
+
+  await client.answerClarification({
+    intentId: createClarificationIntentId(action.questionId),
+    fromParticipantId,
+    toParticipantId: action.participantId,
+    taskId: action.taskId,
+    threadId: action.threadId,
+    summary: action.answer,
+  });
+}
+
 export function App() {
   const windowMode = getWindowMode();
   const isExpandedWindow = windowMode === 'expanded';
@@ -103,77 +169,88 @@ export function App() {
     let disposed = false;
     const client = new BrokerClient({ brokerUrl: settings.brokerUrl });
     let refreshInFlight = false;
+    let refreshQueued = false;
 
     const refreshSnapshot = async () => {
-      if (disposed || refreshInFlight) {
+      if (disposed) {
+        return;
+      }
+
+      if (refreshInFlight) {
+        refreshQueued = true;
         return;
       }
 
       refreshInFlight = true;
-
-      if (!disposed) {
-        setConnectionState('checking');
-        setConnectionMessage(
-          settings.brokerUrl === DEFAULT_BROKER_URL
-            ? 'Starting local broker runtime...'
-            : `Connecting to broker at ${settings.brokerUrl}...`
-        );
-      }
-
       try {
-        if (settings.brokerUrl === DEFAULT_BROKER_URL) {
-          const bootstrap = await ensureBrokerReady(settings.brokerUrl);
-          if (disposed) {
-            return;
-          }
+        do {
+          refreshQueued = false;
 
-          if (!bootstrap.ready) {
-            throw new Error(bootstrap.last_error ?? 'broker_not_ready');
-          }
-
-          const runtime = await getBrokerRuntimeStatus().catch(() => null);
           if (!disposed) {
-            setRuntimeStatus(runtime);
+            setConnectionState('checking');
+            setConnectionMessage(
+              settings.brokerUrl === DEFAULT_BROKER_URL
+                ? 'Starting local broker runtime...'
+                : `Connecting to broker at ${settings.brokerUrl}...`
+            );
           }
-        } else if (!disposed) {
-          setRuntimeStatus(null);
-        }
 
-        const seed = await client.loadServiceSeed();
-        if (disposed) {
-          return;
-        }
+          try {
+            if (settings.brokerUrl === DEFAULT_BROKER_URL) {
+              const bootstrap = await ensureBrokerReady(settings.brokerUrl);
+              if (disposed) {
+                return;
+              }
 
-        const nextSnapshot = buildProjectSnapshot(seed);
-        const agentParticipants = seed.participants.filter(isAgentParticipant);
-        const projectCount = new Set(
-          agentParticipants
-            .map((participant) => participant.context?.projectName?.trim())
-            .filter((value): value is string => Boolean(value))
-        ).size;
+              if (!bootstrap.ready) {
+                throw new Error(bootstrap.last_error ?? 'broker_not_ready');
+              }
 
-        store.setSnapshot(nextSnapshot);
-        setSnapshot(nextSnapshot);
-        setParticipants(seed.participants);
-        setConnectionState('connected');
-        setConnectionMessage(
-          `${settings.brokerUrl === DEFAULT_BROKER_URL ? 'Local broker ready' : 'Broker ready'} · ${agentParticipants.length} agents · ${
-            projectCount || 1
-          } projects · ${settings.brokerUrl}`
-        );
-      } catch (error) {
-        if (disposed) {
-          return;
-        }
+              const runtime = await getBrokerRuntimeStatus().catch(() => null);
+              if (!disposed) {
+                setRuntimeStatus(runtime);
+              }
+            } else if (!disposed) {
+              setRuntimeStatus(null);
+            }
 
-        setSnapshot(null);
-        setParticipants([]);
-        setConnectionState('error');
-        setConnectionMessage(
-          `${settings.brokerUrl === DEFAULT_BROKER_URL ? 'Local broker unavailable' : 'Broker unavailable'}: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        );
+            const seed = await client.loadServiceSeed();
+            if (disposed) {
+              return;
+            }
+
+            const nextSnapshot = buildProjectSnapshot(seed);
+            const agentParticipants = seed.participants.filter(isAgentParticipant);
+            const projectCount = new Set(
+              agentParticipants
+                .map((participant) => participant.context?.projectName?.trim())
+                .filter((value): value is string => Boolean(value))
+            ).size;
+
+            store.setSnapshot(nextSnapshot);
+            setSnapshot(nextSnapshot);
+            setParticipants(seed.participants);
+            setConnectionState('connected');
+            setConnectionMessage(
+              `${settings.brokerUrl === DEFAULT_BROKER_URL ? 'Local broker ready' : 'Broker ready'} · ${agentParticipants.length} agents · ${
+                projectCount || 1
+              } projects · ${settings.brokerUrl}`
+            );
+          } catch (error) {
+            if (disposed) {
+              return;
+            }
+
+            setSnapshot(null);
+            setParticipants([]);
+            setConnectionState('error');
+            setConnectionMessage(
+              `${settings.brokerUrl === DEFAULT_BROKER_URL ? 'Local broker unavailable' : 'Broker unavailable'}: ${
+                error instanceof Error ? error.message : String(error)
+              }`
+            );
+          }
+        } while (!disposed && refreshQueued);
       } finally {
         refreshInFlight = false;
       }
@@ -246,26 +323,19 @@ export function App() {
     await jumpToTarget(target);
   };
 
-  const respondToApproval = async (
-    approvalId: string,
-    taskId: string | undefined,
-    decision: 'approved' | 'denied'
-  ) => {
-    if (!taskId) {
+  const handleActivityCardAction = async (action: AppActivityAction) => {
+    if (action.kind === 'approval' && !action.taskId) {
       return;
     }
 
     const client = new BrokerClient({ brokerUrl: settings.brokerUrl });
-    store.startApprovalAction(approvalId);
-    setPendingApprovalIds(new Set(store.getState().pendingApprovalIds));
+    if (action.kind === 'approval') {
+      store.startApprovalAction(action.approvalId);
+      setPendingApprovalIds(new Set(store.getState().pendingApprovalIds));
+    }
 
     try {
-      await client.respondToApproval({
-        approvalId,
-        taskId,
-        fromParticipantId: 'human.local',
-        decision,
-      });
+      await dispatchActivityCardAction(client, action);
 
       const seed = await client.loadServiceSeed();
       const nextSnapshot = buildProjectSnapshot(seed);
@@ -273,8 +343,10 @@ export function App() {
       setSnapshot(nextSnapshot);
       setParticipants(seed.participants);
     } finally {
-      store.finishApprovalAction(approvalId);
-      setPendingApprovalIds(new Set(store.getState().pendingApprovalIds));
+      if (action.kind === 'approval') {
+        store.finishApprovalAction(action.approvalId);
+        setPendingApprovalIds(new Set(store.getState().pendingApprovalIds));
+      }
     }
   };
 
@@ -400,8 +472,18 @@ export function App() {
         capabilities={capabilities}
         pendingApprovalIds={pendingApprovalIds}
         onJump={handleJump}
-        onApprove={(approvalId, taskId) => void respondToApproval(approvalId, taskId, 'approved')}
-        onDeny={(approvalId, taskId) => void respondToApproval(approvalId, taskId, 'denied')}
+        onApprove={(approvalId, taskId) => void handleActivityCardAction({
+          kind: 'approval',
+          approvalId,
+          taskId,
+          decisionMode: 'yes',
+        })}
+        onDeny={(approvalId, taskId) => void handleActivityCardAction({
+          kind: 'approval',
+          approvalId,
+          taskId,
+          decisionMode: 'no',
+        })}
         onMinimize={() => void minimizeCurrentWindow()}
         onClose={() => void closeCurrentWindow()}
       />

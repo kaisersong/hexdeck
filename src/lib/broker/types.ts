@@ -51,11 +51,23 @@ export interface BrokerApprovalItem {
   decision?: 'approved' | 'denied' | 'pending';
 }
 
+export type BrokerApprovalDecisionMode = 'yes' | 'always' | 'no';
+
 export interface BrokerApprovalResponseInput {
   approvalId: string;
   taskId: string;
   fromParticipantId: string;
   decision: 'approved' | 'denied';
+  decisionMode?: BrokerApprovalDecisionMode;
+}
+
+export interface BrokerClarificationAnswerInput {
+  intentId?: string;
+  taskId?: string;
+  threadId?: string;
+  fromParticipantId: string;
+  toParticipantId: string;
+  summary: string;
 }
 
 export interface ProjectSeed {

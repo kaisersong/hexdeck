@@ -260,6 +260,39 @@ describe('BrokerClient', () => {
     expect(snapshot.events).toEqual([{ id: 2001, type: 'report_progress' }]);
   });
 
+  it('surfaces malformed presence payloads instead of collapsing them into empty data', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ participantId: 'a', alias: 'codex16', kind: 'agent', context: { projectName: 'projects' } }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [{ participantId: 'a', status: 'implementing', projectName: 'projects' }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify({ participants: { participantId: 'a' } }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [{ id: 2001, type: 'report_progress' }] }), { status: 200 }));
+
+    const client = new BrokerClient({
+      brokerUrl: 'http://127.0.0.1:4318',
+      fetchImpl: fetchMock as typeof fetch,
+      websocketFactory: () => {
+        throw new Error('not used in this test');
+      }
+    });
+
+    await expect(client.loadServiceSeed()).rejects.toThrow(/broker_response_malformed/);
+  });
+
   it('binds the default global fetch implementation before using it', async () => {
     const originalFetch = globalThis.fetch;
     const fetchCalls: string[] = [];
@@ -475,7 +508,7 @@ describe('BrokerClient', () => {
     );
   });
 
-  it('falls back to an empty approvals list for a malformed 200 response', async () => {
+  it('throws when the pending approvals payload is malformed', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ items: { approvalId: 'approval-1' } }), { status: 200 })
     );
@@ -488,9 +521,7 @@ describe('BrokerClient', () => {
       },
     });
 
-    const approvals = await client.loadPendingApprovals('intent-broker');
-
-    expect(approvals).toEqual([]);
+    await expect(client.loadPendingApprovals('intent-broker')).rejects.toThrow(/broker_response_malformed/);
   });
 
   it('responds to an approval through the broker API', async () => {
@@ -526,6 +557,94 @@ describe('BrokerClient', () => {
         }),
       })
     );
+  });
+
+  it('carries decisionMode metadata when responding to an approval', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ approval: { approvalId: 'approval-1' } }), { status: 200 })
+    );
+
+    const client = new BrokerClient({
+      brokerUrl: 'http://127.0.0.1:4318',
+      fetchImpl: fetchMock as typeof fetch,
+      websocketFactory: () => {
+        throw new Error('not used');
+      },
+    });
+
+    await client.respondToApproval({
+      approvalId: 'approval-1',
+      taskId: 'task-1',
+      fromParticipantId: 'human.local',
+      decision: 'approved',
+      decisionMode: 'always',
+    } as Parameters<BrokerClient['respondToApproval']>[0]);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:4318/approvals/approval-1/respond',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          taskId: 'task-1',
+          fromParticipantId: 'human.local',
+          decision: 'approved',
+          decisionMode: 'always',
+        }),
+      })
+    );
+  });
+
+  it('submits clarification answers through broker intents', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 202 })
+    );
+
+    const client = new BrokerClient({
+      brokerUrl: 'http://127.0.0.1:4318',
+      fetchImpl: fetchMock as typeof fetch,
+      websocketFactory: () => {
+        throw new Error('not used');
+      },
+    });
+
+    await (client as unknown as {
+      answerClarification: (input: {
+        fromParticipantId: string;
+        toParticipantId: string;
+        taskId?: string;
+        threadId?: string;
+        summary: string;
+      }) => Promise<void>;
+    }).answerClarification({
+      fromParticipantId: 'human.local',
+      toParticipantId: 'codex.main',
+      taskId: 'task-1',
+      threadId: 'thread-1',
+      summary: 'Use the compact layout',
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:4318/intents',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: expect.any(String),
+      })
+    );
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string)).toMatchObject({
+      intentId: expect.any(String),
+      kind: 'answer_clarification',
+      fromParticipantId: 'human.local',
+      taskId: 'task-1',
+      threadId: 'thread-1',
+      to: { mode: 'participant', participants: ['codex.main'] },
+      payload: {
+        body: { summary: 'Use the compact layout' },
+      },
+    });
   });
 
   it('uses Tauri invoke to load the broker service seed inside the desktop app', async () => {
