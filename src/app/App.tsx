@@ -26,6 +26,10 @@ import { PanelRoute } from './routes/panel';
 import '../styles/tokens.css';
 import '../styles/panel.css';
 
+function isAgentParticipant(participant: BrokerParticipant): boolean {
+  return participant.kind !== 'human' && participant.kind !== 'adapter';
+}
+
 function getWindowMode(): 'panel' | 'expanded' | 'drag-demo' {
   if (typeof window === 'undefined') {
     return 'panel';
@@ -55,7 +59,9 @@ function buildEmptySnapshot(participants: BrokerParticipant[], brokerHealthy = f
   return {
     overview: {
       brokerHealthy,
-      onlineCount: participants.filter((participant) => participant.presence === 'online').length,
+      onlineCount: participants.filter(
+        (participant) => participant.presence === 'online' && isAgentParticipant(participant)
+      ).length,
       busyCount: 0,
       blockedCount: 0,
       pendingApprovalCount: 0,
@@ -72,7 +78,9 @@ function derivePreferredProject(participants: BrokerParticipant[], fallback: str
     return normalizedFallback;
   }
 
-  return participants.find((participant) => participant.context?.projectName?.trim())?.context?.projectName?.trim() ?? '';
+  return participants
+    .find((participant) => isAgentParticipant(participant) && participant.context?.projectName?.trim())
+    ?.context?.projectName?.trim() ?? '';
 }
 
 export function App() {
@@ -137,8 +145,9 @@ export function App() {
         }
 
         const nextSnapshot = buildProjectSnapshot(seed);
+        const agentParticipants = seed.participants.filter(isAgentParticipant);
         const projectCount = new Set(
-          seed.participants
+          agentParticipants
             .map((participant) => participant.context?.projectName?.trim())
             .filter((value): value is string => Boolean(value))
         ).size;
@@ -148,7 +157,7 @@ export function App() {
         setParticipants(seed.participants);
         setConnectionState('connected');
         setConnectionMessage(
-          `${settings.brokerUrl === DEFAULT_BROKER_URL ? 'Local broker ready' : 'Broker ready'} · ${seed.participants.length} agents · ${
+          `${settings.brokerUrl === DEFAULT_BROKER_URL ? 'Local broker ready' : 'Broker ready'} · ${agentParticipants.length} agents · ${
             projectCount || 1
           } projects · ${settings.brokerUrl}`
         );

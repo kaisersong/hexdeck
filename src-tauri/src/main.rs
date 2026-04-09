@@ -59,10 +59,14 @@ enum TitleActions {
 struct JumpTargetPayload {
     #[serde(rename = "participantId")]
     _participant_id: String,
-    terminal_app: String,
+    _terminal_app: String,
     #[serde(rename = "precision")]
     _precision: String,
     session_hint: Option<String>,
+    #[serde(rename = "terminalTTY")]
+    terminal_tty: Option<String>,
+    #[serde(rename = "terminalSessionID")]
+    terminal_session_id: Option<String>,
     project_path: Option<String>,
 }
 
@@ -122,27 +126,91 @@ fn panel_window_resizable() -> bool {
 
 #[tauri::command]
 fn jump_with_ghostty(target: JumpTargetPayload) -> Result<JumpResultPayload, String> {
-    let session_hint = escape_applescript(target.session_hint.as_deref().unwrap_or(""));
+    let session_hint = escape_applescript(target.terminal_session_id.as_deref().unwrap_or(""));
     let project_path = escape_applescript(target.project_path.as_deref().unwrap_or(""));
 
     let script = format!(
         r#"
 tell application "Ghostty"
     activate
-    set matches to {{}}
+    set targetWindow to missing value
+    set targetTab to missing value
+    set targetTerminal to missing value
+    set projectPathMatches to 0
+
     if "{session_hint}" is not "" then
-        set matches to every terminal whose name contains "{session_hint}"
+        repeat with aWindow in windows
+            repeat with aTab in tabs of aWindow
+                repeat with aTerminal in terminals of aTab
+                    if (id of aTerminal as text) is "{session_hint}" then
+                        set targetWindow to aWindow
+                        set targetTab to aTab
+                        set targetTerminal to aTerminal
+                        exit repeat
+                    end if
+                end repeat
+                if targetTerminal is not missing value then
+                    exit repeat
+                end if
+            end repeat
+            if targetTerminal is not missing value then
+                exit repeat
+            end if
+        end repeat
     end if
-    if (count of matches) = 0 and "{project_path}" is not "" then
-        set matches to every terminal whose working directory contains "{project_path}"
+
+    if targetTerminal is missing value and "{project_path}" is not "" then
+        repeat with aWindow in windows
+            repeat with aTab in tabs of aWindow
+                repeat with aTerminal in terminals of aTab
+                    if (working directory of aTerminal as text) contains "{project_path}" then
+                        set projectPathMatches to projectPathMatches + 1
+                        if targetTerminal is missing value then
+                            set targetWindow to aWindow
+                            set targetTab to aTab
+                            set targetTerminal to aTerminal
+                        end if
+                    end if
+                end repeat
+            end repeat
+        end repeat
     end if
-    if (count of matches) > 0 then
-        set focusedTerm to item 1 of matches
-        focus focusedTerm
+
+    if targetTerminal is missing value then
+        return "best_effort"
+    end if
+
+    if "{session_hint}" is "" and projectPathMatches > 1 then
+        return "best_effort"
+    end if
+
+    if targetWindow is not missing value then
+        activate window targetWindow
+        delay 0.05
+    end if
+
+    if targetTab is not missing value then
+        select tab targetTab
+        delay 0.05
+    end if
+
+    if "{session_hint}" is "" then
+        focus targetTerminal
+        delay 0.1
         return "exact"
     end if
-    return "best_effort"
+
+    repeat 3 times
+        focus targetTerminal
+        delay 0.1
+        try
+            if (id of focused terminal of selected tab of front window as text) is "{session_hint}" then
+                return "exact"
+            end if
+        end try
+    end repeat
 end tell
+return "best_effort"
 "#
     );
 
@@ -195,15 +263,28 @@ end tell
 
 #[tauri::command]
 fn jump_with_terminal_app(target: JumpTargetPayload) -> Result<JumpResultPayload, String> {
-    let app_name = if target.terminal_app == "Terminal.app" {
-        "Terminal"
-    } else {
-        "Terminal"
-    };
+    let terminal_tty = escape_applescript(
+        target
+            .terminal_tty
+            .as_deref()
+            .or(target.session_hint.as_deref())
+            .unwrap_or(""),
+    );
     let script = format!(
         r#"
-tell application "{app_name}"
+tell application "Terminal"
     activate
+    if "{terminal_tty}" is not "" then
+        repeat with aWindow in windows
+            repeat with aTab in tabs of aWindow
+                if (tty of aTab as text) is "{terminal_tty}" then
+                    set selected of aTab to true
+                    set frontmost of aWindow to true
+                    return "exact"
+                end if
+            end repeat
+        end repeat
+    end if
 end tell
 return "best_effort"
 "#
@@ -216,6 +297,20 @@ return "best_effort"
             None,
         )),
         Err(reason) => Ok(jump_result(false, "unsupported", Some(reason))),
+    }
+}
+
+#[tauri::command]
+fn open_project_path(project_path: String) -> Result<(), String> {
+    let status = Command::new("open")
+        .arg(&project_path)
+        .status()
+        .map_err(|error| format!("failed_to_open_project_path: {error}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err("open_project_path_failed".to_string())
     }
 }
 
@@ -297,25 +392,6 @@ end tell
     execute_osascript(script).ok()
 }
 
-/// Get Ghostty terminal title by finding the terminal with matching tty.
-fn get_ghostty_title_for_tty(_tty_path: &str) -> Option<String> {
-    // Get list of Ghostty terminals and find the one matching our tty
-    let script = r#"
-tell application "Ghostty"
-    set terminalList to every terminal
-    set output to ""
-    repeat with t in terminalList
-        set output to output & (name of t) & "|"
-    end repeat
-    return output
-end tell
-"#;
-
-    let names = execute_osascript(script).ok()?;
-    // Return the first terminal name (best effort)
-    names.split('|').next().map(|s| s.trim().to_string())
-}
-
 /// Set terminal title by sending OSC escape sequence directly to tty.
 /// This works for all terminals that support OSC sequences.
 fn set_title_via_osc(tty_path: &str, title: &str) -> Result<(), String> {
@@ -386,10 +462,10 @@ fn execute_title_append(alias: &str, project: Option<&str>) -> Result<(), String
         Some("iTerm.app") | Some("Apple_Terminal") => {
             get_terminal_title_via_applescript(&term_program.unwrap()).unwrap_or_default()
         }
-        Some("ghostty") => {
-            // Ghostty doesn't support AppleScript title read, use tty matching
-            get_ghostty_title_for_tty(&tty_path).unwrap_or_default()
-        }
+        // For Ghostty, avoid reading back a "current title" because it is not
+        // reliably exposed per-tty and can leak another terminal's title into
+        // this one. Use a deterministic title instead.
+        Some("ghostty") => String::new(),
         _ => String::new(),
     };
 
@@ -443,7 +519,7 @@ fn execute_title_clear(alias: &str) -> Result<(), String> {
         Some("iTerm.app") | Some("Apple_Terminal") => {
             get_terminal_title_via_applescript(&term_program.unwrap()).unwrap_or_default()
         }
-        Some("ghostty") => get_ghostty_title_for_tty(&tty_path).unwrap_or_default(),
+        Some("ghostty") => String::new(),
         _ => String::new(),
     };
 
@@ -510,6 +586,7 @@ fn main() {
             jump_with_ghostty,
             jump_with_iterm,
             jump_with_terminal_app,
+            open_project_path,
             commands::get_installed_broker_version,
             commands::get_installed_broker_path,
             commands::fetch_latest_broker_release,

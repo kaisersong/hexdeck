@@ -133,13 +133,13 @@ describe('PanelRoute', () => {
     expect(screen.getByRole('button', { name: 'Hide offline agents' })).toBeInTheDocument();
   });
 
-  it('treats registration-only presence as offline until there is live transport or work-state activity', () => {
+  it('keeps registration-only online participants in the active project groups', () => {
     render(
       <PanelRoute
         snapshot={{
           overview: {
             brokerHealthy: true,
-            onlineCount: 1,
+            onlineCount: 2,
             busyCount: 1,
             blockedCount: 0,
             pendingApprovalCount: 0,
@@ -178,8 +178,8 @@ describe('PanelRoute', () => {
     );
 
     expect(screen.getByText('Agent-A')).toBeInTheDocument();
-    expect(screen.queryByText('Agent-B')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Show offline agents' })).toHaveTextContent('1 Agents');
+    expect(screen.getByText('Agent-B')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Show offline agents' })).not.toBeInTheDocument();
   });
 
   it('scrolls the offline section into view when expanding it', () => {
@@ -294,6 +294,8 @@ describe('PanelRoute', () => {
   });
 
   it('renders jump actions on agent rows when the agent can be focused', () => {
+    const onJump = vi.fn();
+
     render(
       <PanelRoute
         snapshot={{
@@ -315,9 +317,12 @@ describe('PanelRoute', () => {
               jumpPrecision: 'exact',
               jumpTarget: {
                 participantId: 'a',
+                alias: 'codex4',
                 terminalApp: 'Ghostty',
                 precision: 'exact',
                 sessionHint: 'ghostty-tab-1',
+                terminalTTY: '/dev/ttys003',
+                terminalSessionID: 'ghostty-tab-1',
                 projectPath: '/repo',
               },
             },
@@ -335,13 +340,132 @@ describe('PanelRoute', () => {
           },
         ]}
         currentProject="HexDeck"
+        onJump={onJump}
       />
     );
 
+    const jumpRow = screen.getByRole('button', { name: 'Jump to @codex4' });
+    expect(jumpRow).toBeInTheDocument();
+
+    fireEvent.click(jumpRow);
+
+    expect(onJump).toHaveBeenCalledWith({
+      participantId: 'a',
+      alias: 'codex4',
+      terminalApp: 'Ghostty',
+      precision: 'exact',
+      sessionHint: 'ghostty-tab-1',
+      terminalTTY: '/dev/ttys003',
+      terminalSessionID: 'ghostty-tab-1',
+      projectPath: '/repo',
+    });
+  });
+
+  it('derives jump actions for online agents from participant metadata even without work-state activity', () => {
+    const onJump = vi.fn();
+
+    render(
+      <PanelRoute
+        snapshot={{
+          overview: {
+            brokerHealthy: true,
+            onlineCount: 1,
+            busyCount: 0,
+            blockedCount: 0,
+            pendingApprovalCount: 0,
+          },
+          now: [],
+          attention: [],
+          recent: [],
+        }}
+        participants={[
+          {
+            participantId: 'a',
+            alias: 'codex4',
+            presence: 'online',
+            presenceMetadata: { transport: 'websocket', connectionCount: 1 },
+            metadata: {
+              terminalApp: 'Ghostty',
+              sessionHint: 'ghostty-tab-1',
+              terminalTTY: '/dev/ttys003',
+              terminalSessionID: 'ghostty-tab-1',
+              projectPath: '/repo',
+            },
+            context: { projectName: 'HexDeck' },
+          },
+        ]}
+        currentProject="HexDeck"
+        onJump={onJump}
+      />
+    );
+
+    const jumpRow = screen.getByRole('button', { name: 'Jump to @codex4' });
+    expect(jumpRow).toBeEnabled();
+
+    fireEvent.click(jumpRow);
+
+    expect(onJump).toHaveBeenCalledWith({
+      participantId: 'a',
+      alias: 'codex4',
+      terminalApp: 'Ghostty',
+      precision: 'exact',
+      sessionHint: 'ghostty-tab-1',
+      terminalTTY: '/dev/ttys003',
+      terminalSessionID: 'ghostty-tab-1',
+      projectPath: '/repo',
+    });
+  });
+
+  it('does not render broker adapters as clickable agent rows', () => {
+    render(
+      <PanelRoute
+        snapshot={{
+          overview: {
+            brokerHealthy: true,
+            onlineCount: 1,
+            busyCount: 0,
+            blockedCount: 0,
+            pendingApprovalCount: 0,
+          },
+          now: [],
+          attention: [],
+          recent: [],
+        }}
+        participants={[
+          {
+            participantId: 'adapter.yunzhijia',
+            alias: 'yunzhijia',
+            kind: 'adapter',
+            presence: 'online',
+            presenceMetadata: { transport: 'websocket', connectionCount: 1 },
+          },
+          {
+            participantId: 'a',
+            alias: 'codex4',
+            kind: 'agent',
+            presence: 'online',
+            presenceMetadata: { transport: 'websocket', connectionCount: 1 },
+            metadata: {
+              terminalApp: 'Ghostty',
+              sessionHint: 'ghostty-tab-1',
+              terminalTTY: '/dev/ttys003',
+              terminalSessionID: 'ghostty-tab-1',
+              projectPath: '/repo',
+            },
+            context: { projectName: 'HexDeck' },
+          },
+        ]}
+        currentProject="HexDeck"
+      />
+    );
+
+    expect(screen.queryByRole('button', { name: 'Jump to @yunzhijia' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Jump to @codex4' })).toBeInTheDocument();
   });
 
-  it('renders disabled agent rows when a jump target is unavailable', () => {
+  it('disables online agents when stable jump metadata is missing', () => {
+    const onJump = vi.fn();
+
     render(
       <PanelRoute
         snapshot={{
@@ -360,13 +484,6 @@ describe('PanelRoute', () => {
               workState: 'implementing',
               summary: 'Working',
               updatedAtLabel: 'just now',
-              jumpTarget: {
-                participantId: 'a',
-                terminalApp: 'Ghostty',
-                precision: 'exact',
-                sessionHint: 'ghostty-tab-1',
-                projectPath: '/repo',
-              },
             },
             {
               participantId: 'b',
@@ -383,11 +500,11 @@ describe('PanelRoute', () => {
         participants={[
           {
             participantId: 'a',
-            alias: 'codex4',
-            presence: 'online',
-            presenceMetadata: { transport: 'websocket', connectionCount: 1 },
-            context: { projectName: 'HexDeck' },
-          },
+              alias: 'codex4',
+              presence: 'online',
+              presenceMetadata: { transport: 'websocket', connectionCount: 1 },
+              context: { projectName: 'HexDeck' },
+            },
           {
             participantId: 'b',
             alias: 'xiaok2',
@@ -397,12 +514,73 @@ describe('PanelRoute', () => {
           },
         ]}
         currentProject="HexDeck"
+        onJump={onJump}
       />
     );
 
-    expect(screen.getByRole('button', { name: 'Jump to @codex4' })).toBeEnabled();
-    expect(screen.getByRole('button', { name: 'xiaok2 unavailable' })).toBeDisabled();
+    const codexRow = screen.getByRole('button', { name: 'codex4 unavailable' });
+    const xiaokRow = screen.getByRole('button', { name: 'xiaok2 unavailable' });
+
+    expect(codexRow).toBeDisabled();
+    expect(xiaokRow).toBeDisabled();
     expect(screen.getByText('blocked')).toBeInTheDocument();
+    expect(onJump).not.toHaveBeenCalled();
+  });
+
+  it('disables rows when a snapshot jump target is unsupported and no participant metadata exists', () => {
+    const onJump = vi.fn();
+
+    render(
+      <PanelRoute
+        snapshot={{
+          overview: {
+            brokerHealthy: true,
+            onlineCount: 1,
+            busyCount: 1,
+            blockedCount: 0,
+            pendingApprovalCount: 0,
+          },
+          now: [
+            {
+              participantId: 'a',
+              alias: 'codex4',
+              toolLabel: 'codex',
+              workState: 'implementing',
+              summary: 'Working',
+              updatedAtLabel: 'just now',
+              jumpPrecision: 'unsupported',
+              jumpTarget: {
+                participantId: 'a',
+                alias: 'codex4',
+                terminalApp: 'unknown',
+                precision: 'unsupported',
+                sessionHint: null,
+                terminalTTY: null,
+                terminalSessionID: null,
+                projectPath: null,
+              },
+            },
+          ],
+          attention: [],
+          recent: [],
+        }}
+        participants={[
+          {
+            participantId: 'a',
+            alias: 'codex4',
+            presence: 'online',
+            presenceMetadata: { transport: 'websocket', connectionCount: 1 },
+            context: { projectName: 'HexDeck' },
+          },
+        ]}
+        currentProject="HexDeck"
+        onJump={onJump}
+      />
+    );
+
+    const jumpRow = screen.getByRole('button', { name: 'codex4 unavailable' });
+    expect(jumpRow).toBeDisabled();
+    expect(onJump).not.toHaveBeenCalled();
   });
 });
 
@@ -418,9 +596,12 @@ describe('ActivityCardHost', () => {
             actorLabel: '@codex4',
             jumpTarget: {
               participantId: 'a',
+              alias: 'codex4',
               terminalApp: 'Ghostty',
               precision: 'exact',
               sessionHint: 'ghostty-tab-1',
+              terminalTTY: '/dev/ttys003',
+              terminalSessionID: 'ghostty-tab-1',
               projectPath: '/repo',
             },
           },

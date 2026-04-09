@@ -6,10 +6,11 @@ interface JumpSeed {
   toolLabel: string;
   terminalApp: string;
   sessionHint: string | null;
+  terminalTTY: string | null;
+  terminalSessionID: string | null;
   projectPath: string | null;
 }
 
-const EXACT_TERMINAL_APPS = new Set(['Ghostty', 'iTerm']);
 const BEST_EFFORT_TERMINAL_APPS = new Set([
   'Terminal.app',
   'Windows Terminal',
@@ -20,7 +21,15 @@ const BEST_EFFORT_TERMINAL_APPS = new Set([
 ]);
 
 export function buildJumpTarget(seed: JumpSeed): JumpTarget {
-  const precision = EXACT_TERMINAL_APPS.has(seed.terminalApp)
+  // Ghostty's sessionHint may carry a compatibility alias; only terminalSessionID
+  // is stable enough to qualify as an exact locator.
+  const hasExactLocator = (
+    (seed.terminalApp === 'Ghostty' && Boolean(seed.terminalSessionID))
+    || (seed.terminalApp === 'iTerm' && Boolean(seed.sessionHint || seed.terminalTTY))
+    || (seed.terminalApp === 'Terminal.app' && Boolean(seed.terminalTTY || seed.sessionHint))
+  );
+
+  const precision = hasExactLocator
     ? 'exact'
     : BEST_EFFORT_TERMINAL_APPS.has(seed.terminalApp) || Boolean(seed.projectPath)
       ? 'best_effort'
@@ -28,9 +37,12 @@ export function buildJumpTarget(seed: JumpSeed): JumpTarget {
 
   return {
     participantId: seed.participantId,
+    alias: seed.alias,
     terminalApp: seed.terminalApp,
     precision,
     sessionHint: seed.sessionHint,
+    terminalTTY: seed.terminalTTY,
+    terminalSessionID: seed.terminalSessionID,
     projectPath: seed.projectPath,
   };
 }

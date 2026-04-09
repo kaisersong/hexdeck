@@ -48,7 +48,7 @@ describe('buildProjectSnapshot', () => {
     expect(snapshot.overview.onlineCount).toBe(1);
   });
 
-  it('does not count registration-only broker presence as online without work-state activity', () => {
+  it('counts registration-only broker presence as online', () => {
     const snapshot = buildProjectSnapshot({
       health: { ok: true },
       participants: [
@@ -74,7 +74,7 @@ describe('buildProjectSnapshot', () => {
       approvals: [],
     });
 
-    expect(snapshot.overview.onlineCount).toBe(1);
+    expect(snapshot.overview.onlineCount).toBe(2);
   });
 
   it('adds jump metadata to now cards', () => {
@@ -89,6 +89,8 @@ describe('buildProjectSnapshot', () => {
           metadata: {
             terminalApp: 'Ghostty',
             sessionHint: 'ghostty-tab-1',
+            terminalTTY: '/dev/ttys003',
+            terminalSessionID: 'ghostty-tab-1',
             projectPath: '/Users/song/projects/intent-broker',
           },
         } as any,
@@ -101,9 +103,12 @@ describe('buildProjectSnapshot', () => {
     expect(snapshot.now[0].jumpPrecision).toBe('exact');
     expect(snapshot.now[0].jumpTarget).toEqual({
       participantId: 'a',
+      alias: 'codex4',
       terminalApp: 'Ghostty',
       precision: 'exact',
       sessionHint: 'ghostty-tab-1',
+      terminalTTY: '/dev/ttys003',
+      terminalSessionID: 'ghostty-tab-1',
       projectPath: '/Users/song/projects/intent-broker',
     });
   });

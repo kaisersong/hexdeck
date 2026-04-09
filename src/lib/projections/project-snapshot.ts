@@ -16,14 +16,7 @@ export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjecti
   const workStateParticipantIds = new Set(seed.workStates.map((workState) => workState.participantId));
   const onlineAgentCount = agentParticipants.filter((participant) => {
     if (participant.presence === 'online') {
-      const connectionCount = participant.presenceMetadata?.connectionCount;
-      const hasLiveTransport =
-        participant.presenceMetadata?.transport === 'websocket' ||
-        (typeof connectionCount === 'number' && connectionCount > 0);
-
-      if (hasLiveTransport) {
-        return true;
-      }
+      return true;
     }
 
     if (participant.presence === 'offline') {
@@ -47,6 +40,14 @@ export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjecti
       toolLabel: participant?.tool ?? 'agent',
       terminalApp: String(metadata?.terminalApp ?? 'unknown'),
       sessionHint: typeof metadata?.sessionHint === 'string' ? metadata.sessionHint : null,
+      terminalTTY: typeof metadata?.terminalTTY === 'string'
+        ? metadata.terminalTTY
+        : typeof metadata?.sessionHint === 'string' && metadata?.terminalApp === 'Terminal.app'
+          ? metadata.sessionHint
+          : null,
+      terminalSessionID: typeof metadata?.terminalSessionID === 'string'
+        ? metadata.terminalSessionID
+        : null,
       projectPath: typeof metadata?.projectPath === 'string' ? metadata.projectPath : null,
     });
   };

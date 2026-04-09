@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { BrokerParticipant } from '../../lib/broker/types';
+import { buildJumpTarget } from '../../lib/jump/targets';
 import type { JumpTarget } from '../../lib/jump/types';
 import { startWindowDragging } from '../../lib/platform/window-controls';
 import type {
@@ -49,14 +50,7 @@ function toStateLabel(workState?: string): string {
 
 function isParticipantOnline(participant: BrokerParticipant, nowByParticipant: Map<string, AgentCardProjection>): boolean {
   if (participant.presence === 'online') {
-    const connectionCount = participant.presenceMetadata?.connectionCount;
-    const hasLiveTransport =
-      participant.presenceMetadata?.transport === 'websocket' ||
-      (typeof connectionCount === 'number' && connectionCount > 0);
-
-    if (hasLiveTransport) {
-      return true;
-    }
+    return true;
   }
 
   if (participant.presence === 'offline') {
@@ -71,6 +65,9 @@ function buildProjectGroups(
   currentProject: string,
   now: AgentCardProjection[]
 ): MenuGroups {
+  const agentParticipants = participants.filter(
+    (participant) => participant.kind !== 'human' && participant.kind !== 'adapter'
+  );
   const currentProjectKey = currentProject.trim() || 'Current Project';
   const nowByParticipant = new Map(now.map((item) => [item.participantId, item]));
   const groups = new Map<string, MenuProjectGroup>();
@@ -86,18 +83,47 @@ function buildProjectGroups(
     return group;
   };
 
-  for (const participant of participants) {
+  const deriveParticipantJumpTarget = (participant: BrokerParticipant): JumpTarget | null => {
+    const metadata = (participant as { metadata?: Record<string, unknown> }).metadata;
+    return buildJumpTarget({
+      participantId: participant.participantId,
+      alias: participant.alias,
+      toolLabel: participant.tool ?? 'agent',
+      terminalApp: typeof metadata?.terminalApp === 'string' ? metadata.terminalApp : 'unknown',
+      sessionHint: typeof metadata?.sessionHint === 'string' ? metadata.sessionHint : null,
+      terminalTTY: typeof metadata?.terminalTTY === 'string'
+        ? metadata.terminalTTY
+        : typeof metadata?.sessionHint === 'string' && metadata?.terminalApp === 'Terminal.app'
+          ? metadata.sessionHint
+          : null,
+      terminalSessionID: typeof metadata?.terminalSessionID === 'string'
+        ? metadata.terminalSessionID
+        : null,
+      projectPath: typeof metadata?.projectPath === 'string' ? metadata.projectPath : null,
+    });
+  };
+
+  for (const participant of agentParticipants) {
     const groupName = participant.context?.projectName ?? currentProjectKey;
     const currentState = nowByParticipant.get(participant.participantId);
     const isOnline = isParticipantOnline(participant, nowByParticipant);
     const stateLabel = toStateLabel(currentState?.workState);
     const stateTone = toStateTone(currentState?.workState);
+    const currentJumpTarget = currentState?.jumpTarget
+      ? {
+          ...currentState.jumpTarget,
+          alias: currentState.jumpTarget.alias || participant.alias,
+        }
+      : null;
     const agent: MenuAgentItem = {
       participantId: participant.participantId,
       alias: participant.alias,
       stateLabel: isOnline ? stateLabel : 'offline',
       stateTone: isOnline ? stateTone : 'idle',
-      jumpTarget: currentState?.jumpTarget,
+      jumpTarget:
+        currentJumpTarget && currentJumpTarget.precision !== 'unsupported'
+          ? currentJumpTarget
+          : deriveParticipantJumpTarget(participant),
     };
 
     if (!isOnline) {
@@ -114,7 +140,7 @@ function buildProjectGroups(
   }
 
   for (const item of now) {
-    if (participants.some((participant) => participant.participantId === item.participantId)) {
+    if (agentParticipants.some((participant) => participant.participantId === item.participantId)) {
       continue;
     }
 
@@ -289,7 +315,7 @@ export function PanelRoute({
                 </div>
                 <ul className="menu-agent-list">
                   {group.agents.map((agent) => {
-                    const canJump = Boolean(agent.jumpTarget);
+                    const canJump = Boolean(agent.jumpTarget && agent.jumpTarget.precision !== 'unsupported');
 
                     return (
                       <li key={agent.participantId}>

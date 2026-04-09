@@ -12,6 +12,10 @@ export function OnboardingPanel({
   capabilities: CapabilityStatus;
   participants?: BrokerParticipant[];
 }) {
+  const agentParticipants = participants.filter(
+    (participant) => participant.kind !== 'human' && participant.kind !== 'adapter'
+  );
+
   return (
     <section className="panel-section panel-onboarding" aria-labelledby="broker-connection-title">
       <div className="panel-section-header">
@@ -24,9 +28,9 @@ export function OnboardingPanel({
 
       <div className="agent-status-section">
         <div className="compact-section-title">Connected agents</div>
-        {participants.length > 0 ? (
+        {agentParticipants.length > 0 ? (
           <div className="agent-list">
-            {participants.map((agent) => (
+            {agentParticipants.map((agent) => (
               <div key={agent.participantId} className="agent-item">
                 <span className="agent-status-dot"></span>
                 <span className="agent-alias">{agent.alias}</span>
