@@ -1063,3 +1063,96 @@
     transform: scale(0.84);
   }
 }
+
+.activity-card-shell {
+  min-height: 100vh;
+  width: 100%;
+  padding: 24px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  background:
+    radial-gradient(circle at top, rgba(74, 122, 255, 0.18), transparent 34%),
+    linear-gradient(180deg, rgba(5, 10, 18, 0.98), rgba(10, 16, 29, 0.95));
+}
+
+.activity-card-shell--empty {
+  min-height: 0;
+  padding: 0;
+  background: transparent;
+  pointer-events: none;
+}
+
+.activity-card-host {
+  display: grid;
+  gap: 12px;
+}
+
+.floating-card {
+  width: min(100%, 560px);
+  margin-top: 10px;
+  padding: 20px 22px 18px;
+  border-radius: 24px;
+  border: 1px solid var(--border);
+  background: rgba(8, 13, 23, 0.96);
+  box-shadow: 0 24px 48px rgba(0, 0, 0, 0.32);
+}
+
+.floating-card--approval {
+  border-color: rgba(107, 227, 156, 0.34);
+}
+
+.floating-card--question {
+  border-color: rgba(125, 183, 255, 0.34);
+}
+
+.floating-card--completion {
+  border-color: rgba(255, 196, 92, 0.34);
+}
+
+.floating-card__eyebrow {
+  margin: 0 0 10px;
+  color: var(--text-muted);
+  font-size: 0.76rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.floating-card__summary {
+  margin: 0;
+  font-size: 1.36rem;
+  line-height: 1.2;
+}
+
+.floating-card__meta,
+.floating-card__body {
+  margin: 8px 0 0;
+  color: var(--text-muted);
+}
+
+.floating-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.floating-card__jump {
+  margin-top: 16px;
+}
+
+.action-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+@media (max-width: 640px) {
+  .activity-card-shell {
+    padding: 16px;
+  }
+
+  .floating-card {
+    width: 100%;
+    padding: 18px 18px 16px;
+  }
+}

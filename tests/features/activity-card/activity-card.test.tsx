@@ -1,5 +1,12 @@
-import { render, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type {
+  ActivityCardApprovalProjection,
+  ActivityCardCompletionProjection,
+  ActivityCardQuestionProjection,
+} from '../../../src/lib/activity-card/types';
+import { ActivityCardRoute } from '../../../src/app/routes/activity-card';
+import { FloatingActivityCard } from '../../../src/features/activity-card/FloatingActivityCard';
 
 const {
   brokerClientConstructorMock,
@@ -55,6 +62,64 @@ function makeSeed() {
     workStates: [],
     events: [],
     approvals: [],
+  };
+}
+
+function makeApprovalCard(): ActivityCardApprovalProjection {
+  return {
+    cardId: 'approval:1',
+    kind: 'approval',
+    priority: 'critical',
+    summary: 'Deploy approval needed',
+    actorLabel: '@codex4',
+    approvalId: 'approval-1',
+    actionMode: 'action',
+    decision: 'pending',
+    taskId: 'task-1',
+  };
+}
+
+function makeQuestionCard(): ActivityCardQuestionProjection {
+  return {
+    cardId: 'question:1',
+    kind: 'question',
+    priority: 'attention',
+    summary: 'Which target should I use?',
+    actorLabel: '@codex4',
+    questionId: 'question-1',
+    prompt: 'Choose a target',
+    selectionMode: 'single-select',
+    options: [
+      { label: 'Staging', value: 'staging' },
+      { label: 'Production', value: 'prod' },
+    ],
+    participantId: 'codex.main',
+    taskId: 'task-1',
+    threadId: 'thread-1',
+  };
+}
+
+function makeCompletionCard(): ActivityCardCompletionProjection {
+  return {
+    cardId: 'completion:1',
+    kind: 'completion',
+    priority: 'ambient',
+    summary: 'Completed rollout tracking slice.',
+    actorLabel: '@codex4',
+    stage: 'completed',
+    participantId: 'codex.main',
+    taskId: 'task-1',
+    threadId: 'thread-1',
+    jumpTarget: {
+      participantId: 'codex.main',
+      alias: 'codex4',
+      terminalApp: 'Ghostty',
+      precision: 'exact',
+      sessionHint: 'ghostty-1',
+      terminalTTY: '/dev/ttys001',
+      terminalSessionID: 'ghostty-1',
+      projectPath: '/Users/song/projects/hexdeck',
+    },
   };
 }
 
@@ -313,5 +378,173 @@ describe('activity card action dispatcher', () => {
     await waitFor(() => {
       expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(2);
     });
+  });
+});
+
+describe('FloatingActivityCard', () => {
+  it('renders approval actions as Yes, Always, and No buttons', () => {
+    const onApprovalDecision = vi.fn();
+
+    render(
+      <FloatingActivityCard
+        card={makeApprovalCard()}
+        onApprovalDecision={onApprovalDecision}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Yes' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Always' }));
+    fireEvent.click(screen.getByRole('button', { name: 'No' }));
+
+    expect(onApprovalDecision).toHaveBeenNthCalledWith(1, 'yes');
+    expect(onApprovalDecision).toHaveBeenNthCalledWith(2, 'always');
+    expect(onApprovalDecision).toHaveBeenNthCalledWith(3, 'no');
+  });
+
+  it('submits question options immediately on click', () => {
+    const onQuestionSelect = vi.fn();
+
+    render(
+      <FloatingActivityCard
+        card={makeQuestionCard()}
+        onQuestionSelect={onQuestionSelect}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Staging' }));
+
+    expect(onQuestionSelect).toHaveBeenCalledWith({ label: 'Staging', value: 'staging' });
+    expect(screen.queryByRole('button', { name: /submit/i })).not.toBeInTheDocument();
+  });
+
+  it('reports hover state changes so timers can pause and resume', () => {
+    const onHoverChange = vi.fn();
+
+    render(
+      <FloatingActivityCard
+        card={makeApprovalCard()}
+        onHoverChange={onHoverChange}
+      />
+    );
+
+    const article = screen.getByText('Deploy approval needed').closest('article');
+    if (!article) {
+      throw new Error('expected floating card article');
+    }
+
+    fireEvent.mouseEnter(article);
+    fireEvent.mouseLeave(article);
+
+    expect(onHoverChange).toHaveBeenNthCalledWith(1, true);
+    expect(onHoverChange).toHaveBeenNthCalledWith(2, false);
+  });
+
+  it('renders completion summaries and jump actions when a jump target exists', () => {
+    const onJump = vi.fn();
+    const completionCard = makeCompletionCard();
+
+    render(
+      <FloatingActivityCard
+        card={completionCard}
+        onJump={onJump}
+      />
+    );
+
+    expect(screen.getByText('Completed rollout tracking slice.')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Jump' }));
+    expect(onJump).toHaveBeenCalledWith(completionCard.jumpTarget);
+  });
+});
+
+describe('ActivityCardRoute', () => {
+  it('forwards question selections through the route boundary', () => {
+    const onQuestionAction = vi.fn();
+
+    render(
+      <ActivityCardRoute
+        card={makeQuestionCard()}
+        onQuestionAction={onQuestionAction}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Staging' }));
+
+    expect(onQuestionAction).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'question', questionId: 'question-1' }),
+      { label: 'Staging', value: 'staging' }
+    );
+  });
+
+  it('forwards hover state changes through the route boundary', () => {
+    const onHoverChange = vi.fn();
+
+    render(
+      <ActivityCardRoute
+        card={makeApprovalCard()}
+        onHoverChange={onHoverChange}
+      />
+    );
+
+    const article = screen.getByText('Deploy approval needed').closest('article');
+    if (!article) {
+      throw new Error('expected floating card article');
+    }
+
+    fireEvent.mouseEnter(article);
+    fireEvent.mouseLeave(article);
+
+    expect(onHoverChange).toHaveBeenNthCalledWith(1, true);
+    expect(onHoverChange).toHaveBeenNthCalledWith(2, false);
+  });
+});
+
+describe('activity-card window routing', () => {
+  it('renders the floating activity card route when view=activity-card', async () => {
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue({
+        health: { ok: true },
+        participants: [
+          {
+            participantId: 'codex.main',
+            alias: 'codex4',
+            kind: 'agent',
+            tool: 'codex',
+            metadata: {
+              terminalApp: 'Ghostty',
+              terminalSessionID: 'ghostty-1',
+              projectPath: '/Users/song/projects/hexdeck',
+            },
+            context: { projectName: 'HexDeck' },
+          },
+        ],
+        workStates: [],
+        events: [],
+        approvals: [
+          {
+            approvalId: 'approval-1',
+            taskId: 'task-1',
+            summary: 'Deploy approval needed',
+            decision: 'pending',
+          },
+        ],
+      }),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Yes' })).toBeInTheDocument();
+    });
+
+    expect(screen.getByText('Deploy approval needed')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Open Main Panel' })).not.toBeInTheDocument();
   });
 });

@@ -21,13 +21,13 @@ export function ActivityCardHost({
   }
 
   return (
-    <aside className="panel-section activity-card" aria-label="activity-card">
+    <aside className="panel-section activity-card-host" aria-label="panel attention">
       <div className="panel-section-header">
         <div>
           <h2>Needs attention</h2>
-          <p className="section-kicker">Top priority item surfaced into the compact panel</p>
+          <p className="section-kicker">Legacy panel attention host</p>
         </div>
-        <span className="stack-card__badge">priority</span>
+        <span className="stack-card__badge">panel</span>
       </div>
       <p>{firstCritical.summary}</p>
       {firstCritical.kind === 'approval' && firstCritical.approvalId ? (

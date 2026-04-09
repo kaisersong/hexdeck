@@ -12,6 +12,7 @@ import type {
   BrokerParticipant,
 } from '../lib/broker/types';
 import type { JumpTarget } from '../lib/jump/types';
+import { buildActivityCardsFromSeed } from '../lib/activity-card/projections';
 import type { ProjectSnapshotProjection } from '../lib/projections/types';
 import { buildProjectSnapshot } from '../lib/projections/project-snapshot';
 import { getCapabilityStatus } from '../lib/platform/capabilities';
@@ -26,6 +27,7 @@ import {
 import { useAppStore } from '../lib/store/use-app-store';
 import { ensureBrokerReady } from '../lib/update/broker-updater';
 import { DragDemoRoute } from './routes/drag-demo';
+import { ActivityCardRoute } from './routes/activity-card';
 import { ExpandedRoute, type ExpandedSection } from './routes/expanded';
 import { PanelRoute } from './routes/panel';
 import '../styles/tokens.css';
@@ -35,12 +37,16 @@ function isAgentParticipant(participant: BrokerParticipant): boolean {
   return participant.kind !== 'human' && participant.kind !== 'adapter';
 }
 
-function getWindowMode(): 'panel' | 'expanded' | 'drag-demo' {
+function getWindowMode(): 'panel' | 'expanded' | 'drag-demo' | 'activity-card' {
   if (typeof window === 'undefined') {
     return 'panel';
   }
 
   const mode = new URLSearchParams(window.location.search).get('view');
+  if (mode === 'activity-card') {
+    return 'activity-card';
+  }
+
   if (mode === 'expanded') {
     return 'expanded';
   }
@@ -219,7 +225,9 @@ export function App() {
               return;
             }
 
+            const nowMs = Date.now();
             const nextSnapshot = buildProjectSnapshot(seed);
+            store.replaceActivityCards(buildActivityCardsFromSeed(seed), nowMs);
             const agentParticipants = seed.participants.filter(isAgentParticipant);
             const projectCount = new Set(
               agentParticipants
@@ -338,6 +346,7 @@ export function App() {
       await dispatchActivityCardAction(client, action);
 
       const seed = await client.loadServiceSeed();
+      store.replaceActivityCards(buildActivityCardsFromSeed(seed), Date.now());
       const nextSnapshot = buildProjectSnapshot(seed);
       store.setSnapshot(nextSnapshot);
       setSnapshot(nextSnapshot);
@@ -453,6 +462,38 @@ export function App() {
   const currentProject = derivePreferredProject(participants, settings.currentProject);
   const brokerLive = runtimeStatus?.healthy ?? snapshot?.overview.brokerHealthy ?? false;
   const panelSnapshot = snapshot ?? buildEmptySnapshot(participants, brokerLive);
+  const activityCardState = store.getState().activityCards;
+  const isActivityCardWindow = windowMode === 'activity-card';
+
+  if (isActivityCardWindow) {
+    return (
+      <ActivityCardRoute
+        card={activityCardState.activeCard}
+        pendingApprovalIds={pendingApprovalIds}
+        onJump={handleJump}
+        onApprovalAction={(card, decisionMode) => void handleActivityCardAction({
+          kind: 'approval',
+          approvalId: card.approvalId,
+          taskId: card.taskId,
+          decisionMode,
+        })}
+        onQuestionAction={(card, option) => {
+          if (!card.participantId) {
+            return;
+          }
+
+          void handleActivityCardAction({
+            kind: 'question',
+            questionId: card.questionId,
+            participantId: card.participantId,
+            taskId: card.taskId,
+            threadId: card.threadId,
+            answer: option.value,
+          });
+        }}
+      />
+    );
+  }
 
   if (isExpandedWindow) {
     return (
