@@ -13,6 +13,7 @@ const {
   expandedRouteSpy,
   getBrokerRuntimeStatusMock,
   getCapabilityStatusMock,
+  invokeMock,
   loadLocalSettingsMock,
   ensureBrokerReadyMock,
 } = vi.hoisted(() => ({
@@ -20,6 +21,7 @@ const {
   expandedRouteSpy: vi.fn(),
   getBrokerRuntimeStatusMock: vi.fn(),
   getCapabilityStatusMock: vi.fn(),
+  invokeMock: vi.fn(),
   loadLocalSettingsMock: vi.fn(),
   ensureBrokerReadyMock: vi.fn(),
 }));
@@ -33,6 +35,10 @@ vi.mock('../../../src/app/routes/expanded', () => ({
 
 vi.mock('../../../src/lib/broker/client', () => ({
   BrokerClient: brokerClientConstructorMock,
+}));
+
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: invokeMock,
 }));
 
 vi.mock('../../../src/lib/broker/runtime', () => ({
@@ -164,6 +170,7 @@ beforeEach(() => {
   });
   ensureBrokerReadyMock.mockReset();
   ensureBrokerReadyMock.mockResolvedValue({ ready: true, last_error: null });
+  invokeMock.mockReset();
   brokerClientInstance = makeBrokerClientMock();
   brokerClientConstructorMock.mockReset();
   brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
@@ -439,6 +446,42 @@ describe('FloatingActivityCard', () => {
     expect(onHoverChange).toHaveBeenNthCalledWith(2, false);
   });
 
+  it('maps y, a, and n keyboard shortcuts onto approval decisions', () => {
+    const onApprovalDecision = vi.fn();
+
+    render(
+      <FloatingActivityCard
+        card={makeApprovalCard()}
+        onApprovalDecision={onApprovalDecision}
+      />
+    );
+
+    fireEvent.keyDown(window, { key: 'y' });
+    fireEvent.keyDown(window, { key: 'a' });
+    fireEvent.keyDown(window, { key: 'n' });
+
+    expect(onApprovalDecision).toHaveBeenNthCalledWith(1, 'yes');
+    expect(onApprovalDecision).toHaveBeenNthCalledWith(2, 'always');
+    expect(onApprovalDecision).toHaveBeenNthCalledWith(3, 'no');
+  });
+
+  it('does not map approval keyboard shortcuts for non-approval cards', () => {
+    const onQuestionSelect = vi.fn();
+
+    render(
+      <FloatingActivityCard
+        card={makeQuestionCard()}
+        onQuestionSelect={onQuestionSelect}
+      />
+    );
+
+    fireEvent.keyDown(window, { key: 'y' });
+    fireEvent.keyDown(window, { key: 'a' });
+    fireEvent.keyDown(window, { key: 'n' });
+
+    expect(onQuestionSelect).not.toHaveBeenCalled();
+  });
+
   it('renders completion summaries and jump actions when a jump target exists', () => {
     const onJump = vi.fn();
     const completionCard = makeCompletionCard();
@@ -499,6 +542,55 @@ describe('ActivityCardRoute', () => {
 });
 
 describe('activity-card window routing', () => {
+  it('shows the floating activity-card window when broker data contains an active card', async () => {
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue({
+        health: { ok: true },
+        participants: [],
+        workStates: [],
+        events: [],
+        approvals: [
+          {
+            approvalId: 'approval-1',
+            taskId: 'task-1',
+            summary: 'Deploy approval needed',
+            decision: 'pending',
+          },
+        ],
+      }),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    render(<App />);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+    });
+  });
+
+  it('hides the floating activity-card window when broker data has no active card', async () => {
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    render(<App />);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    });
+  });
+
   it('renders the floating activity card route when view=activity-card', async () => {
     brokerClientInstance = {
       loadServiceSeed: vi.fn().mockResolvedValue({

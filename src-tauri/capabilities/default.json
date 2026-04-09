@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/nicerobot/tauri/dev/crates/tauri-utils/schema.json",
   "identifier": "default",
   "description": "Default capabilities for HexDeck",
-  "windows": ["panel", "expanded", "drag-demo"],
+  "windows": ["panel", "expanded", "drag-demo", "activity-card"],
   "permissions": [
     "core:default",
     "core:window:allow-minimize",

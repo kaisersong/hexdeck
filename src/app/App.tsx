@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { BrokerClient } from '../lib/broker/client';
+import type { ActivityCardProjection } from '../lib/activity-card/types';
 import {
   getBrokerRuntimeStatus,
   restartBrokerRuntime,
@@ -117,6 +118,15 @@ export interface AppActivityTransportClient {
   answerClarification(input: BrokerClarificationAnswerInput): Promise<void>;
 }
 
+async function syncActivityCardWindowVisibility(card: ActivityCardProjection | null): Promise<void> {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke(card ? 'show_activity_card_window' : 'hide_activity_card_window');
+  } catch {
+    // Ignore when not running in Tauri.
+  }
+}
+
 function createClarificationIntentId(questionId: string): string {
   if (typeof globalThis.crypto !== 'undefined' && typeof globalThis.crypto.randomUUID === 'function') {
     return `clarification:${questionId}:${globalThis.crypto.randomUUID()}`;
@@ -170,6 +180,20 @@ export function App() {
   const [connectionMessage, setConnectionMessage] = useState<string | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<BrokerRuntimeStatus | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const [, setActivityCardRenderKey] = useState(0);
+
+  const syncActivityCards = async (cards: ActivityCardProjection[], nowMs: number) => {
+    const previousActiveCardId = store.getState().activityCards.activeCard?.cardId ?? null;
+
+    store.replaceActivityCards(cards, nowMs);
+
+    const nextActiveCard = store.getState().activityCards.activeCard;
+    if ((nextActiveCard?.cardId ?? null) !== previousActiveCardId) {
+      setActivityCardRenderKey((value) => value + 1);
+    }
+
+    await syncActivityCardWindowVisibility(nextActiveCard);
+  };
 
   useEffect(() => {
     let disposed = false;
@@ -227,7 +251,7 @@ export function App() {
 
             const nowMs = Date.now();
             const nextSnapshot = buildProjectSnapshot(seed);
-            store.replaceActivityCards(buildActivityCardsFromSeed(seed), nowMs);
+            await syncActivityCards(buildActivityCardsFromSeed(seed), nowMs);
             const agentParticipants = seed.participants.filter(isAgentParticipant);
             const projectCount = new Set(
               agentParticipants
@@ -289,6 +313,25 @@ export function App() {
   }, [reloadKey, settings.brokerUrl, store]);
 
   useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      const previousActiveCardId = store.getState().activityCards.activeCard?.cardId ?? null;
+      store.tickActivityCards(Date.now());
+
+      const nextActiveCard = store.getState().activityCards.activeCard;
+      if ((nextActiveCard?.cardId ?? null) === previousActiveCardId) {
+        return;
+      }
+
+      setActivityCardRenderKey((value) => value + 1);
+      void syncActivityCardWindowVisibility(nextActiveCard);
+    }, 250);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [store]);
+
+  useEffect(() => {
     if (isExpandedWindow || isDragDemoWindow) {
       return;
     }
@@ -346,7 +389,7 @@ export function App() {
       await dispatchActivityCardAction(client, action);
 
       const seed = await client.loadServiceSeed();
-      store.replaceActivityCards(buildActivityCardsFromSeed(seed), Date.now());
+      await syncActivityCards(buildActivityCardsFromSeed(seed), Date.now());
       const nextSnapshot = buildProjectSnapshot(seed);
       store.setSnapshot(nextSnapshot);
       setSnapshot(nextSnapshot);
@@ -490,6 +533,9 @@ export function App() {
             threadId: card.threadId,
             answer: option.value,
           });
+        }}
+        onHoverChange={(hovered) => {
+          store.setActivityCardHovered(hovered, Date.now());
         }}
       />
     );

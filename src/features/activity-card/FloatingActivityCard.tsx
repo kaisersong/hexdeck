@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import type { ActivityCardApprovalProjection, ActivityCardQuestionOption, ActivityCardProjection } from '../../lib/activity-card/types';
 import type { BrokerApprovalDecisionMode } from '../../lib/broker/types';
 import type { JumpTarget } from '../../lib/jump/types';
@@ -98,6 +99,38 @@ export function FloatingActivityCard({
   onHoverChange,
 }: FloatingActivityCardProps) {
   const label = getCardLabel(card);
+  const approvalPending = card.kind === 'approval' && (pendingApprovalIds?.has(card.approvalId) ?? false);
+
+  useEffect(() => {
+    if (card.kind !== 'approval' || !onApprovalDecision || approvalPending) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey || event.altKey) {
+        return;
+      }
+
+      const key = event.key.toLowerCase();
+      if (key === 'y') {
+        event.preventDefault();
+        onApprovalDecision('yes');
+      }
+      if (key === 'a') {
+        event.preventDefault();
+        onApprovalDecision('always');
+      }
+      if (key === 'n') {
+        event.preventDefault();
+        onApprovalDecision('no');
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [approvalPending, card, onApprovalDecision]);
 
   return (
     <article
