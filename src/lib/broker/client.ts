@@ -39,13 +39,52 @@ function isTauriEnvironment(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
 
-function isBrokerEvent(value: unknown): value is BrokerEvent {
+function normalizeBrokerEvent(value: unknown): BrokerEvent | null {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return false;
+    return null;
   }
 
-  const candidate = value as Partial<BrokerEvent>;
-  return typeof candidate.id === 'number' && typeof candidate.type === 'string';
+  const candidate = value as Partial<BrokerEvent> & { kind?: unknown };
+  const type = typeof candidate.type === 'string'
+    ? candidate.type
+    : typeof candidate.kind === 'string'
+      ? candidate.kind
+      : null;
+
+  if (typeof candidate.id !== 'number' || type === null) {
+    return null;
+  }
+
+  const event: BrokerEvent = {
+    id: candidate.id,
+    type,
+  };
+
+  if (typeof candidate.taskId === 'string') event.taskId = candidate.taskId;
+  if (typeof candidate.threadId === 'string') event.threadId = candidate.threadId;
+  if (typeof candidate.createdAt === 'string') event.createdAt = candidate.createdAt;
+  if (candidate.payload && typeof candidate.payload === 'object' && !Array.isArray(candidate.payload)) {
+    event.payload = candidate.payload as Record<string, unknown>;
+  }
+
+  return event;
+}
+
+function normalizeBrokerEvents(values: unknown): BrokerEvent[] {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+
+  return values
+    .map((value) => normalizeBrokerEvent(value))
+    .filter((value): value is BrokerEvent => value !== null);
+}
+
+function normalizeProjectSeed(seed: ProjectSeed): ProjectSeed {
+  return {
+    ...seed,
+    events: normalizeBrokerEvents(seed.events),
+  };
 }
 
 export class BrokerClient {
@@ -71,10 +110,10 @@ export class BrokerClient {
 
   async loadProjectSeed(projectName: string): Promise<ProjectSeed> {
     if (isTauriEnvironment()) {
-      return invoke<ProjectSeed>('load_broker_project_seed', {
+      return normalizeProjectSeed(await invoke<ProjectSeed>('load_broker_project_seed', {
         brokerUrl: this.brokerUrl,
         projectName,
-      });
+      }));
     }
 
     const encodedProjectName = encodeURIComponent(projectName);
@@ -83,7 +122,7 @@ export class BrokerClient {
       this.requestList<BrokerParticipant>(`/participants?projectName=${encodedProjectName}`, 'participants'),
       this.requestList<BrokerWorkState>(`/work-state?projectName=${encodedProjectName}`, 'items'),
       this.loadPresence(),
-      this.requestList<BrokerEvent>('/events/replay?after=0', 'items'),
+      this.requestList<unknown>('/events/replay?after=0', 'items'),
       this.loadPendingApprovals(projectName),
     ]);
 
@@ -91,16 +130,16 @@ export class BrokerClient {
       health,
       participants: mergeParticipantsWithPresence(participants, presence),
       workStates,
-      events,
+      events: normalizeBrokerEvents(events),
       approvals,
     };
   }
 
   async loadServiceSeed(): Promise<ProjectSeed> {
     if (isTauriEnvironment()) {
-      return invoke<ProjectSeed>('load_broker_service_seed', {
+      return normalizeProjectSeed(await invoke<ProjectSeed>('load_broker_service_seed', {
         brokerUrl: this.brokerUrl,
-      });
+      }));
     }
 
     const [health, participants, workStates, presence, events] = await Promise.all([
@@ -108,14 +147,14 @@ export class BrokerClient {
       this.requestList<BrokerParticipant>('/participants', 'participants'),
       this.requestList<BrokerWorkState>('/work-state', 'items'),
       this.loadPresence(),
-      this.requestList<BrokerEvent>('/events/replay?after=0', 'items'),
+      this.requestList<unknown>('/events/replay?after=0', 'items'),
     ]);
 
     return {
       health,
       participants: mergeParticipantsWithPresence(participants, presence),
       workStates,
-      events,
+      events: normalizeBrokerEvents(events),
       approvals: [],
     };
   }
@@ -129,10 +168,10 @@ export class BrokerClient {
     }
 
     const encodedProjectName = encodeURIComponent(projectName);
-    const payload = await this.request<{ items: BrokerApprovalItem[] }>(
-      `/projects/${encodedProjectName}/approvals?status=pending`
+    return this.requestList<BrokerApprovalItem>(
+      `/projects/${encodedProjectName}/approvals?status=pending`,
+      'items'
     );
-    return payload.items;
   }
 
   async respondToApproval(input: BrokerApprovalResponseInput): Promise<void> {
@@ -189,31 +228,44 @@ export class BrokerClient {
         return;
       }
 
-      if (!isBrokerEvent(parsed)) {
+      const event = normalizeBrokerEvent(parsed);
+      if (!event) {
         return;
       }
 
-      const event = parsed;
       for (const listener of this.listeners) {
         listener(event);
       }
     };
 
-    socket.addEventListener('message', handleMessage);
-
+    let cleanup: () => void = () => undefined;
     let disposed = false;
-    const cleanup = () => {
+    const cleanupInternal = () => {
       if (disposed) {
         return;
       }
 
       disposed = true;
       socket.removeEventListener('message', handleMessage);
-      socket.close();
+      socket.removeEventListener('close', handleSocketTerminalEvent);
+      socket.removeEventListener('error', handleSocketTerminalEvent);
 
       if (this.realtimeCleanup === cleanup) {
         this.realtimeCleanup = null;
       }
+    };
+
+    const handleSocketTerminalEvent = () => {
+      cleanupInternal();
+    };
+
+    socket.addEventListener('message', handleMessage);
+    socket.addEventListener('close', handleSocketTerminalEvent);
+    socket.addEventListener('error', handleSocketTerminalEvent);
+
+    cleanup = () => {
+      cleanupInternal();
+      socket.close();
     };
 
     this.realtimeCleanup = cleanup;

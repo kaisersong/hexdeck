@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BrokerClient } from '../../../src/lib/broker/client';
+import type { BrokerEvent } from '../../../src/lib/broker/types';
+
+// @ts-expect-error legacy replay field should not be part of the public contract
+const legacyBrokerEvent: BrokerEvent = { id: 1, type: 'report_progress', kind: 'report_progress' };
+
+void legacyBrokerEvent;
 
 const { invokeMock } = vi.hoisted(() => ({
   invokeMock: vi.fn(),
@@ -151,6 +157,55 @@ describe('BrokerClient', () => {
         new Response(
           JSON.stringify({
             items: [{ id: 2001, type: 'report_progress' }],
+          }),
+          { status: 200 }
+        )
+      );
+
+    const client = new BrokerClient({
+      brokerUrl: 'http://127.0.0.1:4318',
+      fetchImpl: fetchMock as typeof fetch,
+      websocketFactory: () => {
+        throw new Error('not used in this test');
+      }
+    });
+
+    const snapshot = await client.loadServiceSeed();
+
+    expect(snapshot.events).toEqual([{ id: 2001, type: 'report_progress' }]);
+  });
+
+  it('normalizes replay events that use kind instead of type', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ participantId: 'codex-session-019d671b', alias: 'codex16', kind: 'agent', context: { projectName: 'projects' } }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [{ participantId: 'codex-session-019d671b', status: 'implementing', projectName: 'projects' }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ participantId: 'codex-session-019d671b', status: 'online', metadata: { source: 'registration' } }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [{ id: 2001, kind: 'report_progress' }],
           }),
           { status: 200 }
         )
@@ -352,6 +407,48 @@ describe('BrokerClient', () => {
     expect(fakeSocket.close).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['close', 'error'] as const)('clears the cached realtime handle after websocket %s and reconnects', (eventType) => {
+    const sockets: Array<{
+      addEventListener: (type: string, handler: (event: Event) => void) => void;
+      removeEventListener: (type: string, handler: (event: Event) => void) => void;
+      close: ReturnType<typeof vi.fn>;
+      listeners: Map<string, (event: Event) => void>;
+    }> = [];
+
+    const websocketFactory = vi.fn(() => {
+      const listeners = new Map<string, (event: Event) => void>();
+      const socket = {
+        addEventListener: (type: string, handler: (event: Event) => void) => listeners.set(type, handler),
+        removeEventListener: (type: string, handler: (event: Event) => void) => {
+          if (listeners.get(type) === handler) {
+            listeners.delete(type);
+          }
+        },
+        close: vi.fn(),
+        listeners,
+      };
+
+      sockets.push(socket);
+      return socket as never;
+    });
+
+    const client = new BrokerClient({
+      brokerUrl: 'https://broker.example.com/root',
+      fetchImpl: vi.fn() as typeof fetch,
+      websocketFactory,
+    });
+
+    const firstCleanup = client.connectRealtime();
+
+    expect(websocketFactory).toHaveBeenCalledTimes(1);
+    sockets[0].listeners.get(eventType)?.({} as Event);
+
+    const secondCleanup = client.connectRealtime();
+
+    expect(websocketFactory).toHaveBeenCalledTimes(2);
+    expect(secondCleanup).not.toBe(firstCleanup);
+  });
+
   it('loads pending approvals for a project', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
@@ -376,6 +473,24 @@ describe('BrokerClient', () => {
     expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:4318/projects/intent-broker/approvals?status=pending'
     );
+  });
+
+  it('falls back to an empty approvals list for a malformed 200 response', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ items: { approvalId: 'approval-1' } }), { status: 200 })
+    );
+
+    const client = new BrokerClient({
+      brokerUrl: 'http://127.0.0.1:4318',
+      fetchImpl: fetchMock as typeof fetch,
+      websocketFactory: () => {
+        throw new Error('not used');
+      },
+    });
+
+    const approvals = await client.loadPendingApprovals('intent-broker');
+
+    expect(approvals).toEqual([]);
   });
 
   it('responds to an approval through the broker API', async () => {
