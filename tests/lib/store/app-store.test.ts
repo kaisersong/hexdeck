@@ -69,6 +69,11 @@ describe('createAppStore', () => {
           actionMode: 'action',
           decision: 'pending',
           taskId: 'task-1',
+          actions: [
+            { label: 'Yes', decisionMode: 'yes' },
+            { label: 'Always', decisionMode: 'always' },
+            { label: 'No', decisionMode: 'no' },
+          ],
         },
       ],
       0
@@ -82,6 +87,9 @@ describe('createAppStore', () => {
 
     store.setActivityCardHovered(false, 6_500);
     store.tickActivityCards(7_100);
+    expect(store.getState().activityCards.activeCard?.cardId).toBe('approval:1');
+
+    store.dismissActivityCard(7_200);
 
     expect(store.getState().activityCards.dismissedCardIds.has('approval:approval-1')).toBe(true);
     expect(store.getState().activityCards.activeCard?.cardId).toBe('question:1');

@@ -8,7 +8,10 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::Command;
-use tauri::{Manager, PhysicalPosition, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{
+    utils::config::BackgroundThrottlingPolicy, Manager, PhysicalPosition, WebviewUrl,
+    WebviewWindow, WebviewWindowBuilder,
+};
 
 // ============================================================================
 // CLI Subcommand Definitions
@@ -77,6 +80,15 @@ struct JumpResultPayload {
     reason: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityCardWindowMeasurementPayload {
+    target_height: f64,
+    inner_height: f64,
+    outer_height: f64,
+    scale_factor: f64,
+}
+
 fn escape_applescript(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -124,8 +136,12 @@ fn panel_window_resizable() -> bool {
     false
 }
 
+fn panel_window_starts_visible() -> bool {
+    false
+}
+
 fn activity_card_window_size() -> (f64, f64) {
-    (420.0, 120.0)
+    (680.0, 152.0)
 }
 
 fn activity_card_window_resizable() -> bool {
@@ -137,18 +153,115 @@ fn activity_card_window_top_margin() -> i32 {
 }
 
 fn activity_card_window_focuses_on_show() -> bool {
-    false
+    activity_card_preview_mode().is_some()
+}
+
+fn log_activity_card_window_state(stage: &str, window: &WebviewWindow) {
+    if activity_card_preview_mode().is_none() {
+        return;
+    }
+
+    eprintln!(
+        "[activity-card-preview] {stage}: visible={:?} pos={:?} inner={:?} outer={:?}",
+        window.is_visible(),
+        window.outer_position(),
+        window.inner_size(),
+        window.outer_size()
+    );
+}
+
+fn activity_card_preview_mode() -> Option<String> {
+    let preview = env::var("HEXDECK_ACTIVITY_CARD_PREVIEW").ok()?;
+    let trimmed = preview.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn activity_card_window_location_for(preview: Option<&str>) -> String {
+    match preview {
+        Some(value) if value.trim().starts_with('&') => format!("index.html?view=activity-card{}", value.trim()),
+        Some(value) if !value.trim().is_empty() => format!("index.html?view=activity-card&preview={}", value.trim()),
+        _ => "index.html?view=activity-card".to_string(),
+    }
+}
+
+fn activity_card_window_location() -> String {
+    activity_card_window_location_for(activity_card_preview_mode().as_deref())
+}
+
+fn setup_creates_panel_window(activity_card_preview: Option<&str>) -> bool {
+    activity_card_preview.is_none()
 }
 
 fn activity_card_window_position(
     work_area_position: PhysicalPosition<i32>,
     work_area_width: u32,
+    scale_factor: f64,
 ) -> PhysicalPosition<i32> {
     let (window_width, _) = activity_card_window_size();
-    let centered_x = work_area_position.x + ((work_area_width as i32 - window_width as i32).max(0) / 2);
-    let top_y = work_area_position.y + activity_card_window_top_margin();
+    let safe_scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let window_width_physical = (window_width * safe_scale_factor).round() as i32;
+    let top_margin_physical = (activity_card_window_top_margin() as f64 * safe_scale_factor).round() as i32;
+    let centered_x = work_area_position.x + ((work_area_width as i32 - window_width_physical).max(0) / 2);
+    let top_y = work_area_position.y + top_margin_physical;
 
     PhysicalPosition::new(centered_x, top_y)
+}
+
+fn activity_card_target_monitor_index(
+    work_area_positions: &[PhysicalPosition<i32>],
+    primary_index: Option<usize>,
+) -> Option<usize> {
+    work_area_positions
+        .iter()
+        .position(|position| position.x == 0 && position.y == 0)
+        .or(primary_index)
+        .or_else(|| (!work_area_positions.is_empty()).then_some(0))
+}
+
+fn activity_card_target_monitor(
+    app: &tauri::AppHandle,
+    window: &WebviewWindow,
+) -> tauri::Result<Option<tauri::Monitor>> {
+    let monitors = app.available_monitors()?;
+    if activity_card_preview_mode().is_some() {
+        for (index, monitor) in monitors.iter().enumerate() {
+            let work_area = monitor.work_area();
+            eprintln!(
+                "[activity-card-preview] monitor[{index}]: pos={:?} size={:?} scale={}",
+                work_area.position,
+                work_area.size,
+                monitor.scale_factor()
+            );
+        }
+    }
+    if monitors.is_empty() {
+        return window.current_monitor();
+    }
+
+    let primary_work_area_position = app
+        .primary_monitor()?
+        .map(|monitor| monitor.work_area().position);
+    let primary_index = primary_work_area_position.and_then(|primary_position| {
+        monitors.iter().position(|monitor| {
+            let position = monitor.work_area().position;
+            position.x == primary_position.x && position.y == primary_position.y
+        })
+    });
+    let work_area_positions = monitors
+        .iter()
+        .map(|monitor| monitor.work_area().position)
+        .collect::<Vec<_>>();
+
+    Ok(activity_card_target_monitor_index(&work_area_positions, primary_index)
+        .and_then(|index| monitors.into_iter().nth(index)))
 }
 
 fn expanded_window_size() -> (f64, f64) {
@@ -169,7 +282,8 @@ fn ensure_panel_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> {
         .title("HexDeck")
         .inner_size(width, height)
         .resizable(panel_window_resizable())
-        .visible(true)
+        .visible(panel_window_starts_visible())
+        .background_throttling(BackgroundThrottlingPolicy::Disabled)
         .build()
 }
 
@@ -200,34 +314,53 @@ fn ensure_expanded_window(app: &tauri::AppHandle, section: &str) -> tauri::Resul
 
 fn ensure_activity_card_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> {
     if let Some(window) = app.get_webview_window("activity-card") {
+        log_activity_card_window_state("ensure-existing", &window);
         return Ok(window);
     }
 
     let (width, height) = activity_card_window_size();
+    let location = activity_card_window_location();
+    if activity_card_preview_mode().is_some() {
+        eprintln!("[activity-card-preview] location: {location}");
+    }
     WebviewWindowBuilder::new(
         app,
         "activity-card",
-        WebviewUrl::App("index.html?view=activity-card".into()),
+        WebviewUrl::App(location.into()),
     )
     .title("HexDeck Activity Card")
     .inner_size(width, height)
     .resizable(activity_card_window_resizable())
     .visible(false)
     .always_on_top(true)
+    .visible_on_all_workspaces(true)
     .decorations(false)
     .skip_taskbar(true)
+    .background_throttling(BackgroundThrottlingPolicy::Disabled)
     .build()
+    .inspect(|window| {
+        if activity_card_preview_mode().is_some() {
+            log_activity_card_window_state("created", window);
+            window.on_window_event(|event| {
+                eprintln!("[activity-card-preview] window-event: {event:?}");
+            });
+        }
+    })
 }
 
 fn position_activity_card_window(
     app: &tauri::AppHandle,
     window: &WebviewWindow,
 ) -> tauri::Result<()> {
-    let monitor = window.current_monitor()?.or(app.primary_monitor()?);
+    let monitor = activity_card_target_monitor(app, window)?;
 
     if let Some(monitor) = monitor {
         let work_area = monitor.work_area();
-        let position = activity_card_window_position(work_area.position, work_area.size.width);
+        let position = activity_card_window_position(
+            work_area.position,
+            work_area.size.width,
+            monitor.scale_factor(),
+        );
         window.set_position(position)?;
     }
 
@@ -257,23 +390,58 @@ fn open_expanded_window(app: tauri::AppHandle, section: String) -> Result<(), St
     Ok(())
 }
 
-#[tauri::command]
-fn show_activity_card_window(app: tauri::AppHandle) -> Result<(), String> {
-    let window = ensure_activity_card_window(&app).map_err(|error| error.to_string())?;
-    position_activity_card_window(&app, &window).map_err(|error| error.to_string())?;
-    window.show().map_err(|error| error.to_string())?;
+fn show_activity_card_window_for_app(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let window = ensure_activity_card_window(app)?;
+    log_activity_card_window_state("show-before-position", &window);
+    position_activity_card_window(app, &window)?;
+    window.set_always_on_top(true)?;
+    window.set_visible_on_all_workspaces(true)?;
+    window.show()?;
+    log_activity_card_window_state("show-after-show", &window);
 
     if activity_card_window_focuses_on_show() {
-        window.set_focus().map_err(|error| error.to_string())?;
+        window.set_focus()?;
+        log_activity_card_window_state("show-after-focus", &window);
     }
 
     Ok(())
 }
 
 #[tauri::command]
+fn show_activity_card_window(app: tauri::AppHandle) -> Result<(), String> {
+    show_activity_card_window_for_app(&app).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn resize_activity_card_window(
+    app: tauri::AppHandle,
+    width: f64,
+    height: f64,
+) -> Result<ActivityCardWindowMeasurementPayload, String> {
+    let window = ensure_activity_card_window(&app).map_err(|error| error.to_string())?;
+    window
+        .set_size(tauri::LogicalSize::new(width, height))
+        .map_err(|error| error.to_string())?;
+    let scale_factor = window.scale_factor().map_err(|error| error.to_string())?;
+    let inner_size = window.inner_size().map_err(|error| error.to_string())?;
+    let outer_size = window.outer_size().map_err(|error| error.to_string())?;
+
+    log_activity_card_window_state("resize-after-set-size", &window);
+
+    Ok(ActivityCardWindowMeasurementPayload {
+        target_height: height,
+        inner_height: inner_size.height as f64 / scale_factor,
+        outer_height: outer_size.height as f64 / scale_factor,
+        scale_factor,
+    })
+}
+
+#[tauri::command]
 fn hide_activity_card_window(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("activity-card") {
+        log_activity_card_window_state("hide-before", &window);
         window.hide().map_err(|error| error.to_string())?;
+        log_activity_card_window_state("hide-after", &window);
     }
 
     Ok(())
@@ -741,6 +909,7 @@ fn main() {
             toggle_panel_command,
             open_expanded_window,
             show_activity_card_window,
+            resize_activity_card_window,
             hide_activity_card_window,
             jump_with_ghostty,
             jump_with_iterm,
@@ -762,7 +931,13 @@ fn main() {
             commands::ensure_broker_ready
         ])
         .setup(|app| {
-            let _panel = ensure_panel_window(app.handle())?;
+            let preview = activity_card_preview_mode();
+
+            if setup_creates_panel_window(preview.as_deref()) {
+                let _panel = ensure_panel_window(app.handle())?;
+            } else {
+                show_activity_card_window_for_app(app.handle())?;
+            }
 
             Ok(())
         })
@@ -786,22 +961,82 @@ mod tests {
     }
 
     #[test]
+    fn panel_window_starts_hidden() {
+        assert!(!panel_window_starts_visible());
+    }
+
+    #[test]
     fn activity_card_window_size_is_compact_and_non_resizable() {
-        assert_eq!(activity_card_window_size(), (420.0, 120.0));
+        assert_eq!(activity_card_window_size(), (680.0, 152.0));
         assert!(!activity_card_window_resizable());
     }
 
     #[test]
     fn activity_card_window_position_centers_at_top_of_work_area() {
-        let position = activity_card_window_position(PhysicalPosition::new(100, 40), 1600);
+        let position = activity_card_window_position(PhysicalPosition::new(100, 40), 1600, 1.0);
 
-        assert_eq!(position.x, 690);
+        assert_eq!(position.x, 560);
         assert_eq!(position.y, 56);
+    }
+
+    #[test]
+    fn activity_card_window_position_scales_window_width_on_retina_work_area() {
+        let position = activity_card_window_position(PhysicalPosition::new(0, 34), 3024, 2.0);
+
+        assert_eq!(position.x, 832);
+        assert_eq!(position.y, 66);
+    }
+
+    #[test]
+    fn activity_card_target_monitor_prefers_origin_work_area_for_notch_display() {
+        let positions = [
+            PhysicalPosition::new(1512, 0),
+            PhysicalPosition::new(0, 0),
+        ];
+
+        assert_eq!(activity_card_target_monitor_index(&positions, Some(0)), Some(1));
+    }
+
+    #[test]
+    fn activity_card_target_monitor_falls_back_to_primary_when_origin_is_missing() {
+        let positions = [
+            PhysicalPosition::new(1512, 0),
+            PhysicalPosition::new(3432, 0),
+        ];
+
+        assert_eq!(activity_card_target_monitor_index(&positions, Some(0)), Some(0));
     }
 
     #[test]
     fn activity_card_window_show_policy_does_not_focus() {
         assert!(!activity_card_window_focuses_on_show());
+    }
+
+    #[test]
+    fn activity_card_window_location_defaults_to_live_route() {
+        assert_eq!(activity_card_window_location_for(None), "index.html?view=activity-card");
+    }
+
+    #[test]
+    fn activity_card_window_location_supports_preview_mode() {
+        assert_eq!(
+            activity_card_window_location_for(Some("approval")),
+            "index.html?view=activity-card&preview=approval"
+        );
+    }
+
+    #[test]
+    fn activity_card_window_location_supports_live_debug_query() {
+        assert_eq!(
+            activity_card_window_location_for(Some("&debugLive=1&project=hexdeck")),
+            "index.html?view=activity-card&debugLive=1&project=hexdeck"
+        );
+    }
+
+    #[test]
+    fn preview_mode_skips_hidden_panel_window() {
+        assert!(setup_creates_panel_window(None));
+        assert!(!setup_creates_panel_window(Some("approval")));
     }
 
     #[test]

@@ -43,7 +43,14 @@ describe('BrokerClient', () => {
           { status: 200 }
         )
       )
-      .mockResolvedValueOnce(new Response(JSON.stringify([{ id: 1282, type: 'report_progress' }]), { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify([
+            { id: 1282, type: 'report_progress', payload: { participantId: 'codex-session-aa59e6ef' } },
+          ]),
+          { status: 200 }
+        )
+      )
       .mockResolvedValueOnce(new Response(JSON.stringify({ items: [{ approvalId: 'approval-1', taskId: 'task-1' }] }), { status: 200 }));
 
     const client = new BrokerClient({
@@ -71,6 +78,149 @@ describe('BrokerClient', () => {
     expect(snapshot.workStates[0].status).toBe('implementing');
     expect(snapshot.events[0].id).toBe(1282);
     expect(snapshot.approvals[0].approvalId).toBe('approval-1');
+  });
+
+  it('filters project replay events down to the project participants', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ participantId: 'agent-a', alias: 'codex4', context: { projectName: 'intent-broker' } }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [{ participantId: 'agent-a', status: 'implementing' }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ participantId: 'agent-a', status: 'online', metadata: { source: 'registration' } }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [
+              { eventId: 1, type: 'ask_clarification', payload: { participantId: 'agent-a', summary: 'Project event' } },
+              { eventId: 2, type: 'ask_clarification', payload: { participantId: 'agent-b', summary: 'Other project event' } },
+            ],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [] }), { status: 200 }));
+
+    const client = new BrokerClient({
+      brokerUrl: 'http://127.0.0.1:4318',
+      fetchImpl: fetchMock as typeof fetch,
+      websocketFactory: () => {
+        throw new Error('not used in this test');
+      }
+    });
+
+    const snapshot = await client.loadProjectSeed('intent-broker');
+
+    expect(snapshot.events).toEqual([
+      { id: 1, type: 'ask_clarification', payload: { participantId: 'agent-a', summary: 'Project event' } },
+    ]);
+  });
+
+  it('keeps human approval responses that resolve project participant approvals', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ participantId: 'agent-a', alias: 'codex4', context: { projectName: 'intent-broker' } }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [{ participantId: 'agent-a', status: 'implementing' }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ participantId: 'agent-a', status: 'online', metadata: { source: 'registration' } }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [
+              {
+                eventId: 1,
+                type: 'request_approval',
+                taskId: 'task-a',
+                payload: { approvalId: 'approval-a', participantId: 'agent-a' },
+              },
+              {
+                eventId: 2,
+                type: 'respond_approval',
+                taskId: 'task-a',
+                payload: { approvalId: 'approval-a', participantId: 'human.local', decision: 'approved' },
+              },
+              {
+                eventId: 3,
+                type: 'request_approval',
+                taskId: 'task-b',
+                payload: { approvalId: 'approval-b', participantId: 'agent-b' },
+              },
+              {
+                eventId: 4,
+                type: 'respond_approval',
+                taskId: 'task-b',
+                payload: { approvalId: 'approval-b', participantId: 'human.local', decision: 'approved' },
+              },
+            ],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [] }), { status: 200 }));
+
+    const client = new BrokerClient({
+      brokerUrl: 'http://127.0.0.1:4318',
+      fetchImpl: fetchMock as typeof fetch,
+      websocketFactory: () => {
+        throw new Error('not used in this test');
+      }
+    });
+
+    const snapshot = await client.loadProjectSeed('intent-broker');
+
+    expect(snapshot.events).toEqual([
+      {
+        id: 1,
+        type: 'request_approval',
+        taskId: 'task-a',
+        payload: { approvalId: 'approval-a', participantId: 'agent-a' },
+      },
+      {
+        id: 2,
+        type: 'respond_approval',
+        taskId: 'task-a',
+        payload: { approvalId: 'approval-a', participantId: 'human.local', decision: 'approved' },
+      },
+    ]);
   });
 
   it('loads the full broker service view without project filtering', async () => {
@@ -175,6 +325,75 @@ describe('BrokerClient', () => {
     expect(snapshot.events).toEqual([{ id: 2001, type: 'report_progress' }]);
   });
 
+  it('paginates replay pages so service seed includes the newest events', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ participantId: 'codex-session-019d671b', alias: 'codex16', kind: 'agent', context: { projectName: 'projects' } }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [{ participantId: 'codex-session-019d671b', status: 'implementing', projectName: 'projects' }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ participantId: 'codex-session-019d671b', status: 'online', metadata: { source: 'registration' } }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: Array.from({ length: 100 }, (_, index) => ({ eventId: index + 1, kind: 'report_progress' })),
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [{ eventId: 101, kind: 'ask_clarification', payload: { summary: 'Latest question' } }],
+          }),
+          { status: 200 }
+        )
+      );
+
+    const client = new BrokerClient({
+      brokerUrl: 'http://127.0.0.1:4318',
+      fetchImpl: fetchMock as typeof fetch,
+      websocketFactory: () => {
+        throw new Error('not used in this test');
+      }
+    });
+
+    const snapshot = await client.loadServiceSeed();
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      'http://127.0.0.1:4318/health',
+      'http://127.0.0.1:4318/participants',
+      'http://127.0.0.1:4318/work-state',
+      'http://127.0.0.1:4318/presence',
+      'http://127.0.0.1:4318/events/replay?after=0',
+      'http://127.0.0.1:4318/events/replay?after=100',
+    ]);
+    expect(snapshot.events.at(-1)).toMatchObject({
+      id: 101,
+      type: 'ask_clarification',
+      payload: { summary: 'Latest question' },
+    });
+  });
+
   it('normalizes replay events that use kind instead of type', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
@@ -222,6 +441,55 @@ describe('BrokerClient', () => {
     const snapshot = await client.loadServiceSeed();
 
     expect(snapshot.events).toEqual([{ id: 2001, type: 'report_progress' }]);
+  });
+
+  it('normalizes replay events that use eventId instead of id', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ participantId: 'codex-session-019d671b', alias: 'codex16', kind: 'agent', context: { projectName: 'projects' } }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [{ participantId: 'codex-session-019d671b', status: 'implementing', projectName: 'projects' }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            participants: [{ participantId: 'codex-session-019d671b', status: 'online', metadata: { source: 'registration' } }],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [{ eventId: 2974, type: 'ask_clarification', taskId: 'smoke-task-1' }],
+          }),
+          { status: 200 }
+        )
+      );
+
+    const client = new BrokerClient({
+      brokerUrl: 'http://127.0.0.1:4318',
+      fetchImpl: fetchMock as typeof fetch,
+      websocketFactory: () => {
+        throw new Error('not used in this test');
+      }
+    });
+
+    const snapshot = await client.loadServiceSeed();
+
+    expect(snapshot.events).toEqual([{ id: 2974, type: 'ask_clarification', taskId: 'smoke-task-1' }]);
   });
 
   it('keeps loading participants when presence lookup is unavailable', async () => {
@@ -359,7 +627,7 @@ describe('BrokerClient', () => {
     const cleanup = client.connectRealtime();
 
     expect(websocketFactory).toHaveBeenCalledTimes(1);
-    expect(websocketFactory).toHaveBeenCalledWith('wss://broker.example.com/root');
+    expect(websocketFactory).toHaveBeenCalledWith('wss://broker.example.com/root/ws?participantId=human.local');
 
     listeners.get('message')?.({
       data: JSON.stringify({ id: 1282, type: 'report_progress' })
@@ -438,6 +706,37 @@ describe('BrokerClient', () => {
 
     expect(received).toEqual([{ id: 1282, type: 'report_progress' }]);
     expect(fakeSocket.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('unwraps broker websocket new_intent envelopes before notifying subscribers', () => {
+    const listeners = new Map<string, (event: MessageEvent<string>) => void>();
+    const fakeSocket = {
+      addEventListener: (type: string, handler: (event: MessageEvent<string>) => void) => listeners.set(type, handler),
+      removeEventListener: vi.fn(),
+      close: vi.fn()
+    };
+
+    const client = new BrokerClient({
+      brokerUrl: 'http://127.0.0.1:4318',
+      fetchImpl: vi.fn() as typeof fetch,
+      websocketFactory: () => fakeSocket as never
+    });
+
+    const received: Array<{ id: number; type: string }> = [];
+    client.subscribe((event) => received.push({ id: event.id, type: event.type }));
+    client.connectRealtime();
+
+    listeners.get('message')?.({
+      data: JSON.stringify({
+        type: 'new_intent',
+        event: {
+          eventId: 2743,
+          kind: 'request_approval',
+        },
+      }),
+    } as MessageEvent<string>);
+
+    expect(received).toEqual([{ id: 2743, type: 'request_approval' }]);
   });
 
   it.each(['close', 'error'] as const)('clears the cached realtime handle after websocket %s and reconnects', (eventType) => {

@@ -7,7 +7,7 @@ const PRIORITY_ORDER: Record<ActivityCardPriority, number> = {
 };
 
 const CARD_DURATION_MS = {
-  approval: 6_000,
+  approval: null,
   question: 6_000,
   completion: 3_000,
 } as const;
@@ -24,13 +24,14 @@ export interface ActivityCardRuntimeState {
 
 export interface ActivityCardStore {
   getState(): ActivityCardRuntimeState;
+  primeExisting(cards: ActivityCardProjection[]): void;
   replaceQueue(cards: ActivityCardProjection[], nowMs: number): void;
   setHovered(hovered: boolean, nowMs: number): void;
   tick(nowMs: number): void;
   dismissActiveCard(nowMs: number): void;
 }
 
-function getCardDurationMs(card: ActivityCardProjection): number {
+function getCardDurationMs(card: ActivityCardProjection): number | null {
   return CARD_DURATION_MS[card.kind];
 }
 
@@ -105,9 +106,10 @@ export function createActivityCardStore(): ActivityCardStore {
   };
 
   const startActiveCardTimer = (card: ActivityCardProjection, nowMs: number) => {
+    const durationMs = getCardDurationMs(card);
     state.activeCard = card;
     state.activeSinceMs = nowMs;
-    state.activeDeadlineMs = nowMs + getCardDurationMs(card);
+    state.activeDeadlineMs = durationMs == null ? null : nowMs + durationMs;
     state.hovered = false;
     state.pausedRemainingMs = null;
   };
@@ -160,6 +162,13 @@ export function createActivityCardStore(): ActivityCardStore {
     getState() {
       return state;
     },
+    primeExisting(cards) {
+      for (const card of cards) {
+        state.dismissedCardIds.add(getCardIdentity(card));
+      }
+      state.queue = [];
+      clearActiveCardState();
+    },
     replaceQueue(cards, nowMs) {
       const latestQueue = buildLatestQueue(cards);
       const activeIdentity = getActiveIdentity();
@@ -196,8 +205,9 @@ export function createActivityCardStore(): ActivityCardStore {
 
       state.hovered = false;
 
-      if (state.pausedRemainingMs != null) {
-        state.activeSinceMs = nowMs - (getCardDurationMs(state.activeCard) - state.pausedRemainingMs);
+      const durationMs = getCardDurationMs(state.activeCard);
+      if (durationMs != null && state.pausedRemainingMs != null) {
+        state.activeSinceMs = nowMs - (durationMs - state.pausedRemainingMs);
         state.activeDeadlineMs = nowMs + state.pausedRemainingMs;
         state.pausedRemainingMs = null;
       }

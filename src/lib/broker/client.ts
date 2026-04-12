@@ -18,6 +18,8 @@ interface BrokerClientOptions {
 }
 
 type BrokerEventListener = (event: BrokerEvent) => void;
+const REPLAY_PAGE_SIZE = 100;
+const BROKER_UI_PARTICIPANT_ID = 'human.local';
 
 function mergeParticipantsWithPresence(
   participants: BrokerParticipant[],
@@ -36,6 +38,46 @@ function mergeParticipantsWithPresence(
   }));
 }
 
+function filterEventsForProjectParticipants(
+  events: BrokerEvent[],
+  participants: BrokerParticipant[]
+): BrokerEvent[] {
+  const participantIds = new Set(participants.map((participant) => participant.participantId));
+  const projectApprovalIds = new Set<string>();
+  const projectApprovalTaskIds = new Set<string>();
+
+  for (const event of events) {
+    const participantId = event.payload?.participantId;
+    if (event.type !== 'request_approval' || typeof participantId !== 'string' || !participantIds.has(participantId)) {
+      continue;
+    }
+
+    const approvalId = event.payload?.approvalId;
+    if (typeof approvalId === 'string') {
+      projectApprovalIds.add(approvalId);
+    }
+
+    if (typeof event.taskId === 'string') {
+      projectApprovalTaskIds.add(event.taskId);
+    }
+  }
+
+  return events.filter((event) => {
+    const participantId = event.payload?.participantId;
+    if (typeof participantId === 'string' && participantIds.has(participantId)) {
+      return true;
+    }
+
+    if (event.type !== 'respond_approval') {
+      return false;
+    }
+
+    const approvalId = event.payload?.approvalId;
+    return (typeof approvalId === 'string' && projectApprovalIds.has(approvalId))
+      || (typeof event.taskId === 'string' && projectApprovalTaskIds.has(event.taskId));
+  });
+}
+
 function isTauriEnvironment(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
@@ -45,19 +87,24 @@ function normalizeBrokerEvent(value: unknown): BrokerEvent | null {
     return null;
   }
 
-  const candidate = value as Partial<BrokerEvent> & { kind?: unknown };
+  const candidate = value as Partial<BrokerEvent> & { kind?: unknown; eventId?: unknown };
   const type = typeof candidate.type === 'string'
     ? candidate.type
     : typeof candidate.kind === 'string'
       ? candidate.kind
       : null;
+  const id = typeof candidate.id === 'number'
+    ? candidate.id
+    : typeof candidate.eventId === 'number'
+      ? candidate.eventId
+      : null;
 
-  if (typeof candidate.id !== 'number' || type === null) {
+  if (id === null || type === null) {
     return null;
   }
 
   const event: BrokerEvent = {
-    id: candidate.id,
+    id,
     type,
   };
 
@@ -79,6 +126,35 @@ function normalizeBrokerEvents(values: unknown): BrokerEvent[] {
   return values
     .map((value) => normalizeBrokerEvent(value))
     .filter((value): value is BrokerEvent => value !== null);
+}
+
+function extractReplayCursor(values: unknown[]): number {
+  let cursor = 0;
+
+  for (const value of values) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      continue;
+    }
+
+    const candidate = value as { id?: unknown; eventId?: unknown };
+    const id = typeof candidate.id === 'number'
+      ? candidate.id
+      : typeof candidate.eventId === 'number'
+        ? candidate.eventId
+        : null;
+
+    if (typeof id === 'number') {
+      cursor = Math.max(cursor, id);
+    }
+  }
+
+  return cursor;
+}
+
+function buildBrokerWebSocketUrl(brokerUrl: string): string {
+  const url = new URL(`${brokerUrl.replace(/^http/, 'ws')}/ws`);
+  url.searchParams.set('participantId', BROKER_UI_PARTICIPANT_ID);
+  return url.toString();
 }
 
 function normalizeProjectSeed(seed: ProjectSeed): ProjectSeed {
@@ -140,15 +216,17 @@ export class BrokerClient {
       this.requestList<BrokerParticipant>(`/participants?projectName=${encodedProjectName}`, 'participants'),
       this.requestList<BrokerWorkState>(`/work-state?projectName=${encodedProjectName}`, 'items'),
       this.loadPresence(),
-      this.requestList<unknown>('/events/replay?after=0', 'items'),
+      this.loadReplayEvents(),
       this.loadPendingApprovals(projectName),
     ]);
 
+    const mergedParticipants = mergeParticipantsWithPresence(participants, presence);
+
     return {
       health,
-      participants: mergeParticipantsWithPresence(participants, presence),
+      participants: mergedParticipants,
       workStates,
-      events: normalizeBrokerEvents(events),
+      events: filterEventsForProjectParticipants(normalizeBrokerEvents(events), mergedParticipants),
       approvals,
     };
   }
@@ -165,7 +243,7 @@ export class BrokerClient {
       this.requestList<BrokerParticipant>('/participants', 'participants'),
       this.requestList<BrokerWorkState>('/work-state', 'items'),
       this.loadPresence(),
-      this.requestList<unknown>('/events/replay?after=0', 'items'),
+      this.loadReplayEvents(),
     ]);
 
     return {
@@ -175,6 +253,29 @@ export class BrokerClient {
       events: normalizeBrokerEvents(events),
       approvals: [],
     };
+  }
+
+  private async loadReplayEvents(): Promise<BrokerEvent[]> {
+    const events: BrokerEvent[] = [];
+    let after = 0;
+
+    while (true) {
+      const page = await this.requestList<unknown>(`/events/replay?after=${after}`, 'items');
+      events.push(...normalizeBrokerEvents(page));
+
+      if (page.length < REPLAY_PAGE_SIZE) {
+        break;
+      }
+
+      const nextAfter = extractReplayCursor(page);
+      if (nextAfter <= after) {
+        break;
+      }
+
+      after = nextAfter;
+    }
+
+    return events;
   }
 
   async loadPendingApprovals(projectName: string): Promise<BrokerApprovalItem[]> {
@@ -265,7 +366,7 @@ export class BrokerClient {
       return this.realtimeCleanup;
     }
 
-    const socket = this.websocketFactory(this.brokerUrl.replace(/^http/, 'ws'));
+    const socket = this.websocketFactory(buildBrokerWebSocketUrl(this.brokerUrl));
 
     const handleMessage = (message: MessageEvent<string>) => {
       let parsed: unknown;
@@ -276,7 +377,12 @@ export class BrokerClient {
         return;
       }
 
-      const event = normalizeBrokerEvent(parsed);
+      const event = normalizeBrokerEvent(parsed)
+        ?? (
+          parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? normalizeBrokerEvent((parsed as { event?: unknown }).event)
+            : null
+        );
       if (!event) {
         return;
       }

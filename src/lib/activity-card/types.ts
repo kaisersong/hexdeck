@@ -1,3 +1,4 @@
+import type { BrokerApprovalDecisionMode } from '../broker/types';
 import type { JumpTarget } from '../jump/types';
 
 export type ActivityCardKind = 'approval' | 'question' | 'completion';
@@ -5,6 +6,10 @@ export type ActivityCardKind = 'approval' | 'question' | 'completion';
 export type ActivityCardPriority = 'critical' | 'attention' | 'ambient';
 
 export type ActivityCardApprovalActionMode = 'action';
+export interface ActivityCardApprovalAction {
+  label: string;
+  decisionMode: BrokerApprovalDecisionMode;
+}
 
 export type ActivityCardQuestionSelectionMode = 'single-select';
 
@@ -15,6 +20,9 @@ export interface ActivityCardBaseProjection {
   priority: ActivityCardPriority;
   participantId?: string;
   actorLabel?: string;
+  projectLabel?: string;
+  toolLabel?: string;
+  terminalLabel?: string;
   jumpTarget?: JumpTarget | null;
 }
 
@@ -24,6 +32,11 @@ export interface ActivityCardApprovalProjection extends ActivityCardBaseProjecti
   approvalId: string;
   taskId: string;
   decision: 'approved' | 'denied' | 'pending';
+  actions: ActivityCardApprovalAction[];
+  detailText?: string;
+  commandTitle?: string;
+  commandLine?: string;
+  commandPreview?: string;
 }
 
 export interface ActivityCardQuestionOption {

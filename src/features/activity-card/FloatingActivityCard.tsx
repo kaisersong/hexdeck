@@ -8,19 +8,59 @@ export interface FloatingActivityCardProps {
   pendingApprovalIds?: Set<string>;
   onApprovalDecision?: (mode: BrokerApprovalDecisionMode) => void;
   onQuestionSelect?: (option: ActivityCardQuestionOption) => void;
+  onDismiss?: () => void;
   onJump?: (target: JumpTarget) => void;
   onHoverChange?: (hovered: boolean) => void;
 }
 
-function getCardLabel(card: ActivityCardProjection): string {
+function getJumpLabel(card: ActivityCardProjection): string {
+  return `Open agent context for ${card.summary}`;
+}
+
+function getCardSupportingText(card: ActivityCardProjection): string {
   switch (card.kind) {
     case 'approval':
-      return 'Approval';
+      return card.detailText ?? '需要你立即确认这个 agent 意图';
     case 'question':
-      return 'Question';
+      return card.prompt;
     case 'completion':
-      return 'Completion';
+      return '任务已完成，点击可直接跳回对应 agent';
   }
+}
+
+function getDisplayTitle(card: ActivityCardProjection): string {
+  return card.actorLabel ? `${card.actorLabel} · ${card.summary}` : card.summary;
+}
+
+function getSourceLine(card: ActivityCardProjection): string | null {
+  return card.projectLabel ?? null;
+}
+
+function renderApprovalBody(card: ActivityCardApprovalProjection, supportingText: string) {
+  const hasCommandBlock = Boolean(card.commandLine || card.commandPreview);
+
+  return (
+    <>
+      <p className="floating-card__body floating-card__body--approval">{supportingText}</p>
+      {card.commandTitle ? (
+        <p className="floating-card__section-label">{card.commandTitle}</p>
+      ) : null}
+      {hasCommandBlock ? (
+        <div className="floating-card__command" aria-label="Approval command preview">
+          {card.commandLine ? <p className="floating-card__command-primary">{card.commandLine}</p> : null}
+          {card.commandPreview ? <p className="floating-card__command-secondary">{card.commandPreview}</p> : null}
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function renderCardBody(card: ActivityCardProjection, supportingText: string) {
+  if (card.kind === 'approval') {
+    return renderApprovalBody(card, supportingText);
+  }
+
+  return <p className="floating-card__body">{supportingText}</p>;
 }
 
 function ApprovalActions({
@@ -36,30 +76,17 @@ function ApprovalActions({
 
   return (
     <div className="floating-card__actions">
-      <button
-        type="button"
-        className="action-button"
-        disabled={isPending}
-        onClick={() => onApprovalDecision?.('yes')}
-      >
-        Yes
-      </button>
-      <button
-        type="button"
-        className="action-button"
-        disabled={isPending}
-        onClick={() => onApprovalDecision?.('always')}
-      >
-        Always
-      </button>
-      <button
-        type="button"
-        className="action-button"
-        disabled={isPending}
-        onClick={() => onApprovalDecision?.('no')}
-      >
-        No
-      </button>
+      {card.actions.map((action) => (
+        <button
+          key={action.decisionMode}
+          type="button"
+          className={`action-button action-button--${action.decisionMode}`}
+          disabled={isPending}
+          onClick={() => onApprovalDecision?.(action.decisionMode)}
+        >
+          {action.label}
+        </button>
+      ))}
     </div>
   );
 }
@@ -79,7 +106,7 @@ function QuestionActions({
         <button
           key={option.value}
           type="button"
-          className="action-button"
+          className="action-button action-button--question"
           disabled={disabled}
           onClick={() => onQuestionSelect?.(option)}
         >
@@ -95,11 +122,15 @@ export function FloatingActivityCard({
   pendingApprovalIds,
   onApprovalDecision,
   onQuestionSelect,
+  onDismiss,
   onJump,
   onHoverChange,
 }: FloatingActivityCardProps) {
-  const label = getCardLabel(card);
+  const displayTitle = getDisplayTitle(card);
+  const sourceLine = getSourceLine(card);
+  const supportingText = getCardSupportingText(card);
   const approvalPending = card.kind === 'approval' && (pendingApprovalIds?.has(card.approvalId) ?? false);
+  const canJump = Boolean(card.jumpTarget && onJump);
 
   useEffect(() => {
     if (card.kind !== 'approval' || !onApprovalDecision || approvalPending) {
@@ -135,15 +166,46 @@ export function FloatingActivityCard({
   return (
     <article
       className={`floating-card floating-card--${card.kind}`}
+      data-activity-card-surface
       onMouseEnter={() => onHoverChange?.(true)}
       onMouseLeave={() => onHoverChange?.(false)}
     >
-      <p className="floating-card__eyebrow">{label}</p>
-      <h1 className="floating-card__summary">{card.summary}</h1>
-      {card.actorLabel ? <p className="floating-card__meta">{card.actorLabel}</p> : null}
+      <div className="floating-card__header">
+        <div className="floating-card__identity">
+          <span className="floating-card__dot" aria-hidden="true" />
+          <div className="floating-card__identity-copy">
+            <h1 className="floating-card__summary">{displayTitle}</h1>
+          </div>
+        </div>
+        <div className="floating-card__chips" aria-label="activity card metadata">
+          {card.terminalLabel ? <span className="floating-card__chip">{card.terminalLabel}</span> : null}
+          <button
+            type="button"
+            className="floating-card__dismiss"
+            aria-label="Close activity card"
+            onClick={() => onDismiss?.()}
+          >
+            Close
+          </button>
+        </div>
+      </div>
 
-      {card.kind === 'question' ? <p className="floating-card__body">{card.prompt}</p> : null}
-      {card.kind === 'completion' ? <p className="floating-card__body">Completed</p> : null}
+      {canJump ? (
+        <button
+          type="button"
+          className="floating-card__content floating-card__content--interactive"
+          aria-label={getJumpLabel(card)}
+          onClick={() => onJump?.(card.jumpTarget!)}
+        >
+          {sourceLine ? <p className="floating-card__source">{sourceLine}</p> : null}
+          {renderCardBody(card, supportingText)}
+        </button>
+      ) : (
+        <div className="floating-card__content">
+          {sourceLine ? <p className="floating-card__source">{sourceLine}</p> : null}
+          {renderCardBody(card, supportingText)}
+        </div>
+      )}
 
       {card.kind === 'approval' ? (
         <ApprovalActions
@@ -155,16 +217,6 @@ export function FloatingActivityCard({
 
       {card.kind === 'question' ? (
         <QuestionActions card={card} onQuestionSelect={onQuestionSelect} />
-      ) : null}
-
-      {card.jumpTarget ? (
-        <button
-          type="button"
-          className="action-button floating-card__jump"
-          onClick={() => onJump?.(card.jumpTarget!)}
-        >
-          Jump
-        </button>
       ) : null}
     </article>
   );

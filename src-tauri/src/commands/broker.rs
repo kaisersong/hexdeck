@@ -2,8 +2,9 @@ use chrono::Utc;
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
+use std::future::Future;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,8 @@ use std::process::{Command, Stdio};
 use tar::Archive;
 use tauri::{AppHandle, Manager};
 use tokio::time::{sleep, Duration};
+
+const REPLAY_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BrokerVersionInfo {
@@ -348,6 +351,46 @@ fn value_items(payload: serde_json::Value, key: &str) -> serde_json::Value {
         .unwrap_or_else(|| json!([]))
 }
 
+fn event_cursor(value: &Value) -> Option<u64> {
+    value
+        .get("id")
+        .and_then(Value::as_u64)
+        .or_else(|| value.get("eventId").and_then(Value::as_u64))
+}
+
+async fn load_all_replay_events_with<F, Fut>(mut fetch_page: F) -> Result<serde_json::Value, String>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: Future<Output = Result<serde_json::Value, String>>,
+{
+    let mut after = 0;
+    let mut events = Vec::new();
+
+    loop {
+        let payload = fetch_page(after).await?;
+        let items = value_items(payload, "items");
+        let page = items.as_array().cloned().unwrap_or_default();
+        let page_len = page.len();
+        let next_after = page.iter().filter_map(event_cursor).max().unwrap_or(after);
+        events.extend(page);
+
+        if page_len < REPLAY_PAGE_SIZE || next_after <= after {
+            break;
+        }
+
+        after = next_after;
+    }
+
+    Ok(json!(events))
+}
+
+async fn load_all_replay_events(broker_url: &str) -> Result<serde_json::Value, String> {
+    load_all_replay_events_with(|after| async move {
+        broker_get_json(broker_url, &format!("/events/replay?after={after}")).await
+    })
+    .await
+}
+
 fn merge_participants_with_presence(participants: Value, presence: Value) -> Value {
     let mut participants = value_items(participants, "participants");
     let presence_items = value_items(presence, "participants");
@@ -397,6 +440,95 @@ fn merge_participants_with_presence(participants: Value, presence: Value) -> Val
     participants
 }
 
+fn filter_events_for_project_participants(events: Value, participants: &Value) -> Value {
+    let participant_ids: HashSet<String> = value_items(participants.clone(), "participants")
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|participant| {
+            participant
+                .get("participantId")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    let all_events = value_items(events, "items").as_array().cloned().unwrap_or_default();
+    let mut project_approval_ids = HashSet::new();
+    let mut project_approval_task_ids = HashSet::new();
+
+    for event in &all_events {
+        let event_kind = event
+            .get("kind")
+            .or_else(|| event.get("type"))
+            .and_then(|value| value.as_str());
+
+        if event_kind != Some("request_approval") {
+            continue;
+        }
+
+        let payload = event.get("payload").and_then(|value| value.as_object());
+        let participant_id = payload
+            .and_then(|payload| payload.get("participantId"))
+            .and_then(|value| value.as_str());
+
+        if !participant_id
+            .map(|participant_id| participant_ids.contains(participant_id))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        if let Some(approval_id) = payload
+            .and_then(|payload| payload.get("approvalId"))
+            .and_then(|value| value.as_str())
+        {
+            project_approval_ids.insert(approval_id.to_string());
+        }
+
+        if let Some(task_id) = event.get("taskId").and_then(|value| value.as_str()) {
+            project_approval_task_ids.insert(task_id.to_string());
+        }
+    }
+
+    Value::Array(
+        all_events
+            .into_iter()
+            .filter(|event| {
+                let payload = event.get("payload").and_then(|value| value.as_object());
+                if payload
+                    .and_then(|payload| payload.get("participantId"))
+                    .and_then(|value| value.as_str())
+                    .map(|participant_id| participant_ids.contains(participant_id))
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+
+                let event_kind = event
+                    .get("kind")
+                    .or_else(|| event.get("type"))
+                    .and_then(|value| value.as_str());
+                if event_kind != Some("respond_approval") {
+                    return false;
+                }
+
+                let approval_id_matches = payload
+                    .and_then(|payload| payload.get("approvalId"))
+                    .and_then(|value| value.as_str())
+                    .map(|approval_id| project_approval_ids.contains(approval_id))
+                    .unwrap_or(false);
+                let task_id_matches = event
+                    .get("taskId")
+                    .and_then(|value| value.as_str())
+                    .map(|task_id| project_approval_task_ids.contains(task_id))
+                    .unwrap_or(false);
+
+                approval_id_matches || task_id_matches
+            })
+            .collect(),
+    )
+}
+
 #[tauri::command]
 pub async fn load_broker_service_seed(
     broker_url: Option<String>,
@@ -408,7 +540,7 @@ pub async fn load_broker_service_seed(
     let presence = broker_get_json(&broker_url, "/presence")
         .await
         .unwrap_or_else(|_| json!({ "participants": [] }));
-    let events = broker_get_json(&broker_url, "/events/replay?after=0").await?;
+    let events = load_all_replay_events(&broker_url).await?;
 
     Ok(json!({
         "health": health,
@@ -439,14 +571,17 @@ pub async fn load_broker_project_seed(
     let presence = broker_get_json(&broker_url, "/presence")
         .await
         .unwrap_or_else(|_| json!({ "participants": [] }));
-    let events = broker_get_json(&broker_url, "/events/replay?after=0").await?;
+    let events = load_all_replay_events(&broker_url).await?;
     let approvals = broker_get_json(&broker_url, &approvals_path).await?;
+
+    let merged_participants = merge_participants_with_presence(participants, presence);
+    let filtered_events = filter_events_for_project_participants(events, &merged_participants);
 
     Ok(json!({
         "health": health,
-        "participants": merge_participants_with_presence(participants, presence),
+        "participants": merged_participants,
         "workStates": value_items(work_states, "items"),
-        "events": value_items(events, "items"),
+        "events": filtered_events,
         "approvals": value_items(approvals, "items")
     }))
 }
@@ -1305,6 +1440,7 @@ pub async fn ensure_broker_ready(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn build_runtime_status_reports_installed_healthy_runtime() {
@@ -1364,6 +1500,148 @@ mod tests {
         assert_eq!(
             status.last_error.as_deref(),
             Some("broker_not_ready_before_timeout")
+        );
+    }
+
+    #[test]
+    fn load_all_replay_events_pages_until_the_latest_slice() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let calls: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_for_fetch = Arc::clone(&calls);
+
+        let events = runtime
+            .block_on(load_all_replay_events_with(move |after| {
+                let calls = Arc::clone(&calls_for_fetch);
+                async move {
+                    calls.lock().expect("calls").push(after);
+                    Ok(match after {
+                        0 => json!({
+                            "items": (1..=100)
+                                .map(|event_id| json!({ "eventId": event_id, "kind": "report_progress" }))
+                                .collect::<Vec<_>>()
+                        }),
+                        100 => json!({
+                            "items": [
+                                { "eventId": 101, "kind": "ask_clarification" }
+                            ]
+                        }),
+                        _ => panic!("unexpected replay cursor {after}"),
+                    })
+                }
+            }))
+            .expect("events");
+
+        assert_eq!(calls.lock().expect("calls").as_slice(), &[0, 100]);
+        let items = value_items(events, "items").as_array().cloned().expect("array");
+        assert_eq!(items.len(), 101);
+        assert_eq!(items.first(), Some(&json!({ "eventId": 1, "kind": "report_progress" })));
+        assert_eq!(items.last(), Some(&json!({ "eventId": 101, "kind": "ask_clarification" })));
+    }
+
+    #[test]
+    fn filter_events_for_project_participants_keeps_only_matching_participant_ids() {
+        let events = json!({
+            "items": [
+                {
+                    "eventId": 1,
+                    "kind": "ask_clarification",
+                    "payload": { "participantId": "agent-a", "summary": "keep" }
+                },
+                {
+                    "eventId": 2,
+                    "kind": "ask_clarification",
+                    "payload": { "participantId": "agent-b", "summary": "drop" }
+                }
+            ]
+        });
+        let participants = json!({
+            "participants": [
+                { "participantId": "agent-a", "alias": "codex4" }
+            ]
+        });
+
+        let filtered = filter_events_for_project_participants(events, &participants);
+
+        assert_eq!(
+            filtered,
+            json!([
+                {
+                    "eventId": 1,
+                    "kind": "ask_clarification",
+                    "payload": { "participantId": "agent-a", "summary": "keep" }
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn filter_events_for_project_participants_keeps_matching_approval_responses() {
+        let events = json!({
+            "items": [
+                {
+                    "eventId": 1,
+                    "kind": "request_approval",
+                    "taskId": "task-a",
+                    "payload": {
+                        "approvalId": "approval-a",
+                        "participantId": "agent-a",
+                        "summary": "keep request"
+                    }
+                },
+                {
+                    "eventId": 2,
+                    "kind": "respond_approval",
+                    "taskId": "task-a",
+                    "payload": {
+                        "approvalId": "approval-a",
+                        "participantId": "human.local",
+                        "decision": "approved"
+                    }
+                },
+                {
+                    "eventId": 3,
+                    "kind": "respond_approval",
+                    "taskId": "task-b",
+                    "payload": {
+                        "approvalId": "approval-b",
+                        "participantId": "human.local",
+                        "decision": "approved"
+                    }
+                }
+            ]
+        });
+        let participants = json!({
+            "participants": [
+                { "participantId": "agent-a", "alias": "codex4" }
+            ]
+        });
+
+        let filtered = filter_events_for_project_participants(events, &participants);
+
+        assert_eq!(
+            filtered,
+            json!([
+                {
+                    "eventId": 1,
+                    "kind": "request_approval",
+                    "taskId": "task-a",
+                    "payload": {
+                        "approvalId": "approval-a",
+                        "participantId": "agent-a",
+                        "summary": "keep request"
+                    }
+                },
+                {
+                    "eventId": 2,
+                    "kind": "respond_approval",
+                    "taskId": "task-a",
+                    "payload": {
+                        "approvalId": "approval-a",
+                        "participantId": "human.local",
+                        "decision": "approved"
+                    }
+                }
+            ])
         );
     }
 }

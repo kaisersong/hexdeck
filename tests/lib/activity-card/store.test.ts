@@ -12,6 +12,11 @@ function makeApproval(cardId: string, approvalId = 'approval-1'): ActivityCardPr
     actionMode: 'action',
     decision: 'pending',
     taskId: 'task-1',
+    actions: [
+      { label: 'Yes', decisionMode: 'yes' },
+      { label: 'Always', decisionMode: 'always' },
+      { label: 'No', decisionMode: 'no' },
+    ],
   };
 }
 
@@ -67,6 +72,17 @@ describe('createActivityCardStore', () => {
 
     expect(store.getState().activeCard?.cardId).toBe('question:2');
     expect(store.getState().queue.map((item) => item.cardId)).toEqual(['question:1']);
+  });
+
+  it('primes existing cards as dismissed so startup backlog does not replay as notifications', () => {
+    const store = createActivityCardStore();
+
+    store.primeExisting([makeApproval('approval:1'), makeQuestion('question:1')]);
+
+    expect(store.getState().activeCard).toBeNull();
+    expect(store.getState().queue).toEqual([]);
+    expect(store.getState().dismissedCardIds.has('approval:approval-1')).toBe(true);
+    expect(store.getState().dismissedCardIds.has('question:question-1')).toBe(true);
   });
 
   it('deduplicates approval and question cards by semantic identity even when cardIds change', () => {
@@ -126,7 +142,7 @@ describe('createActivityCardStore', () => {
 
     store.setHovered(false, 6_500);
     store.tick(7_100);
-    expect(store.getState().activeCard).toBeNull();
+    expect(store.getState().activeCard?.cardId).toBe('approval:1');
   });
 
   it('uses kind-specific timeout durations for approval, question, and completion cards', () => {
@@ -142,6 +158,10 @@ describe('createActivityCardStore', () => {
     );
     store.tick(6_001);
 
+    expect(store.getState().dismissedCardIds.has('approval:approval-1')).toBe(false);
+    expect(store.getState().activeCard?.cardId).toBe('approval:1');
+
+    store.dismissActiveCard(6_100);
     expect(store.getState().dismissedCardIds.has('approval:approval-1')).toBe(true);
     const questionCard = store.getState().activeCard;
     if (!questionCard || questionCard.kind !== 'question') {
@@ -149,20 +169,20 @@ describe('createActivityCardStore', () => {
     }
     expect(questionCard.questionId).toBe('question-1');
 
-    store.tick(12_001);
+    store.tick(12_102);
     expect(store.getState().dismissedCardIds.has('question:question-1')).toBe(true);
     expect(store.getState().activeCard?.cardId).toBe('completion:1');
 
-    store.tick(15_001);
+    store.tick(15_103);
     expect(store.getState().dismissedCardIds.has('completion:completion:1')).toBe(true);
     expect(store.getState().activeCard).toBeNull();
   });
 
-  it('keeps a dismissed approval identity out of the queue after timeout even if it reappears with a new cardId', () => {
+  it('keeps a manually dismissed approval identity out of the queue even if it reappears with a new cardId', () => {
     const store = createActivityCardStore();
 
     store.replaceQueue([makeApproval('approval:1')], 0);
-    store.tick(6_001);
+    store.dismissActiveCard(6_001);
 
     expect(store.getState().dismissedCardIds.has('approval:approval-1')).toBe(true);
 

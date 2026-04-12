@@ -10,10 +10,14 @@ describe('buildActivityCardsFromSeed', () => {
           participantId: 'agent-1',
           alias: 'codex4',
           kind: 'agent',
+          tool: 'Claude Code',
           metadata: {
             terminalApp: 'Ghostty',
             terminalSessionID: 'session-1',
             projectPath: '/Users/song/projects/hexdeck',
+          },
+          context: {
+            projectName: 'HexDeck',
           },
         },
       ],
@@ -58,6 +62,11 @@ describe('buildActivityCardsFromSeed', () => {
       approvalId: 'approval-1',
       actionMode: 'action',
       cardId: 'approval:approval-1',
+      actions: [
+        { label: 'Yes', decisionMode: 'yes' },
+        { label: 'Always', decisionMode: 'always' },
+        { label: 'No', decisionMode: 'no' },
+      ],
     });
     const questionCard = cards[1];
     if (questionCard.kind !== 'question') {
@@ -75,6 +84,10 @@ describe('buildActivityCardsFromSeed', () => {
       { value: 'compact', label: 'Compact' },
       { value: 'expanded', label: 'Expanded' },
     ]);
+    expect(questionCard.actorLabel).toBe('@codex4');
+    expect(questionCard.projectLabel).toBe('HexDeck');
+    expect(questionCard.toolLabel).toBe('Claude Code');
+    expect(questionCard.terminalLabel).toBe('Ghostty');
     expect(questionCard.jumpTarget?.participantId).toBe('agent-1');
     expect(cards[2]).toMatchObject({
       kind: 'completion',
@@ -187,5 +200,159 @@ describe('buildActivityCardsFromSeed', () => {
     });
 
     expect(cards).toEqual([]);
+  });
+
+  it('derives a pending approval card from replay request_approval events', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'agent-1',
+          alias: 'codex4',
+          kind: 'agent',
+          tool: 'Claude Code',
+          metadata: {
+            terminalApp: 'Ghostty',
+            terminalSessionID: 'session-1',
+            projectPath: '/Users/song/projects/hexdeck',
+          },
+          context: {
+            projectName: 'HexDeck',
+          },
+        },
+      ],
+      workStates: [],
+      events: [
+        {
+          id: 501,
+          type: 'request_approval',
+          taskId: 'task-approval-1',
+          threadId: 'thread-approval-1',
+          payload: {
+            approvalId: 'approval-event-1',
+            participantId: 'agent-1',
+            body: {
+              summary: 'Ship the result?',
+            },
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards).toContainEqual(expect.objectContaining({
+      kind: 'approval',
+      approvalId: 'approval-event-1',
+      taskId: 'task-approval-1',
+      summary: 'Ship the result?',
+      actorLabel: '@codex4',
+      projectLabel: 'HexDeck',
+      toolLabel: 'Claude Code',
+      terminalLabel: 'Ghostty',
+    }));
+  });
+
+  it('uses approval action labels provided by the agent payload', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [],
+      workStates: [],
+      events: [
+        {
+          id: 551,
+          type: 'request_approval',
+          taskId: 'task-approval-3',
+          payload: {
+            approvalId: 'approval-event-3',
+            actions: [
+              { label: 'Run Bash', decisionMode: 'yes' },
+              { label: 'Always allow Bash', decisionMode: 'always' },
+              { label: 'Deny', decisionMode: 'no' },
+            ],
+            body: {
+              summary: 'Claude wants to run Bash.',
+            },
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards).toContainEqual(expect.objectContaining({
+      kind: 'approval',
+      approvalId: 'approval-event-3',
+      actions: [
+        { label: 'Run Bash', decisionMode: 'yes' },
+        { label: 'Always allow Bash', decisionMode: 'always' },
+        { label: 'Deny', decisionMode: 'no' },
+      ],
+    }));
+  });
+
+  it('extracts optional approval detail and command preview fields from the payload body', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [],
+      workStates: [],
+      events: [
+        {
+          id: 560,
+          type: 'request_approval',
+          taskId: 'task-approval-4',
+          payload: {
+            approvalId: 'approval-event-4',
+            approvalScope: 'run_command',
+            body: {
+              summary: 'Claude wants to run Bash.',
+              detail: '需要创建 skill 目录并进入 scripts 子目录。',
+              commandLine: '$ mkdir -p /Users/song/.claude/skills/kai-export-ppt-lite/scripts',
+            },
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards).toContainEqual(expect.objectContaining({
+      kind: 'approval',
+      approvalId: 'approval-event-4',
+      detailText: '需要创建 skill 目录并进入 scripts 子目录。',
+      commandTitle: 'Bash',
+      commandLine: '$ mkdir -p /Users/song/.claude/skills/kai-export-ppt-lite/scripts',
+      commandPreview: 'mkdir -p /Users/song/.claude/skills/kai-export-ppt-lite/scripts',
+    }));
+  });
+
+  it('drops derived approval cards after a respond_approval event arrives', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [],
+      workStates: [],
+      events: [
+        {
+          id: 601,
+          type: 'request_approval',
+          taskId: 'task-approval-2',
+          payload: {
+            approvalId: 'approval-event-2',
+            body: {
+              summary: 'Approve deploy?',
+            },
+          },
+        },
+        {
+          id: 602,
+          type: 'respond_approval',
+          taskId: 'task-approval-2',
+          payload: {
+            approvalId: 'approval-event-2',
+            decision: 'approved',
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards.find((card) => card.kind === 'approval')).toBeUndefined();
   });
 });

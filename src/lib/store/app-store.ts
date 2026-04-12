@@ -14,6 +14,7 @@ export interface AppState {
 export interface AppStore {
   getState(): AppState;
   setSnapshot(snapshot: ProjectSnapshotProjection): void;
+  primeActivityCards(cards: ActivityCardProjection[]): void;
   replaceActivityCards(cards: ActivityCardProjection[], nowMs: number): void;
   setActivityCardHovered(hovered: boolean, nowMs: number): void;
   tickActivityCards(nowMs: number): void;
@@ -51,6 +52,9 @@ export function createAppStore(): AppStore {
     },
     setSnapshot(snapshot) {
       state.snapshot = snapshot;
+    },
+    primeActivityCards(cards) {
+      activityCardStore.primeExisting(cards);
     },
     replaceActivityCards(cards, nowMs) {
       activityCardStore.replaceQueue(cards, nowMs);
