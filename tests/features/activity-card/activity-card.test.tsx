@@ -110,9 +110,9 @@ function makeSeed() {
   };
 }
 
-function makeApprovalCard(): ActivityCardApprovalProjection {
+function makeApprovalCard(approvalId = 'approval-1'): ActivityCardApprovalProjection {
   return {
-    cardId: 'approval:1',
+    cardId: `approval:${approvalId}`,
     kind: 'approval',
     priority: 'critical',
     summary: 'Deploy approval needed',
@@ -120,7 +120,7 @@ function makeApprovalCard(): ActivityCardApprovalProjection {
     projectLabel: 'HexDeck',
     toolLabel: 'Claude Code',
     terminalLabel: 'Ghostty',
-    approvalId: 'approval-1',
+    approvalId,
     actionMode: 'action',
     decision: 'pending',
     taskId: 'task-1',
@@ -903,11 +903,13 @@ describe('ActivityCardRoute', () => {
       render(<ActivityCardRoute card={makeApprovalCard()} />);
 
       await waitFor(() => {
-        expect(screen.getByLabelText('activity card debug measurements')).toHaveTextContent('shell 224px');
-        expect(screen.getByLabelText('activity card debug measurements')).toHaveTextContent('card 224px');
-        expect(screen.getByLabelText('activity card debug measurements')).toHaveTextContent('target 226px');
-        expect(screen.getByLabelText('activity card debug measurements')).toHaveTextContent('inner 226px');
-        expect(screen.getByLabelText('activity card debug measurements')).toHaveTextContent('outer 226px');
+        const metrics = screen.getByLabelText('activity card debug measurements');
+        expect(metrics).toHaveTextContent('card 224px');
+        expect(metrics).toHaveTextContent('inner 226px');
+        expect(metrics).toHaveTextContent('outer 226px');
+        expect(metrics).not.toHaveTextContent('shell');
+        expect(metrics).not.toHaveTextContent('target');
+        expect(metrics).not.toHaveTextContent('scale');
       });
     } finally {
       scrollHeightSpy.mockRestore();
@@ -915,7 +917,7 @@ describe('ActivityCardRoute', () => {
     }
   });
 
-  it('renders live debug broker diagnostics before native measurement completes', () => {
+  it('keeps live debug diagnostics compact before native measurement completes', () => {
     window.history.pushState({}, '', '/?view=activity-card&debugLive=1&project=hexdeck');
     invokeMock.mockImplementation(() => new Promise(() => undefined));
 
@@ -935,11 +937,46 @@ describe('ActivityCardRoute', () => {
     );
 
     const metrics = screen.getByLabelText('activity card debug measurements');
-    expect(metrics).toHaveTextContent('shell pending');
-    expect(metrics).toHaveTextContent('project hexdeck');
-    expect(metrics).toHaveTextContent('cards 0');
-    expect(metrics).toHaveTextContent('active none');
-    expect(metrics).toHaveTextContent('latest 2796');
+    expect(metrics).toHaveTextContent('card pending');
+    expect(metrics).toHaveTextContent('inner pending');
+    expect(metrics).toHaveTextContent('outer pending');
+    expect(metrics).not.toHaveTextContent('project hexdeck');
+    expect(metrics).not.toHaveTextContent('latest 2796');
+  });
+
+  it('hides the live activity-card window after a real card clears', async () => {
+    const { rerender } = render(<ActivityCardRoute card={makeApprovalCard()} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('@codex4 · Deploy approval needed')).toBeInTheDocument();
+    });
+
+    rerender(<ActivityCardRoute card={null} />);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    });
+  });
+
+  it('reopens the live activity-card window when a new real card arrives after hiding', async () => {
+    const { rerender } = render(<ActivityCardRoute card={makeApprovalCard('approval-1')} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('@codex4 · Deploy approval needed')).toBeInTheDocument();
+    });
+
+    rerender(<ActivityCardRoute card={null} />);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    });
+    invokeMock.mockClear();
+
+    rerender(<ActivityCardRoute card={makeApprovalCard('approval-2')} />);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+    });
   });
 
   it('renders a local preview approval card when preview=approval is present', async () => {

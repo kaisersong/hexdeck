@@ -246,13 +246,25 @@ export interface ActivityCardRouteProps {
 function DebugMetrics({
   measurement,
   debugInfo,
+  compact,
 }: {
   measurement: ActivityCardMeasurement | null;
   debugInfo?: ActivityCardDebugInfo | null;
+  compact?: boolean;
 }) {
   const formatHeight = (height: number | null | undefined) => (
     typeof height === 'number' ? `${height}px` : 'pending'
   );
+
+  if (compact) {
+    return (
+      <div className="activity-card-debug-metrics" aria-label="activity card debug measurements">
+        card {formatHeight(measurement?.cardHeight)}
+        {' '}· inner {formatHeight(measurement?.actualInnerHeight)}
+        {' '}· outer {formatHeight(measurement?.actualOuterHeight)}
+      </div>
+    );
+  }
 
   return (
     <div className="activity-card-debug-metrics" aria-label="activity card debug measurements">
@@ -294,6 +306,9 @@ export function ActivityCardRoute({
   const previewCard = useMemo(() => getPreviewCard(), []);
   const showDebugMetrics = useMemo(() => Boolean(previewCard) || getActivityCardDebugMode(), [previewCard]);
   const displayCard = previewCard ?? card;
+  const compactDebugMetrics = !previewCard && showDebugMetrics;
+  const hasDisplayedBrokerCardRef = useRef(false);
+  const hasHiddenActivityCardWindowRef = useRef(false);
   const [measurement, setMeasurement] = useState<ActivityCardMeasurement | null>(null);
 
   useEffect(() => {
@@ -312,6 +327,34 @@ export function ActivityCardRoute({
       .then(({ invoke }) => invoke('show_activity_card_window'))
       .catch(() => undefined);
   }, [previewCard]);
+
+  useEffect(() => {
+    if (!previewCard && card) {
+      hasDisplayedBrokerCardRef.current = true;
+    }
+  }, [card, previewCard]);
+
+  useEffect(() => {
+    if (previewCard || displayCard || !hasDisplayedBrokerCardRef.current) {
+      return;
+    }
+
+    hasHiddenActivityCardWindowRef.current = true;
+    void import('@tauri-apps/api/core')
+      .then(({ invoke }) => invoke('hide_activity_card_window'))
+      .catch(() => undefined);
+  }, [displayCard, previewCard]);
+
+  useEffect(() => {
+    if (previewCard || !displayCard || !hasHiddenActivityCardWindowRef.current) {
+      return;
+    }
+
+    hasHiddenActivityCardWindowRef.current = false;
+    void import('@tauri-apps/api/core')
+      .then(({ invoke }) => invoke('show_activity_card_window'))
+      .catch(() => undefined);
+  }, [displayCard, previewCard]);
 
   useLayoutEffect(() => {
     let cancelled = false;
@@ -418,7 +461,9 @@ export function ActivityCardRoute({
         style={ACTIVITY_CARD_SHELL_STYLE}
         aria-label="activity-card"
       >
-        {showDebugMetrics ? <DebugMetrics measurement={measurement} debugInfo={debugInfo} /> : null}
+        {showDebugMetrics ? (
+          <DebugMetrics measurement={measurement} debugInfo={debugInfo} compact={compactDebugMetrics} />
+        ) : null}
       </main>
     );
   }
@@ -447,7 +492,9 @@ export function ActivityCardRoute({
         onJump={onJump}
         onHoverChange={onHoverChange}
       />
-      {showDebugMetrics ? <DebugMetrics measurement={measurement} debugInfo={debugInfo} /> : null}
+      {showDebugMetrics ? (
+        <DebugMetrics measurement={measurement} debugInfo={debugInfo} compact={compactDebugMetrics} />
+      ) : null}
     </main>
   );
 }
