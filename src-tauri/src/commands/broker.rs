@@ -14,6 +14,7 @@ use tauri::{AppHandle, Manager};
 use tokio::time::{sleep, Duration};
 
 const REPLAY_PAGE_SIZE: usize = 100;
+const INTENT_BROKER_REPO: &str = "kaisersong/intent-broker";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BrokerVersionInfo {
@@ -707,44 +708,7 @@ async fn fetch_latest_broker_release_internal(
                 .await
                 .map_err(|e| format!("failed_to_parse_response: {}", e))?;
 
-            let version = release
-                .get("tag_name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim_start_matches('v').to_string())
-                .ok_or_else(|| "no_version_found".to_string())?;
-
-            let assets = release
-                .get("assets")
-                .and_then(|a| a.as_array())
-                .ok_or_else(|| "no_assets_found".to_string())?;
-
-            let tarball_asset = assets
-                .iter()
-                .find(|asset| {
-                    asset
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .map(|n| n.ends_with(".tar.gz") && n.contains("intent-broker"))
-                        .unwrap_or(false)
-                })
-                .ok_or_else(|| "no_tarball_asset_found".to_string())?;
-
-            let download_url = tarball_asset
-                .get("browser_download_url")
-                .and_then(|u| u.as_str())
-                .map(|s| s.to_string())
-                .ok_or_else(|| "no_download_url_found".to_string())?;
-
-            let release_notes = release
-                .get("body")
-                .and_then(|b| b.as_str())
-                .map(|s| s.to_string());
-
-            let info = BrokerVersionInfo {
-                version,
-                download_url,
-                release_notes,
-            };
+            let info = broker_release_info_from_github_release(&release)?;
 
             maybe_log(
                 log_path,
@@ -814,7 +778,8 @@ async fn fetch_latest_broker_release_via_redirect(
         .ok_or_else(|| "missing_release_tag".to_string())?;
     let version = tag.trim_start_matches('v').to_string();
     let download_url = format!(
-        "https://codeload.github.com/kaisersong/intent-broker/tar.gz/refs/tags/{}",
+        "https://codeload.github.com/{}/tar.gz/refs/tags/{}",
+        INTENT_BROKER_REPO,
         tag
     );
 
@@ -830,6 +795,57 @@ async fn fetch_latest_broker_release_via_redirect(
         version,
         download_url,
         release_notes: None,
+    })
+}
+
+fn broker_release_info_from_github_release(
+    release: &serde_json::Value,
+) -> Result<BrokerVersionInfo, String> {
+    let tag = release
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "no_version_found".to_string())?;
+    let version = tag.trim_start_matches('v').to_string();
+
+    let asset_download_url = release
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .and_then(|assets| {
+            assets.iter().find_map(|asset| {
+                let name = asset.get("name").and_then(|n| n.as_str())?;
+                if !name.ends_with(".tar.gz") || !name.contains("intent-broker") {
+                    return None;
+                }
+                asset
+                    .get("browser_download_url")
+                    .and_then(|u| u.as_str())
+                    .map(|s| s.to_string())
+            })
+        });
+
+    let download_url = asset_download_url
+        .or_else(|| {
+            release
+                .get("tarball_url")
+                .and_then(|u| u.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "https://codeload.github.com/{}/tar.gz/refs/tags/{}",
+                INTENT_BROKER_REPO, tag
+            )
+        });
+
+    let release_notes = release
+        .get("body")
+        .and_then(|b| b.as_str())
+        .map(|s| s.to_string());
+
+    Ok(BrokerVersionInfo {
+        version,
+        download_url,
+        release_notes,
     })
 }
 
@@ -1500,6 +1516,50 @@ mod tests {
         assert_eq!(
             status.last_error.as_deref(),
             Some("broker_not_ready_before_timeout")
+        );
+    }
+
+    #[test]
+    fn broker_release_info_falls_back_to_github_tarball_when_assets_are_absent() {
+        let release = json!({
+            "tag_name": "v0.2.1",
+            "assets": [],
+            "tarball_url": "https://api.github.com/repos/kaisersong/intent-broker/tarball/v0.2.1",
+            "body": "Hook approval release"
+        });
+
+        let info = broker_release_info_from_github_release(&release).expect("release info");
+
+        assert_eq!(info.version, "0.2.1");
+        assert_eq!(
+            info.download_url,
+            "https://api.github.com/repos/kaisersong/intent-broker/tarball/v0.2.1"
+        );
+        assert_eq!(
+            info.release_notes.as_deref(),
+            Some("Hook approval release")
+        );
+    }
+
+    #[test]
+    fn broker_release_info_prefers_uploaded_tarball_assets() {
+        let release = json!({
+            "tag_name": "v0.2.2",
+            "assets": [
+                {
+                    "name": "intent-broker-0.2.2.tar.gz",
+                    "browser_download_url": "https://github.com/kaisersong/intent-broker/releases/download/v0.2.2/intent-broker-0.2.2.tar.gz"
+                }
+            ],
+            "tarball_url": "https://api.github.com/repos/kaisersong/intent-broker/tarball/v0.2.2"
+        });
+
+        let info = broker_release_info_from_github_release(&release).expect("release info");
+
+        assert_eq!(info.version, "0.2.2");
+        assert_eq!(
+            info.download_url,
+            "https://github.com/kaisersong/intent-broker/releases/download/v0.2.2/intent-broker-0.2.2.tar.gz"
         );
     }
 
