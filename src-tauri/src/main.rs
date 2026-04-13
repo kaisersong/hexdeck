@@ -9,9 +9,16 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::Command;
 use tauri::{
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     utils::config::BackgroundThrottlingPolicy, Manager, PhysicalPosition, WebviewUrl,
     WebviewWindow, WebviewWindowBuilder,
 };
+use tauri_plugin_positioner::{Position, WindowExt};
+
+const TRAY_MENU_OPEN_ID: &str = "hexdeck-tray-open";
+const TRAY_MENU_SETTINGS_ID: &str = "hexdeck-tray-settings";
+const TRAY_MENU_QUIT_ID: &str = "hexdeck-tray-quit";
 
 // ============================================================================
 // CLI Subcommand Definitions
@@ -89,6 +96,18 @@ struct ActivityCardWindowMeasurementPayload {
     scale_factor: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayClickAction {
+    TogglePanel,
+    Ignore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelShowAnchor {
+    Current,
+    TrayCenter,
+}
+
 fn escape_applescript(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -138,6 +157,18 @@ fn panel_window_resizable() -> bool {
 
 fn panel_window_starts_visible() -> bool {
     false
+}
+
+fn panel_window_always_on_top() -> bool {
+    true
+}
+
+fn panel_window_decorated() -> bool {
+    false
+}
+
+fn panel_window_skips_taskbar() -> bool {
+    true
 }
 
 fn activity_card_window_size() -> (f64, f64) {
@@ -194,6 +225,26 @@ fn activity_card_window_location() -> String {
 
 fn setup_creates_panel_window(activity_card_preview: Option<&str>) -> bool {
     activity_card_preview.is_none()
+}
+
+fn tray_click_action(button: MouseButton, state: MouseButtonState) -> TrayClickAction {
+    if button == MouseButton::Left && state == MouseButtonState::Up {
+        TrayClickAction::TogglePanel
+    } else {
+        TrayClickAction::Ignore
+    }
+}
+
+fn tray_menu_item_ids() -> [&'static str; 3] {
+    [
+        TRAY_MENU_OPEN_ID,
+        TRAY_MENU_SETTINGS_ID,
+        TRAY_MENU_QUIT_ID,
+    ]
+}
+
+fn desktop_shell_uses_accessory_activation_policy() -> bool {
+    true
 }
 
 fn activity_card_window_position(
@@ -283,6 +334,9 @@ fn ensure_panel_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> {
         .inner_size(width, height)
         .resizable(panel_window_resizable())
         .visible(panel_window_starts_visible())
+        .always_on_top(panel_window_always_on_top())
+        .decorations(panel_window_decorated())
+        .skip_taskbar(panel_window_skips_taskbar())
         .background_throttling(BackgroundThrottlingPolicy::Disabled)
         .build()
 }
@@ -367,27 +421,49 @@ fn position_activity_card_window(
     Ok(())
 }
 
-#[tauri::command]
-fn toggle_panel_command(app: tauri::AppHandle) -> Result<(), String> {
-    let window = ensure_panel_window(&app).map_err(|error| error.to_string())?;
-    let visible = window.is_visible().map_err(|error| error.to_string())?;
+fn show_panel_window(
+    app: &tauri::AppHandle,
+    anchor: PanelShowAnchor,
+) -> tauri::Result<WebviewWindow> {
+    let window = ensure_panel_window(app)?;
+
+    if anchor == PanelShowAnchor::TrayCenter {
+        window.move_window_constrained(Position::TrayCenter)?;
+    }
+
+    window.show()?;
+    window.set_focus()?;
+    Ok(window)
+}
+
+fn toggle_panel_window(app: &tauri::AppHandle, anchor: PanelShowAnchor) -> tauri::Result<()> {
+    let window = ensure_panel_window(app)?;
+    let visible = window.is_visible()?;
 
     if visible {
-        window.hide().map_err(|error| error.to_string())?;
+        window.hide()?;
         return Ok(());
     }
 
-    window.show().map_err(|error| error.to_string())?;
-    window.set_focus().map_err(|error| error.to_string())?;
+    show_panel_window(app, anchor)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn toggle_panel_command(app: tauri::AppHandle) -> Result<(), String> {
+    toggle_panel_window(&app, PanelShowAnchor::Current).map_err(|error| error.to_string())
+}
+
+fn open_expanded_window_for_app(app: &tauri::AppHandle, section: &str) -> tauri::Result<()> {
+    let window = ensure_expanded_window(app, section)?;
+    window.show()?;
+    window.set_focus()?;
     Ok(())
 }
 
 #[tauri::command]
 fn open_expanded_window(app: tauri::AppHandle, section: String) -> Result<(), String> {
-    let window = ensure_expanded_window(&app, &section).map_err(|error| error.to_string())?;
-    window.show().map_err(|error| error.to_string())?;
-    window.set_focus().map_err(|error| error.to_string())?;
-    Ok(())
+    open_expanded_window_for_app(&app, &section).map_err(|error| error.to_string())
 }
 
 fn show_activity_card_window_for_app(app: &tauri::AppHandle) -> tauri::Result<()> {
@@ -444,6 +520,75 @@ fn hide_activity_card_window(app: tauri::AppHandle) -> Result<(), String> {
         log_activity_card_window_state("hide-after", &window);
     }
 
+    Ok(())
+}
+
+fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let [open_id, settings_id, quit_id] = tray_menu_item_ids();
+    let open_item = MenuItem::with_id(app, open_id, "Open HexDeck", true, None::<&str>)?;
+    let settings_item = MenuItem::with_id(app, settings_id, "Settings", true, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let quit_item = MenuItem::with_id(app, quit_id, "Quit HexDeck", true, None::<&str>)?;
+
+    Menu::with_items(
+        app,
+        &[&open_item, &settings_item, &separator, &quit_item],
+    )
+}
+
+fn handle_tray_menu_event(app: &tauri::AppHandle, menu_id: &str) {
+    let result = match menu_id {
+        TRAY_MENU_OPEN_ID => show_panel_window(app, PanelShowAnchor::Current).map(|_| ()),
+        TRAY_MENU_SETTINGS_ID => open_expanded_window_for_app(app, "settings"),
+        TRAY_MENU_QUIT_ID => {
+            app.exit(0);
+            Ok(())
+        }
+        _ => Ok(()),
+    };
+
+    if let Err(error) = result {
+        eprintln!("[tray] failed to handle menu item {menu_id}: {error}");
+    }
+}
+
+fn handle_tray_icon_event(app: &tauri::AppHandle, event: TrayIconEvent) {
+    tauri_plugin_positioner::on_tray_event(app, &event);
+
+    let TrayIconEvent::Click {
+        button,
+        button_state,
+        ..
+    } = event
+    else {
+        return;
+    };
+
+    if tray_click_action(button, button_state) == TrayClickAction::TogglePanel {
+        if let Err(error) = toggle_panel_window(app, PanelShowAnchor::TrayCenter) {
+            eprintln!("[tray] failed to toggle panel: {error}");
+        }
+    }
+}
+
+fn setup_tray_icon(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let menu = build_tray_menu(app)?;
+    let mut tray = TrayIconBuilder::with_id("hexdeck-tray")
+        .tooltip("HexDeck")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| {
+            handle_tray_menu_event(app, event.id().0.as_str());
+        })
+        .on_tray_icon_event(|tray, event| {
+            handle_tray_icon_event(tray.app_handle(), event);
+        });
+
+    if let Some(icon) = app.default_window_icon().cloned() {
+        tray = tray.icon(icon).icon_as_template(cfg!(target_os = "macos"));
+    }
+
+    tray.build(app)?;
     Ok(())
 }
 
@@ -903,6 +1048,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_positioner::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
@@ -932,6 +1078,13 @@ fn main() {
         ])
         .setup(|app| {
             let preview = activity_card_preview_mode();
+
+            if desktop_shell_uses_accessory_activation_policy() {
+                #[cfg(target_os = "macos")]
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
+
+            setup_tray_icon(app.handle())?;
 
             if setup_creates_panel_window(preview.as_deref()) {
                 let _panel = ensure_panel_window(app.handle())?;
@@ -963,6 +1116,50 @@ mod tests {
     #[test]
     fn panel_window_starts_hidden() {
         assert!(!panel_window_starts_visible());
+    }
+
+    #[test]
+    fn panel_window_uses_tray_popover_chrome() {
+        assert!(panel_window_always_on_top());
+        assert!(!panel_window_decorated());
+        assert!(panel_window_skips_taskbar());
+    }
+
+    #[test]
+    fn tray_left_mouse_up_toggles_panel() {
+        assert_eq!(
+            tray_click_action(tauri::tray::MouseButton::Left, tauri::tray::MouseButtonState::Up),
+            TrayClickAction::TogglePanel
+        );
+    }
+
+    #[test]
+    fn tray_non_primary_clicks_do_not_toggle_panel() {
+        assert_eq!(
+            tray_click_action(tauri::tray::MouseButton::Right, tauri::tray::MouseButtonState::Up),
+            TrayClickAction::Ignore
+        );
+        assert_eq!(
+            tray_click_action(tauri::tray::MouseButton::Left, tauri::tray::MouseButtonState::Down),
+            TrayClickAction::Ignore
+        );
+    }
+
+    #[test]
+    fn tray_menu_ids_are_stable() {
+        assert_eq!(
+            tray_menu_item_ids(),
+            [
+                "hexdeck-tray-open",
+                "hexdeck-tray-settings",
+                "hexdeck-tray-quit"
+            ]
+        );
+    }
+
+    #[test]
+    fn desktop_shell_uses_accessory_policy_for_menu_bar_mode() {
+        assert!(desktop_shell_uses_accessory_activation_policy());
     }
 
     #[test]
