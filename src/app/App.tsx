@@ -185,6 +185,10 @@ async function loadActivityCardSeed(
   serviceSeed: ProjectSeed,
   currentProjectSetting: string
 ): Promise<ProjectSeed> {
+  if (currentProjectSetting.trim() === ALL_AGENTS_PROJECT) {
+    return serviceSeed;
+  }
+
   const preferredProject = derivePreferredProject(
     serviceSeed.participants.filter(isAgentParticipant),
     currentProjectSetting
@@ -278,7 +282,18 @@ export function App() {
       activityCardsBootstrappedRef.current = true;
 
       if (shouldPrimeStartupActivityBacklog) {
-        store.primeActivityCards(cards);
+        const startupApprovalCards = cards.filter((card) => card.kind === 'approval');
+        const passiveStartupCards = cards.filter((card) => card.kind !== 'approval');
+
+        store.primeActivityCards(passiveStartupCards);
+
+        if (startupApprovalCards.length > 0) {
+          store.replaceActivityCards(startupApprovalCards, nowMs);
+          setActivityCardRenderKey((value) => value + 1);
+          await syncActivityCardWindowVisibility(store.getState().activityCards.activeCard);
+          return;
+        }
+
         await syncActivityCardWindowVisibility(null);
         return;
       }

@@ -1040,21 +1040,41 @@ describe('activity-card window routing', () => {
     expect(invokeMock).not.toHaveBeenCalledWith('hide_activity_card_window');
   });
 
-  it('keeps startup backlog hidden for the floating activity-card window', async () => {
+  it('keeps passive startup backlog hidden for the floating activity-card window', async () => {
     brokerClientInstance = {
       loadServiceSeed: vi.fn().mockResolvedValue({
         health: { ok: true },
-        participants: [],
-        workStates: [],
-        events: [],
-        approvals: [
+        participants: [
           {
-            approvalId: 'approval-1',
-            taskId: 'task-1',
-            summary: 'Deploy approval needed',
-            decision: 'pending',
+            participantId: 'codex.main',
+            alias: 'codex4',
+            kind: 'agent',
+            tool: 'codex',
+            metadata: {
+              terminalApp: 'Ghostty',
+              terminalSessionID: 'ghostty-1',
+              projectPath: '/Users/song/projects/hexdeck',
+            },
+            context: { projectName: 'HexDeck' },
           },
         ],
+        workStates: [],
+        events: [
+          {
+            id: 1,
+            type: 'ask_clarification',
+            taskId: 'task-1',
+            threadId: 'thread-1',
+            payload: {
+              participantId: 'codex.main',
+              summary: 'Old startup question',
+              prompt: 'Old startup question',
+              selectionMode: 'single-select',
+              options: [{ label: 'staging', value: 'staging' }],
+            },
+          },
+        ],
+        approvals: [],
       }),
       loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
       subscribe: vi.fn(() => () => undefined),
@@ -1072,7 +1092,7 @@ describe('activity-card window routing', () => {
     });
   });
 
-  it('suppresses startup backlog in panel mode and only shows newly arrived floating cards after refresh', async () => {
+  it('shows pending startup approvals in panel mode so real agent hooks can be answered', async () => {
     const projectParticipants = [
       {
         participantId: 'codex.main',
@@ -1101,10 +1121,67 @@ describe('activity-card window routing', () => {
         },
       ],
     };
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue({
+        ...makeSeed(),
+        participants: projectParticipants,
+      }),
+      loadProjectSeed: vi.fn().mockResolvedValue(initialProjectSeed),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    render(<App />);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+    });
+  });
+
+  it('keeps passive startup backlog hidden in panel mode and only shows newly arrived floating cards after refresh', async () => {
+    const projectParticipants = [
+      {
+        participantId: 'codex.main',
+        alias: 'codex4',
+        kind: 'agent',
+        tool: 'codex',
+        metadata: {
+          terminalApp: 'Ghostty',
+          terminalSessionID: 'ghostty-1',
+          projectPath: '/Users/song/projects/hexdeck',
+        },
+        context: { projectName: 'HexDeck' },
+      },
+    ];
+    const initialProjectSeed = {
+      health: { ok: true },
+      participants: projectParticipants,
+      workStates: [],
+      events: [
+        {
+          id: 1,
+          type: 'ask_clarification',
+          taskId: 'task-old',
+          threadId: 'thread-old',
+          payload: {
+            participantId: 'codex.main',
+            summary: 'Old startup question',
+            prompt: 'Old startup question',
+            selectionMode: 'single-select',
+            options: [{ label: 'staging', value: 'staging' }],
+          },
+        },
+      ],
+      approvals: [],
+    };
     const nextProjectSeed = {
       ...initialProjectSeed,
       approvals: [
-        ...initialProjectSeed.approvals,
         {
           approvalId: 'approval-new',
           taskId: 'task-new',
@@ -1414,6 +1491,81 @@ describe('activity-card window routing', () => {
 
     expect(screen.queryByText('Old service-wide approval')).not.toBeInTheDocument();
     expect(brokerClientInstance.loadProjectSeed).toHaveBeenCalledWith('HexDeck');
+  });
+
+  it('keeps all-project approvals visible when All agents is selected', async () => {
+    loadLocalSettingsMock.mockReturnValue({
+      brokerUrl: 'http://broker.test',
+      globalShortcut: 'CmdOrCtrl+Shift+H',
+      currentProject: '__all_agents__',
+      recentProjects: [],
+    });
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue({
+        health: { ok: true },
+        participants: [
+          {
+            participantId: 'codex.other',
+            alias: 'codex2',
+            kind: 'agent',
+            tool: 'codex',
+            metadata: {
+              terminalApp: 'Ghostty',
+              terminalSessionID: 'ghostty-2',
+              projectPath: '/Users/song/projects',
+            },
+            context: { projectName: 'projects' },
+          },
+          {
+            participantId: 'codex.main',
+            alias: 'codex4',
+            kind: 'agent',
+            tool: 'codex',
+            metadata: {
+              terminalApp: 'Ghostty',
+              terminalSessionID: 'ghostty-1',
+              projectPath: '/Users/song/projects/hexdeck',
+            },
+            context: { projectName: 'HexDeck' },
+          },
+        ],
+        workStates: [],
+        events: [
+          {
+            id: 1,
+            type: 'request_approval',
+            taskId: 'task-projects',
+            threadId: 'thread-projects',
+            payload: {
+              participantId: 'codex.other',
+              approvalId: 'approval-projects',
+              body: {
+                summary: 'Projects approval',
+              },
+            },
+          },
+        ],
+        approvals: [],
+      }),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('@codex2 · Projects approval')).toBeInTheDocument();
+    });
+
+    expect(brokerClientInstance.loadProjectSeed).not.toHaveBeenCalled();
   });
 
   it('normalizes the preferred project name to the live participant casing before loading the project seed', async () => {
