@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ALL_AGENTS_PROJECT, formatProjectLabel } from '../../lib/settings/local-settings';
 
 interface ProjectSelectorProps {
@@ -14,6 +14,10 @@ export function ProjectSelector({
 }: ProjectSelectorProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [inputValue, setInputValue] = useState(currentProject === ALL_AGENTS_PROJECT ? '' : currentProject);
+
+  useEffect(() => {
+    setInputValue(currentProject === ALL_AGENTS_PROJECT ? '' : currentProject);
+  }, [currentProject]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();

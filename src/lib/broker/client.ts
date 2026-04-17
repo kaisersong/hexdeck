@@ -47,7 +47,9 @@ function filterEventsForProjectParticipants(
   const projectApprovalTaskIds = new Set<string>();
 
   for (const event of events) {
-    const participantId = event.payload?.participantId;
+    const participantId = typeof event.payload?.participantId === 'string'
+      ? event.payload.participantId
+      : event.fromParticipantId;
     if (event.type !== 'request_approval' || typeof participantId !== 'string' || !participantIds.has(participantId)) {
       continue;
     }
@@ -63,7 +65,9 @@ function filterEventsForProjectParticipants(
   }
 
   return events.filter((event) => {
-    const participantId = event.payload?.participantId;
+    const participantId = typeof event.payload?.participantId === 'string'
+      ? event.payload.participantId
+      : event.fromParticipantId;
     if (typeof participantId === 'string' && participantIds.has(participantId)) {
       return true;
     }
@@ -111,6 +115,9 @@ function normalizeBrokerEvent(value: unknown): BrokerEvent | null {
   if (typeof candidate.taskId === 'string') event.taskId = candidate.taskId;
   if (typeof candidate.threadId === 'string') event.threadId = candidate.threadId;
   if (typeof candidate.createdAt === 'string') event.createdAt = candidate.createdAt;
+  if (typeof candidate.fromParticipantId === 'string') event.fromParticipantId = candidate.fromParticipantId;
+  if (typeof candidate.fromAlias === 'string') event.fromAlias = candidate.fromAlias;
+  if (typeof candidate.fromProjectName === 'string') event.fromProjectName = candidate.fromProjectName;
   if (candidate.payload && typeof candidate.payload === 'object' && !Array.isArray(candidate.payload)) {
     event.payload = candidate.payload as Record<string, unknown>;
   }

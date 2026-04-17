@@ -3,6 +3,7 @@ import type { BrokerParticipant } from '../../lib/broker/types';
 import { buildJumpTarget } from '../../lib/jump/targets';
 import type { JumpTarget } from '../../lib/jump/types';
 import { startWindowDragging } from '../../lib/platform/window-controls';
+import { ALL_AGENTS_PROJECT } from '../../lib/settings/local-settings';
 import type {
   AgentCardProjection,
   AttentionItemProjection,
@@ -68,7 +69,14 @@ function buildProjectGroups(
   const agentParticipants = participants.filter(
     (participant) => participant.kind !== 'human' && participant.kind !== 'adapter'
   );
-  const currentProjectKey = currentProject.trim() || 'Current Project';
+  const normalizedCurrentProject = currentProject.trim();
+  const currentProjectKey =
+    normalizedCurrentProject && normalizedCurrentProject !== ALL_AGENTS_PROJECT
+      ? normalizedCurrentProject
+      : 'Current Project';
+  const pinnedProjectName = normalizedCurrentProject && normalizedCurrentProject !== ALL_AGENTS_PROJECT
+    ? normalizedCurrentProject
+    : null;
   const nowByParticipant = new Map(now.map((item) => [item.participantId, item]));
   const groups = new Map<string, MenuProjectGroup>();
   const offlineAgents: MenuAgentItem[] = [];
@@ -165,11 +173,11 @@ function buildProjectGroups(
         agents: group.agents.sort((left, right) => left.alias.localeCompare(right.alias)),
       }))
       .sort((left, right) => {
-        if (left.name === currentProjectKey) {
+        if (pinnedProjectName && left.name === pinnedProjectName) {
           return -1;
         }
 
-        if (right.name === currentProjectKey) {
+        if (pinnedProjectName && right.name === pinnedProjectName) {
           return 1;
         }
 

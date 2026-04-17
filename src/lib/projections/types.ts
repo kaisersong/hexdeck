@@ -37,6 +37,8 @@ export interface RecentItemProjection {
   id: number;
   summary: string;
   priority: ProjectionPriority;
+  actorLabel?: string;
+  projectLabel?: string;
 }
 
 export interface ProjectSnapshotProjection {

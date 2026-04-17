@@ -66,6 +66,39 @@ describe('PanelRoute', () => {
     expect(screen.getByText('1 approvals pending')).toBeInTheDocument();
   });
 
+  it('keeps the dropdown focused on jumpable agent rows instead of selector and recent activity chrome', () => {
+    render(
+      <PanelRoute
+        snapshot={{
+          overview: {
+            brokerHealthy: true,
+            onlineCount: 1,
+            busyCount: 0,
+            blockedCount: 0,
+            pendingApprovalCount: 0,
+          },
+          now: [],
+          attention: [],
+          recent: [
+            {
+              id: 451,
+              priority: 'ambient',
+              actorLabel: '@claude5',
+              projectLabel: 'projects',
+              summary: 'HexDeck real-agent test: please confirm reception',
+            },
+          ],
+        }}
+        participants={[]}
+        currentProject="hexdeck"
+      />
+    );
+
+    expect(screen.queryByRole('heading', { name: 'Recent activity' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'All agents' })).not.toBeInTheDocument();
+    expect(screen.queryByText('HexDeck real-agent test: please confirm reception')).not.toBeInTheDocument();
+  });
+
   it('shows online agents in project groups and keeps offline agents collapsed in a separate section by default', async () => {
     render(
       <PanelRoute

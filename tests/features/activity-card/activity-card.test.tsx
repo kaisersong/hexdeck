@@ -92,7 +92,9 @@ vi.mock('../../../src/lib/platform/capabilities', () => ({
 vi.mock('../../../src/lib/settings/local-settings', () => ({
   ALL_AGENTS_PROJECT: '__all_agents__',
   DEFAULT_BROKER_URL: 'http://127.0.0.1:4318',
+  formatProjectLabel: (project: string) => (project === '__all_agents__' ? 'All agents' : project),
   loadLocalSettings: loadLocalSettingsMock,
+  saveCurrentProject: vi.fn(),
   saveLocalSettings: vi.fn(),
 }));
 
@@ -125,11 +127,10 @@ function makeApprovalCard(approvalId = 'approval-1'): ActivityCardApprovalProjec
     decision: 'pending',
     taskId: 'task-1',
     actions: [
-      { label: 'Yes', decisionMode: 'yes' },
-      { label: 'Always', decisionMode: 'always' },
-      { label: 'No', decisionMode: 'no' },
+      { label: '确认删除', decisionMode: 'yes' },
+      { label: '取消', decisionMode: 'no' },
     ],
-    detailText: '需要你立即确认这个 agent 意图',
+    detailText: '即将删除 workspace 目录下最新文件：/naws-freeflow-demo.svg',
   };
 }
 
@@ -145,10 +146,11 @@ function makeQuestionCard(): ActivityCardQuestionProjection {
     terminalLabel: 'Ghostty',
     questionId: 'question-1',
     prompt: 'Choose a target',
+    detailText: 'Staging is safer for verification before rollout.',
     selectionMode: 'single-select',
     options: [
-      { label: 'Staging', value: 'staging' },
-      { label: 'Production', value: 'prod' },
+      { label: 'Staging', value: 'staging', description: 'Use the staging workspace first' },
+      { label: 'Production', value: 'prod', description: 'Apply the change immediately to prod' },
     ],
     participantId: 'codex.main',
     taskId: 'task-1',
@@ -467,7 +469,7 @@ describe('activity card action dispatcher', () => {
 });
 
 describe('FloatingActivityCard', () => {
-  it('renders approval actions as Yes, Always, and No buttons', () => {
+  it('renders approval actions using the real card action labels', () => {
     const onApprovalDecision = vi.fn();
 
     render(
@@ -477,13 +479,11 @@ describe('FloatingActivityCard', () => {
       />
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Yes' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Always' }));
-    fireEvent.click(screen.getByRole('button', { name: 'No' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
 
     expect(onApprovalDecision).toHaveBeenNthCalledWith(1, 'yes');
-    expect(onApprovalDecision).toHaveBeenNthCalledWith(2, 'always');
-    expect(onApprovalDecision).toHaveBeenNthCalledWith(3, 'no');
+    expect(onApprovalDecision).toHaveBeenNthCalledWith(2, 'no');
   });
 
   it('renders a manual close button for activity cards', () => {
@@ -554,6 +554,16 @@ describe('FloatingActivityCard', () => {
     expect(screen.getByText('mkdir -p /Users/song/.claude/skills/kai-export-ppt-lite/scripts')).toBeInTheDocument();
   });
 
+  it('renders real approval action labels and normalizes escaped line breaks in approval text', () => {
+    render(<FloatingActivityCard card={makeApprovalCard()} />);
+
+    expect(screen.getByRole('button', { name: '确认删除' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '取消' })).toBeInTheDocument();
+    expect(screen.getByText(/即将删除 workspace 目录下最新文件：/)).toBeInTheDocument();
+    expect(screen.getByText(/aws-freeflow-demo\.svg/)).toBeInTheDocument();
+    expect(screen.queryByText('需要你立即确认这个 agent 意图')).not.toBeInTheDocument();
+  });
+
   it('submits question options immediately on click', () => {
     const onQuestionSelect = vi.fn();
 
@@ -564,10 +574,23 @@ describe('FloatingActivityCard', () => {
       />
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Staging' }));
+    fireEvent.click(screen.getByRole('button', { name: /Staging/ }));
 
-    expect(onQuestionSelect).toHaveBeenCalledWith({ label: 'Staging', value: 'staging' });
+    expect(onQuestionSelect).toHaveBeenCalledWith({
+      label: 'Staging',
+      value: 'staging',
+      description: 'Use the staging workspace first',
+    });
     expect(screen.queryByRole('button', { name: /submit/i })).not.toBeInTheDocument();
+  });
+
+  it('renders question detail text and option descriptions when present', () => {
+    render(<FloatingActivityCard card={makeQuestionCard()} />);
+
+    expect(screen.getByText('Choose a target')).toBeInTheDocument();
+    expect(screen.getByText('Staging is safer for verification before rollout.')).toBeInTheDocument();
+    expect(screen.getByText('Use the staging workspace first')).toBeInTheDocument();
+    expect(screen.getByText('Apply the change immediately to prod')).toBeInTheDocument();
   });
 
   it('reports hover state changes so timers can pause and resume', () => {
@@ -673,7 +696,11 @@ describe('ActivityCardRoute', () => {
 
     expect(onQuestionAction).toHaveBeenCalledWith(
       expect.objectContaining({ kind: 'question', questionId: 'question-1' }),
-      { label: 'Staging', value: 'staging' }
+      {
+        label: 'Staging',
+        value: 'staging',
+        description: 'Use the staging workspace first'
+      }
     );
   });
 
@@ -1237,7 +1264,7 @@ describe('activity-card window routing', () => {
     });
   });
 
-  it('renders the floating activity card route when view=activity-card', async () => {
+  it('reopens the floating activity card route when view=activity-card after clearing the initial empty shell', async () => {
     brokerClientInstance = {
       loadServiceSeed: vi.fn().mockResolvedValue({
         health: { ok: true },
@@ -1311,33 +1338,102 @@ describe('activity-card window routing', () => {
 
     expect(screen.getByText('Deploy approval needed')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Open Main Panel' })).not.toBeInTheDocument();
-    expect(invokeMock).not.toHaveBeenCalledWith('show_activity_card_window');
-    expect(invokeMock).not.toHaveBeenCalledWith('hide_activity_card_window');
+    expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+  });
+
+  it('hides an empty live activity-card window on first boot when broker returns no cards', async () => {
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue(makeSeed()),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    });
+  });
+
+  it('hides the floating activity-card window after approving the last live startup approval', async () => {
+    const projectParticipants = [
+      {
+        participantId: 'codex.main',
+        alias: 'codex4',
+        kind: 'agent',
+        tool: 'codex',
+        metadata: {
+          terminalApp: 'Ghostty',
+          terminalSessionID: 'ghostty-1',
+          projectPath: '/Users/song/projects/hexdeck',
+        },
+        context: { projectName: 'HexDeck' },
+      },
+    ];
+    const serviceSeed = {
+      health: { ok: true },
+      participants: projectParticipants,
+      workStates: [],
+      events: [],
+      approvals: [
+        {
+          approvalId: 'approval-1',
+          taskId: 'task-1',
+          summary: 'Deploy approval needed',
+          decision: 'pending',
+        },
+      ],
+    };
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue(serviceSeed),
+      loadProjectSeed: vi.fn()
+        .mockResolvedValueOnce(serviceSeed)
+        .mockResolvedValueOnce(serviceSeed),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Yes' })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Yes' }));
+
+    await waitFor(() => {
+      expect(brokerClientInstance.respondToApproval).toHaveBeenCalledWith({
+        approvalId: 'approval-1',
+        taskId: 'task-1',
+        fromParticipantId: 'human.local',
+        decision: 'approved',
+        decisionMode: 'yes',
+      });
+    });
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    });
   });
 
   it('shows only the latest highest-priority card when the activity-card window boots with backlog', async () => {
     brokerClientInstance = {
       loadServiceSeed: vi.fn().mockResolvedValue({
-        health: { ok: true },
-        participants: [
-          {
-            participantId: 'codex.main',
-            alias: 'codex4',
-            kind: 'agent',
-            tool: 'codex',
-            metadata: {
-              terminalApp: 'Ghostty',
-              terminalSessionID: 'ghostty-1',
-              projectPath: '/Users/song/projects/hexdeck',
-            },
-            context: { projectName: 'HexDeck' },
-          },
-        ],
-        workStates: [],
-        events: [],
-        approvals: [],
-      }),
-      loadProjectSeed: vi.fn().mockResolvedValue({
         health: { ok: true },
         participants: [
           {
@@ -1397,6 +1493,7 @@ describe('activity-card window routing', () => {
         ],
         approvals: [],
       }),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
       subscribe: vi.fn(() => () => undefined),
       connectRealtime: vi.fn(() => () => undefined),
       respondToApproval: vi.fn().mockResolvedValue(undefined),
@@ -1417,11 +1514,23 @@ describe('activity-card window routing', () => {
     expect(screen.queryByText('Old question')).not.toBeInTheDocument();
   });
 
-  it('scopes floating activity cards to the preferred project instead of the whole service replay', async () => {
+  it('keeps floating activity cards on the all-agent service replay even when a saved project exists', async () => {
     brokerClientInstance = {
       loadServiceSeed: vi.fn().mockResolvedValue({
         health: { ok: true },
         participants: [
+          {
+            participantId: 'claude.other',
+            alias: 'claude7',
+            kind: 'agent',
+            tool: 'claude',
+            metadata: {
+              terminalApp: 'Ghostty',
+              terminalSessionID: 'ghostty-7',
+              projectPath: '/Users/song/projects',
+            },
+            context: { projectName: 'projects' },
+          },
           {
             participantId: 'codex.main',
             alias: 'codex4',
@@ -1439,9 +1548,9 @@ describe('activity-card window routing', () => {
         events: [],
         approvals: [
           {
-            approvalId: 'approval-old',
-            taskId: 'task-old',
-            summary: 'Old service-wide approval',
+            approvalId: 'approval-service',
+            taskId: 'task-service',
+            summary: 'Service-wide approval',
             decision: 'pending',
           },
         ],
@@ -1486,11 +1595,11 @@ describe('activity-card window routing', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText('Project-scoped approval')).toBeInTheDocument();
+      expect(screen.getByText('Service-wide approval')).toBeInTheDocument();
     });
 
-    expect(screen.queryByText('Old service-wide approval')).not.toBeInTheDocument();
-    expect(brokerClientInstance.loadProjectSeed).toHaveBeenCalledWith('HexDeck');
+    expect(screen.queryByText('Project-scoped approval')).not.toBeInTheDocument();
+    expect(brokerClientInstance.loadProjectSeed).not.toHaveBeenCalled();
   });
 
   it('keeps all-project approvals visible when All agents is selected', async () => {
@@ -1568,7 +1677,7 @@ describe('activity-card window routing', () => {
     expect(brokerClientInstance.loadProjectSeed).not.toHaveBeenCalled();
   });
 
-  it('normalizes the preferred project name to the live participant casing before loading the project seed', async () => {
+  it('keeps cross-project completion cards visible even when a saved project exists', async () => {
     loadLocalSettingsMock.mockReturnValue({
       brokerUrl: 'http://broker.test',
       globalShortcut: 'CmdOrCtrl+Shift+H',
@@ -1594,7 +1703,21 @@ describe('activity-card window routing', () => {
           },
         ],
         workStates: [],
-        events: [],
+        events: [
+          {
+            id: 900,
+            type: 'report_progress',
+            taskId: 'task-claude5',
+            threadId: 'thread-claude5',
+            payload: {
+              participantId: 'claude.other',
+              stage: 'completed',
+              body: {
+                summary: 'Claude 7 completed the task',
+              },
+            },
+          },
+        ],
         approvals: [],
       }),
       loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
@@ -1611,8 +1734,9 @@ describe('activity-card window routing', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(brokerClientInstance.loadProjectSeed).toHaveBeenCalledWith('hexdeck');
+      expect(screen.getByText('Claude 7 completed the task')).toBeInTheDocument();
     });
+    expect(brokerClientInstance.loadProjectSeed).not.toHaveBeenCalled();
   });
 
   it('uses the activity-card project query override when running live debug', async () => {

@@ -1,5 +1,10 @@
 import { useEffect } from 'react';
-import type { ActivityCardApprovalProjection, ActivityCardQuestionOption, ActivityCardProjection } from '../../lib/activity-card/types';
+import type {
+  ActivityCardApprovalProjection,
+  ActivityCardQuestionOption,
+  ActivityCardProjection,
+  ActivityCardQuestionProjection
+} from '../../lib/activity-card/types';
 import type { BrokerApprovalDecisionMode } from '../../lib/broker/types';
 import type { JumpTarget } from '../../lib/jump/types';
 
@@ -13,6 +18,14 @@ export interface FloatingActivityCardProps {
   onHoverChange?: (hovered: boolean) => void;
 }
 
+function normalizeCardText(value: string | undefined): string {
+  if (!value) {
+    return '';
+  }
+
+  return value.replace(/\\n/g, '\n').replace(/\/n/g, '\n').trim();
+}
+
 function getJumpLabel(card: ActivityCardProjection): string {
   return `Open agent context for ${card.summary}`;
 }
@@ -20,7 +33,7 @@ function getJumpLabel(card: ActivityCardProjection): string {
 function getCardSupportingText(card: ActivityCardProjection): string {
   switch (card.kind) {
     case 'approval':
-      return card.detailText ?? '需要你立即确认这个 agent 意图';
+      return card.detailText ?? '';
     case 'question':
       return card.prompt;
     case 'completion':
@@ -38,18 +51,36 @@ function getSourceLine(card: ActivityCardProjection): string | null {
 
 function renderApprovalBody(card: ActivityCardApprovalProjection, supportingText: string) {
   const hasCommandBlock = Boolean(card.commandLine || card.commandPreview);
+  const normalizedSupportingText = normalizeCardText(supportingText);
+  const normalizedCommandLine = normalizeCardText(card.commandLine);
+  const normalizedCommandPreview = normalizeCardText(card.commandPreview);
 
   return (
     <>
-      <p className="floating-card__body floating-card__body--approval">{supportingText}</p>
+      {normalizedSupportingText ? (
+        <p className="floating-card__body floating-card__body--approval">{normalizedSupportingText}</p>
+      ) : null}
       {card.commandTitle ? (
         <p className="floating-card__section-label">{card.commandTitle}</p>
       ) : null}
       {hasCommandBlock ? (
         <div className="floating-card__command" aria-label="Approval command preview">
-          {card.commandLine ? <p className="floating-card__command-primary">{card.commandLine}</p> : null}
-          {card.commandPreview ? <p className="floating-card__command-secondary">{card.commandPreview}</p> : null}
+          {normalizedCommandLine ? <p className="floating-card__command-primary">{normalizedCommandLine}</p> : null}
+          {normalizedCommandPreview ? <p className="floating-card__command-secondary">{normalizedCommandPreview}</p> : null}
         </div>
+      ) : null}
+    </>
+  );
+}
+
+function renderQuestionBody(card: ActivityCardQuestionProjection, supportingText: string) {
+  const normalizedSupportingText = normalizeCardText(supportingText);
+  const normalizedDetailText = normalizeCardText(card.detailText);
+  return (
+    <>
+      <p className="floating-card__body">{normalizedSupportingText}</p>
+      {normalizedDetailText ? (
+        <p className="floating-card__body floating-card__body--question-detail">{normalizedDetailText}</p>
       ) : null}
     </>
   );
@@ -58,6 +89,10 @@ function renderApprovalBody(card: ActivityCardApprovalProjection, supportingText
 function renderCardBody(card: ActivityCardProjection, supportingText: string) {
   if (card.kind === 'approval') {
     return renderApprovalBody(card, supportingText);
+  }
+
+  if (card.kind === 'question') {
+    return renderQuestionBody(card, supportingText);
   }
 
   return <p className="floating-card__body">{supportingText}</p>;
@@ -108,9 +143,13 @@ function QuestionActions({
           type="button"
           className="action-button action-button--question"
           disabled={disabled}
+          aria-label={option.label}
           onClick={() => onQuestionSelect?.(option)}
         >
-          {option.label}
+          <span className="action-button__label">{option.label}</span>
+          {option.description ? (
+            <span className="action-button__description">{option.description}</span>
+          ) : null}
         </button>
       ))}
     </div>
@@ -197,13 +236,13 @@ export function FloatingActivityCard({
           aria-label={getJumpLabel(card)}
           onClick={() => onJump?.(card.jumpTarget!)}
         >
-          {sourceLine ? <p className="floating-card__source">{sourceLine}</p> : null}
           {renderCardBody(card, supportingText)}
+          {sourceLine ? <p className="floating-card__source">{sourceLine}</p> : null}
         </button>
       ) : (
         <div className="floating-card__content">
-          {sourceLine ? <p className="floating-card__source">{sourceLine}</p> : null}
           {renderCardBody(card, supportingText)}
+          {sourceLine ? <p className="floating-card__source">{sourceLine}</p> : null}
         </div>
       )}
 

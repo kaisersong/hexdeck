@@ -42,12 +42,14 @@ export interface ActivityCardApprovalProjection extends ActivityCardBaseProjecti
 export interface ActivityCardQuestionOption {
   value: string;
   label: string;
+  description?: string;
 }
 
 export interface ActivityCardQuestionProjection extends ActivityCardBaseProjection {
   kind: 'question';
   questionId: string;
   prompt: string;
+  detailText?: string;
   selectionMode: ActivityCardQuestionSelectionMode;
   options: ActivityCardQuestionOption[];
   taskId?: string;

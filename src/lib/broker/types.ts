@@ -40,6 +40,9 @@ export interface BrokerEvent {
   taskId?: string;
   threadId?: string;
   createdAt?: string;
+  fromParticipantId?: string;
+  fromAlias?: string;
+  fromProjectName?: string;
   payload?: Record<string, unknown>;
 }
 
@@ -49,6 +52,16 @@ export interface BrokerApprovalItem {
   threadId?: string;
   summary?: string;
   decision?: 'approved' | 'denied' | 'pending';
+  participantId?: string;
+  actions?: Array<{
+    label?: string;
+    decisionMode?: BrokerApprovalDecisionMode;
+  }>;
+  detailText?: string;
+  commandTitle?: string;
+  commandLine?: string;
+  commandPreview?: string;
+  body?: Record<string, unknown>;
 }
 
 export type BrokerApprovalDecisionMode = 'yes' | 'always' | 'no';

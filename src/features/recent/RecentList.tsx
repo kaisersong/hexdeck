@@ -15,6 +15,12 @@ export function RecentList({ items }: { items: RecentItemProjection[] }) {
         <ul className="stack-list">
           {items.map((item) => (
             <li key={item.id} className={`stack-card stack-card--${item.priority}`}>
+              {item.actorLabel || item.projectLabel ? (
+                <div className="stack-card__topline">
+                  <strong>{item.actorLabel ?? 'Broker event'}</strong>
+                  {item.projectLabel ? <span>{item.projectLabel}</span> : <span />}
+                </div>
+              ) : null}
               <p className="stack-card__summary">{item.summary}</p>
             </li>
           ))}

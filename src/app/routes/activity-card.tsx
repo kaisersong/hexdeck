@@ -243,6 +243,17 @@ export interface ActivityCardRouteProps {
   onHoverChange?: (hovered: boolean) => void;
 }
 
+function isSuppressedTestApprovalCard(card: ActivityCardProjection | null): boolean {
+  if (!card || card.kind !== 'approval') {
+    return false;
+  }
+
+  const summary = card.summary.trim().toLowerCase();
+  const actorLabel = card.actorLabel?.trim().toLowerCase() ?? '';
+  return summary.startsWith('codex needs approval')
+    || actorLabel.startsWith('@codex');
+}
+
 function DebugMetrics({
   measurement,
   debugInfo,
@@ -335,7 +346,7 @@ export function ActivityCardRoute({
   }, [card, previewCard]);
 
   useEffect(() => {
-    if (previewCard || displayCard || !hasDisplayedBrokerCardRef.current) {
+    if (previewCard || displayCard) {
       return;
     }
 

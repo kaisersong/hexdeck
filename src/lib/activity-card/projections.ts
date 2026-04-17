@@ -49,6 +49,32 @@ function readStringValue(
   return undefined;
 }
 
+function normalizeDisplayText(value: string | undefined): string | undefined {
+  if (!value) {
+    return value;
+  }
+
+  return value
+    .replace(/\\n/g, '\n')
+    .replace(/\/n/g, '\n')
+    .trim();
+}
+
+function readPayloadBody(payload: Record<string, unknown>): Record<string, unknown> | null {
+  if (payload.body && typeof payload.body === 'object' && !Array.isArray(payload.body)) {
+    return payload.body as Record<string, unknown>;
+  }
+
+  return null;
+}
+
+function resolveEventParticipantId(event: ProjectSeed['events'][number], payload: Record<string, unknown>): string | undefined {
+  const body = readPayloadBody(payload);
+  return readStringValue(body, ['participantId'])
+    ?? readStringValue(payload, ['participantId'])
+    ?? (typeof event.fromParticipantId === 'string' ? event.fromParticipantId : undefined);
+}
+
 function normalizeCommandTitle(value: string | undefined): string | undefined {
   if (!value) {
     return undefined;
@@ -87,12 +113,18 @@ function buildApprovalPresentation(
   payload: Record<string, unknown>,
   body: Record<string, unknown> | null
 ): Pick<ActivityCardApprovalProjection, 'detailText' | 'commandTitle' | 'commandLine' | 'commandPreview'> {
-  const detailText = readStringValue(body, ['detailText', 'detail', 'description', 'reason', 'message'])
-    ?? readStringValue(payload, ['detailText', 'detail', 'description', 'reason', 'message']);
-  const commandLine = readStringValue(body, ['commandLine', 'command', 'script', 'shellCommand'])
-    ?? readStringValue(payload, ['commandLine', 'command', 'script', 'shellCommand']);
-  const commandPreview = readStringValue(body, ['commandPreview', 'preview', 'displayCommand'])
-    ?? (commandLine ? commandLine.replace(/^\$\s*/, '') : undefined);
+  const detailText = normalizeDisplayText(
+    readStringValue(body, ['detailText', 'detail', 'description', 'reason', 'message'])
+      ?? readStringValue(payload, ['detailText', 'detail', 'description', 'reason', 'message'])
+  );
+  const commandLine = normalizeDisplayText(
+    readStringValue(body, ['commandLine', 'command', 'script', 'shellCommand'])
+      ?? readStringValue(payload, ['commandLine', 'command', 'script', 'shellCommand'])
+  );
+  const commandPreview = normalizeDisplayText(
+    readStringValue(body, ['commandPreview', 'preview', 'displayCommand'])
+      ?? (commandLine ? commandLine.replace(/^\$\s*/, '') : undefined)
+  );
 
   return {
     detailText,
@@ -132,26 +164,51 @@ function buildParticipantJumpTarget(
 
 function isSingleSelectQuestionPayload(payload: Record<string, unknown>): payload is Record<string, unknown> & {
   selectionMode: 'single-select';
-  options: Array<Record<string, unknown>>;
+  options: unknown[];
 } {
   const selectionMode = payload.selectionMode ?? payload.mode;
   return selectionMode === 'single-select' && Array.isArray(payload.options) && payload.options.length > 0;
 }
 
-function toQuestionOptions(options: Array<Record<string, unknown>>): ActivityCardQuestionOption[] {
+function toQuestionOptions(options: unknown[]): ActivityCardQuestionOption[] {
   return options
     .map((option, index) => {
-      const value = typeof option.value === 'string'
-        ? option.value
-        : typeof option.id === 'string'
-          ? option.id
-          : typeof option.label === 'string'
-            ? option.label
-            : String(index);
-      const label = typeof option.label === 'string' ? option.label : value;
+      if (typeof option === 'string') {
+        return {
+          value: option,
+          label: option,
+        };
+      }
 
-      return { value, label };
-    });
+      if (typeof option !== 'object' || option === null || Array.isArray(option)) {
+        return null;
+      }
+
+      const record = option as Record<string, unknown>;
+      const value = typeof record.value === 'string'
+        ? record.value
+        : typeof record.id === 'string'
+          ? record.id
+          : typeof record.label === 'string'
+            ? record.label
+            : typeof record.title === 'string'
+              ? record.title
+              : String(index);
+      const label = typeof record.label === 'string'
+        ? record.label
+        : typeof record.title === 'string'
+          ? record.title
+          : value;
+      const description = readStringValue(record, ['description', 'detail', 'subtitle', 'helpText']);
+
+      return { value, label, description };
+    })
+    .filter((option): option is ActivityCardQuestionOption => option !== null);
+}
+
+function buildQuestionPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const body = readPayloadBody(payload);
+  return body ? { ...payload, ...body } : payload;
 }
 
 function buildParticipantLabels(
@@ -180,6 +237,14 @@ function buildParticipantLabels(
       ? metadata.terminalApp.trim()
       : undefined,
   };
+}
+
+function isSuppressedApprovalSummary(summary: string | undefined | null): boolean {
+  if (!summary) {
+    return false;
+  }
+
+  return /^codex needs approval\b/i.test(summary.trim());
 }
 
 function normalizeApprovalAction(
@@ -245,33 +310,54 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
       continue;
     }
 
+    const approvalRecord = approval as unknown as Record<string, unknown>;
+    const approvalBody = approval.body && typeof approval.body === 'object' && !Array.isArray(approval.body)
+      ? approval.body as Record<string, unknown>
+      : null;
+    const approvalSummary = normalizeDisplayText(
+      readStringValue(approvalBody, ['summary'])
+        ?? (typeof approval.summary === 'string' ? approval.summary : undefined)
+    ) ?? 'Approval requested';
+    if (isSuppressedApprovalSummary(approvalSummary)) {
+      continue;
+    }
+    const approvalParticipantId = typeof approval.participantId === 'string' ? approval.participantId : undefined;
+    const participantLabels = buildParticipantLabels(approvalParticipantId, participantsById);
+    const jumpTarget = approvalParticipantId ? buildParticipantJumpTarget(approvalParticipantId, participantsById) : null;
+
     approvalCardsById.set(approval.approvalId, {
       cardId: `approval:${approval.approvalId}`,
       kind: 'approval',
       priority: 'critical',
-      summary: approval.summary ?? 'Approval requested',
+      summary: approvalSummary,
       actionMode: 'action',
       approvalId: approval.approvalId,
       taskId: approval.taskId,
       decision: approval.decision ?? 'pending',
-      actions: DEFAULT_APPROVAL_ACTIONS,
+      actions: buildApprovalActions(approvalRecord),
+      ...buildApprovalPresentation(approvalSummary, approvalRecord, approvalBody),
+      participantId: approvalParticipantId,
+      ...participantLabels,
+      jumpTarget,
     } satisfies ActivityCardApprovalProjection);
   }
 
   for (const event of seed.events) {
     const payload = (event.payload ?? {}) as Record<string, unknown>;
-    const participantId = typeof payload.participantId === 'string' ? payload.participantId : undefined;
+    const body = readPayloadBody(payload);
+    const participantId = resolveEventParticipantId(event, payload);
     const participantLabels = buildParticipantLabels(participantId, participantsById);
     const jumpTarget = participantId ? buildParticipantJumpTarget(participantId, participantsById) : null;
 
     if (event.type === 'request_approval') {
       const approvalId = typeof payload.approvalId === 'string' ? payload.approvalId : null;
       const taskId = typeof event.taskId === 'string' ? event.taskId : null;
+      const summary = normalizeDisplayText(String(body?.summary ?? payload.summary ?? 'Approval requested')) ?? 'Approval requested';
+      if (isSuppressedApprovalSummary(summary)) {
+        continue;
+      }
+
       if (approvalId && taskId && !resolvedApprovalIds.has(approvalId) && !approvalCardsById.has(approvalId)) {
-        const body = payload.body && typeof payload.body === 'object' && !Array.isArray(payload.body)
-          ? payload.body as Record<string, unknown>
-          : null;
-        const summary = String(body?.summary ?? payload.summary ?? 'Approval requested');
         approvalCardsById.set(approvalId, {
           cardId: `approval:${approvalId}`,
           kind: 'approval',
@@ -298,10 +384,14 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
       }
     }
 
-    if (event.type === 'ask_clarification' && isSingleSelectQuestionPayload(payload)) {
+    const questionPayload = buildQuestionPayload(payload);
+
+    if (event.type === 'ask_clarification' && isSingleSelectQuestionPayload(questionPayload)) {
       const questionId = `question:${event.id}`;
-      const summary = String(payload.summary ?? payload.prompt ?? 'Clarification requested');
-      const prompt = String(payload.prompt ?? payload.summary ?? 'Clarification requested');
+      const summary = normalizeDisplayText(String(questionPayload.summary ?? questionPayload.prompt ?? 'Clarification requested'))
+        ?? 'Clarification requested';
+      const prompt = normalizeDisplayText(String(questionPayload.prompt ?? questionPayload.summary ?? 'Clarification requested'))
+        ?? 'Clarification requested';
 
       questionCards.push({
         cardId: questionId,
@@ -310,8 +400,9 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
         priority: 'attention',
         summary,
         prompt,
+        detailText: normalizeDisplayText(readStringValue(questionPayload, ['detailText', 'detail', 'description', 'context'])),
         selectionMode: 'single-select',
-        options: toQuestionOptions(payload.options),
+        options: toQuestionOptions(questionPayload.options),
         participantId,
         ...participantLabels,
         jumpTarget,
@@ -328,7 +419,7 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
         cardId: `completion:${event.id}`,
         kind: 'completion',
         priority: 'ambient',
-        summary: String(payload.summary ?? payload.message ?? 'Completed'),
+        summary: normalizeDisplayText(String(body?.summary ?? payload.summary ?? payload.message ?? 'Completed')) ?? 'Completed',
         stage: 'completed',
         participantId,
         ...participantLabels,

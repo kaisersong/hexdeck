@@ -98,6 +98,65 @@ describe('buildActivityCardsFromSeed', () => {
     expect(cards[2].jumpTarget?.participantId).toBe('agent-1');
   });
 
+  it('reads question prompt, detail, options, and sender identity from payload body', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'agent-1',
+          alias: 'claude2',
+          kind: 'agent',
+          tool: 'Claude Code',
+          metadata: {
+            terminalApp: 'Terminal.app',
+          },
+          context: {
+            projectName: 'projects',
+          },
+        },
+      ],
+      workStates: [],
+      events: [
+        {
+          id: 111,
+          type: 'ask_clarification',
+          fromParticipantId: 'agent-1',
+          payload: {
+            body: {
+              summary: '删除文件',
+              prompt: '是否确认永久删除此文件？',
+              detailText: '目标文件：aws-freeflow-demo.svg',
+              selectionMode: 'single-select',
+              options: [
+                { value: 'yes', label: '确认删除', description: '执行 rm /tmp/example.txt' },
+                { value: 'no', label: '取消', description: '保留文件，不执行任何操作' },
+              ],
+            },
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({
+      kind: 'question',
+      summary: '删除文件',
+      prompt: '是否确认永久删除此文件？',
+      detailText: '目标文件：aws-freeflow-demo.svg',
+      actorLabel: '@claude2',
+      projectLabel: 'projects',
+      terminalLabel: 'Terminal.app',
+    });
+    if (cards[0].kind !== 'question') {
+      throw new Error(`expected question card, got ${cards[0].kind}`);
+    }
+    expect(cards[0].options).toEqual([
+      { value: 'yes', label: '确认删除', description: '执行 rm /tmp/example.txt' },
+      { value: 'no', label: '取消', description: '保留文件，不执行任何操作' },
+    ]);
+  });
+
   it('keeps approval, question, and completion grouped even when completion appears before question', () => {
     const cards = buildActivityCardsFromSeed({
       health: { ok: true },
@@ -141,6 +200,46 @@ describe('buildActivityCardsFromSeed', () => {
       selectionMode: 'single-select',
     });
     expect(cards[2].cardId).toBe('completion:302');
+  });
+
+  it('builds a completion card from broker progress events that carry summary text in payload.body', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'agent-1',
+          alias: 'claude5',
+          kind: 'agent',
+          context: {
+            projectName: 'projects',
+          },
+        },
+      ],
+      workStates: [],
+      events: [
+        {
+          id: 900,
+          type: 'report_progress',
+          taskId: 'task-1',
+          payload: {
+            participantId: 'agent-1',
+            stage: 'completed',
+            body: {
+              summary: 'Task complete and ready for review',
+            },
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards).toContainEqual(expect.objectContaining({
+      kind: 'completion',
+      summary: 'Task complete and ready for review',
+      taskId: 'task-1',
+      actorLabel: '@claude5',
+      projectLabel: 'projects',
+    }));
   });
 
   it('preserves distinct question summary and prompt text when both are present', () => {
@@ -286,6 +385,199 @@ describe('buildActivityCardsFromSeed', () => {
         { label: 'Always allow Bash', decisionMode: 'always' },
         { label: 'Deny', decisionMode: 'no' },
       ],
+    }));
+  });
+
+  it('uses real approval actions and presentation fields from pending approval items', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'agent-1',
+          alias: 'claude2',
+          kind: 'agent',
+          tool: 'Claude Code',
+          context: {
+            projectName: 'projects',
+          },
+        },
+      ],
+      workStates: [],
+      events: [],
+      approvals: [
+        {
+          approvalId: 'approval-pending-1',
+          taskId: 'task-pending-1',
+          participantId: 'agent-1',
+          decision: 'pending',
+          summary: '删除文件',
+          actions: [
+            { label: '确认删除', decisionMode: 'yes' },
+            { label: '取消', decisionMode: 'no' },
+          ],
+          body: {
+            detailText: '即将删除最新文件\\n此操作不可逆',
+            commandTitle: 'Delete',
+            commandLine: 'rm /tmp/example.txt',
+          },
+        },
+      ],
+    });
+
+    expect(cards).toContainEqual(expect.objectContaining({
+      kind: 'approval',
+      approvalId: 'approval-pending-1',
+      summary: '删除文件',
+      actorLabel: '@claude2',
+      projectLabel: 'projects',
+      actions: [
+        { label: '确认删除', decisionMode: 'yes' },
+        { label: '取消', decisionMode: 'no' },
+      ],
+      detailText: '即将删除最新文件\n此操作不可逆',
+      commandTitle: 'Delete',
+      commandLine: 'rm /tmp/example.txt',
+    }));
+  });
+
+  it('suppresses generic codex hook approval cards from request_approval events', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'agent-1',
+          alias: 'codex3',
+          kind: 'agent',
+          tool: 'Codex',
+          context: {
+            projectName: 'xiaok-cli',
+          },
+        },
+      ],
+      workStates: [],
+      events: [
+        {
+          id: 552,
+          type: 'request_approval',
+          taskId: 'task-approval-codex',
+          payload: {
+            approvalId: 'approval-codex-noise',
+            participantId: 'agent-1',
+            delivery: {
+              semantic: 'actionable',
+              source: 'codex-hook-approval',
+            },
+            nativeHookApproval: {
+              agentTool: 'codex',
+            },
+            body: {
+              summary: 'Codex needs approval to run Bash.',
+            },
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards).toEqual([]);
+  });
+
+  it('suppresses pending approval items that are codex test noise by summary', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [],
+      workStates: [],
+      events: [],
+      approvals: [
+        {
+          approvalId: 'approval-codex-summary-noise',
+          taskId: 'task-codex-summary-noise',
+          summary: 'Codex needs approval to run Bash.',
+          decision: 'pending',
+        },
+      ],
+    });
+
+    expect(cards).toEqual([]);
+  });
+
+  it('suppresses pending approval items when the generic codex noise only exists in body.summary', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [],
+      workStates: [],
+      events: [],
+      approvals: [
+        {
+          approvalId: 'approval-codex-body-noise',
+          taskId: 'task-codex-body-noise',
+          summary: '',
+          decision: 'pending',
+          body: {
+            summary: 'Codex needs approval to run Bash.',
+          },
+        },
+      ],
+    });
+
+    expect(cards).toEqual([]);
+  });
+
+  it('keeps codex approval cards when the summary is a real user-facing confirmation', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'agent-9',
+          alias: 'codex3',
+          kind: 'agent',
+          tool: 'Codex',
+          context: {
+            projectName: 'xiaok-cli',
+          },
+        },
+      ],
+      workStates: [],
+      events: [
+        {
+          id: 553,
+          type: 'request_approval',
+          taskId: 'task-codex-real',
+          payload: {
+            approvalId: 'approval-codex-real',
+            participantId: 'agent-9',
+            delivery: {
+              semantic: 'actionable',
+              source: 'codex-hook-approval',
+            },
+            nativeHookApproval: {
+              agentTool: 'codex',
+            },
+            body: {
+              summary: '删除最新文件',
+              detailText: '即将删除 workspace 目录下最新文件',
+            },
+            actions: [
+              { label: '确认删除', decisionMode: 'yes' },
+              { label: '取消', decisionMode: 'no' },
+            ],
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards).toContainEqual(expect.objectContaining({
+      kind: 'approval',
+      approvalId: 'approval-codex-real',
+      summary: '删除最新文件',
+      detailText: '即将删除 workspace 目录下最新文件',
+      actions: [
+        { label: '确认删除', decisionMode: 'yes' },
+        { label: '取消', decisionMode: 'no' },
+      ],
+      actorLabel: '@codex3',
+      projectLabel: 'xiaok-cli',
     }));
   });
 

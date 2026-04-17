@@ -262,7 +262,7 @@ export function App() {
   const capabilities = getCapabilityStatus();
   const [settings, setSettings] = useState(() => loadLocalSettings());
   const currentProjectSetting = isActivityCardWindow
-    ? getActivityCardProjectOverride() ?? settings.currentProject
+    ? getActivityCardProjectOverride() ?? ALL_AGENTS_PROJECT
     : settings.currentProject;
   const [snapshot, setSnapshot] = useState<ProjectSnapshotProjection | null>(null);
   const [pendingApprovalIds, setPendingApprovalIds] = useState<Set<string>>(new Set());
@@ -582,6 +582,30 @@ export function App() {
     };
   }, [isExpandedWindow]);
 
+  useEffect(() => {
+    if (windowMode !== 'panel') {
+      return;
+    }
+
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) {
+        return;
+      }
+
+      if (target.closest('.menu-dropdown')) {
+        return;
+      }
+
+      void hidePanelWindow();
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+    };
+  }, [windowMode]);
+
   const handleJump = async (target: JumpTarget) => {
     await jumpToTarget(target);
   };
@@ -752,7 +776,6 @@ export function App() {
     }
   };
 
-  const currentProject = derivePreferredProject(participants, currentProjectSetting);
   const brokerLive = runtimeStatus?.healthy ?? snapshot?.overview.brokerHealthy ?? false;
   const panelSnapshot = snapshot ?? buildEmptySnapshot(participants, brokerLive);
   const activityCardState = store.getState().activityCards;
@@ -799,7 +822,7 @@ export function App() {
         onSectionChange={handleExpandedSectionChange}
         snapshot={snapshot}
         participants={participants}
-        currentProject={currentProject}
+        currentProject={settings.currentProject}
         globalShortcut={settings.globalShortcut}
         connectionState={connectionState}
         connectionMessage={connectionMessage}
@@ -837,7 +860,7 @@ export function App() {
       <PanelRoute
         snapshot={panelSnapshot}
         participants={participants}
-        currentProject={currentProject}
+        currentProject={settings.currentProject}
         brokerLive={brokerLive}
         onJump={handleJump}
         onOpenSettings={() => void openExpandedWindow('settings')}
