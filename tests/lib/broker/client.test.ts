@@ -639,6 +639,113 @@ describe('BrokerClient', () => {
     expect(fakeSocket.close).toHaveBeenCalledTimes(1);
   });
 
+  it('opens the broker websocket inside the Tauri desktop app', () => {
+    const listeners = new Map<string, (event: MessageEvent<string>) => void>();
+    const fakeSocket = {
+      addEventListener: (type: string, handler: (event: MessageEvent<string>) => void) => listeners.set(type, handler),
+      removeEventListener: vi.fn(),
+      close: vi.fn()
+    };
+    const websocketFactory = vi.fn(() => fakeSocket as never);
+
+    Object.defineProperty(window, '__TAURI_INTERNALS__', {
+      configurable: true,
+      value: {},
+    });
+
+    try {
+      const client = new BrokerClient({
+        brokerUrl: 'http://127.0.0.1:4318',
+        fetchImpl: vi.fn() as typeof fetch,
+        websocketFactory
+      });
+
+      const received: Array<{ id: number; type: string }> = [];
+      client.subscribe((event) => received.push({ id: event.id, type: event.type }));
+      const cleanup = client.connectRealtime();
+
+      expect(websocketFactory).toHaveBeenCalledTimes(1);
+      expect(websocketFactory).toHaveBeenCalledWith('ws://127.0.0.1:4318/ws?participantId=human.local');
+
+      listeners.get('message')?.({
+        data: JSON.stringify({ type: 'new_intent', event: { eventId: 3901, kind: 'report_progress' } }),
+      } as MessageEvent<string>);
+
+      expect(received).toEqual([{ id: 3901, type: 'report_progress' }]);
+
+      cleanup();
+      expect(fakeSocket.close).toHaveBeenCalledTimes(1);
+    } finally {
+      delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    }
+  });
+
+  it('registers the local UI participant so broker broadcasts can reach the websocket', () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ participantId: 'human.local' }), { status: 200 }));
+    const fakeSocket = {
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      close: vi.fn()
+    };
+
+    const client = new BrokerClient({
+      brokerUrl: 'http://127.0.0.1:4318',
+      fetchImpl: fetchMock as typeof fetch,
+      websocketFactory: () => fakeSocket as never
+    });
+
+    client.connectRealtime();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:4318/participants/register',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: expect.any(String),
+      })
+    );
+    expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string)).toMatchObject({
+      participantId: 'human.local',
+      alias: 'human',
+      kind: 'human',
+      roles: ['approver'],
+      capabilities: ['activity-card'],
+    });
+  });
+
+  it('uses Tauri invoke to register the local UI participant inside the desktop app', () => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValueOnce(undefined);
+    const fetchMock = vi.fn();
+    const fakeSocket = {
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      close: vi.fn()
+    };
+
+    Object.defineProperty(window, '__TAURI_INTERNALS__', {
+      configurable: true,
+      value: {},
+    });
+
+    try {
+      const client = new BrokerClient({
+        brokerUrl: 'http://127.0.0.1:4318',
+        fetchImpl: fetchMock as typeof fetch,
+        websocketFactory: () => fakeSocket as never
+      });
+
+      client.connectRealtime();
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(invokeMock).toHaveBeenCalledWith('register_broker_ui_participant', {
+        brokerUrl: 'http://127.0.0.1:4318',
+      });
+    } finally {
+      delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    }
+  });
+
   it('does not create duplicate live sockets when connectRealtime is called repeatedly', () => {
     const listeners = new Map<string, (event: MessageEvent<string>) => void>();
     const fakeSocket = {

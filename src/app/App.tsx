@@ -15,6 +15,12 @@ import type {
 } from '../lib/broker/types';
 import type { JumpTarget } from '../lib/jump/types';
 import { buildActivityCardsFromSeed } from '../lib/activity-card/projections';
+import {
+  createHiddenPopupSession,
+  markPopupSessionLocalAction,
+  reconcilePopupSession,
+  type PopupVisibilityIntent,
+} from '../lib/activity-card/popup-session';
 import type { ProjectSnapshotProjection } from '../lib/projections/types';
 import { buildProjectSnapshot } from '../lib/projections/project-snapshot';
 import { getCapabilityStatus } from '../lib/platform/capabilities';
@@ -91,6 +97,25 @@ function getActivityCardProjectOverride(): string | null {
   return matchedProject ? decodeURIComponent(matchedProject).trim() || null : null;
 }
 
+async function debugLogActivityCardFrontend(message: string): Promise<void> {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  const params = new URLSearchParams(window.location.search);
+  const debugEnabled = params.has('debugLive') || params.get('debug') === 'activity-card';
+  if (!debugEnabled) {
+    return;
+  }
+
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('debug_log_activity_card_frontend', { message });
+  } catch {
+    // Ignore when not running in Tauri.
+  }
+}
+
 function buildEmptySnapshot(participants: BrokerParticipant[], brokerHealthy = false): ProjectSnapshotProjection {
   return {
     overview: {
@@ -129,32 +154,62 @@ function derivePreferredProject(participants: BrokerParticipant[], fallback: str
     ?.context?.projectName?.trim() ?? '';
 }
 
-function activityCardPriorityRank(card: ActivityCardProjection): number {
-  switch (card.priority) {
-    case 'critical':
-      return 0;
-    case 'attention':
-      return 1;
-    case 'ambient':
-      return 2;
+const BOOTSTRAP_EPHEMERAL_CARD_FRESHNESS_MS = {
+  question: 60_000,
+  completion: 300_000,
+} as const;
+
+function isBootstrapActivityCardFresh(card: ActivityCardProjection, nowMs: number): boolean {
+  if (card.kind === 'approval') {
+    return true;
   }
+
+  if (typeof card.createdAtMs !== 'number') {
+    return false;
+  }
+
+  return nowMs - card.createdAtMs <= BOOTSTRAP_EPHEMERAL_CARD_FRESHNESS_MS[card.kind];
 }
 
-function pickBootstrapActivityCard(cards: ActivityCardProjection[]): ActivityCardProjection | null {
-  let selectedCard: ActivityCardProjection | null = null;
-  let selectedIndex = -1;
-  let selectedRank = Number.POSITIVE_INFINITY;
-
-  for (const [index, card] of cards.entries()) {
-    const rank = activityCardPriorityRank(card);
-    if (rank < selectedRank || (rank === selectedRank && index > selectedIndex)) {
-      selectedCard = card;
-      selectedIndex = index;
-      selectedRank = rank;
-    }
+function isPanelStartupActivityCardVisible(card: ActivityCardProjection, nowMs: number): boolean {
+  if (card.kind === 'approval') {
+    return true;
   }
 
-  return selectedCard;
+  if (typeof card.createdAtMs !== 'number') {
+    return false;
+  }
+
+  return nowMs - card.createdAtMs <= BOOTSTRAP_EPHEMERAL_CARD_FRESHNESS_MS[card.kind];
+}
+
+const ACTIVITY_CARD_PRIORITY_ORDER: Record<ActivityCardProjection['priority'], number> = {
+  critical: 0,
+  attention: 1,
+  ambient: 2,
+};
+
+function orderPopupSessionCards(cards: ActivityCardProjection[]): ActivityCardProjection[] {
+  return cards
+    .map((card, index) => ({
+      card,
+      index,
+      recencyKey: typeof card.createdAtMs === 'number' ? card.createdAtMs : index,
+    }))
+    .sort((a, b) => {
+      const priorityDelta = ACTIVITY_CARD_PRIORITY_ORDER[a.card.priority] - ACTIVITY_CARD_PRIORITY_ORDER[b.card.priority];
+      if (priorityDelta !== 0) {
+        return priorityDelta;
+      }
+
+      const recencyDelta = b.recencyKey - a.recencyKey;
+      if (recencyDelta !== 0) {
+        return recencyDelta;
+      }
+
+      return a.index - b.index;
+    })
+    .map(({ card }) => card);
 }
 
 export type AppActivityApprovalAction = {
@@ -180,35 +235,17 @@ export interface AppActivityTransportClient {
   answerClarification(input: BrokerClarificationAnswerInput): Promise<void>;
 }
 
-async function loadActivityCardSeed(
-  client: BrokerClient,
-  serviceSeed: ProjectSeed,
-  currentProjectSetting: string
-): Promise<ProjectSeed> {
-  if (currentProjectSetting.trim() === ALL_AGENTS_PROJECT) {
-    return serviceSeed;
+async function syncActivityCardWindowVisibility(
+  card: ActivityCardProjection | null,
+  sourceWindowMode: 'panel' | 'expanded' | 'drag-demo' | 'activity-card'
+): Promise<void> {
+  if (!card || sourceWindowMode === 'activity-card') {
+    return;
   }
 
-  const preferredProject = derivePreferredProject(
-    serviceSeed.participants.filter(isAgentParticipant),
-    currentProjectSetting
-  );
-
-  if (!preferredProject) {
-    return serviceSeed;
-  }
-
-  try {
-    return await client.loadProjectSeed(preferredProject);
-  } catch {
-    return serviceSeed;
-  }
-}
-
-async function syncActivityCardWindowVisibility(card: ActivityCardProjection | null): Promise<void> {
   try {
     const { invoke } = await import('@tauri-apps/api/core');
-    await invoke(card ? 'show_activity_card_window' : 'hide_activity_card_window');
+    await invoke('prepare_activity_card_window');
   } catch {
     // Ignore when not running in Tauri.
   }
@@ -274,55 +311,108 @@ export function App() {
   const [reloadKey, setReloadKey] = useState(0);
   const [, setActivityCardRenderKey] = useState(0);
   const [activityCardDebugInfo, setActivityCardDebugInfo] = useState<ActivityCardDebugInfo | null>(null);
+  const [activityCardWindowIntent, setActivityCardWindowIntent] = useState<PopupVisibilityIntent>('hide');
   const activityCardsBootstrappedRef = useRef(false);
+  const allowImmediateEmptyActivityCardSyncRef = useRef(false);
+  const popupSessionRef = useRef(createHiddenPopupSession());
   const shouldPrimeStartupActivityBacklog = windowMode !== 'activity-card';
 
-  const syncActivityCards = async (cards: ActivityCardProjection[], nowMs: number) => {
+  const syncActivityCards = async (seed: ProjectSeed, cards: ActivityCardProjection[], nowMs: number) => {
     if (!activityCardsBootstrappedRef.current) {
       activityCardsBootstrappedRef.current = true;
 
       if (shouldPrimeStartupActivityBacklog) {
-        const startupApprovalCards = cards.filter((card) => card.kind === 'approval');
-        const passiveStartupCards = cards.filter((card) => card.kind !== 'approval');
+        const startupVisibleCards = cards.filter((card) => isPanelStartupActivityCardVisible(card, nowMs));
+        const passiveStartupCards = cards.filter((card) => !isPanelStartupActivityCardVisible(card, nowMs));
 
         store.primeActivityCards(passiveStartupCards);
 
-        if (startupApprovalCards.length > 0) {
-          store.replaceActivityCards(startupApprovalCards, nowMs);
+        if (startupVisibleCards.length > 0) {
+          store.replaceActivityCards(startupVisibleCards, nowMs);
           setActivityCardRenderKey((value) => value + 1);
-          await syncActivityCardWindowVisibility(store.getState().activityCards.activeCard);
+          await syncActivityCardWindowVisibility(store.getState().activityCards.activeCard, windowMode);
           return;
         }
 
-        await syncActivityCardWindowVisibility(null);
+        await syncActivityCardWindowVisibility(null, windowMode);
         return;
       }
 
-      const bootstrapCard = pickBootstrapActivityCard(cards);
-      const staleCards = bootstrapCard
-        ? cards.filter((card) => card.cardId !== bootstrapCard.cardId)
-        : cards;
+      const orderedCards = orderPopupSessionCards(cards);
+      const bootstrapCandidates = orderedCards.filter((card) => isBootstrapActivityCardFresh(card, nowMs));
+      const staleCards = cards.filter((card) => !bootstrapCandidates.some((candidate) => candidate.cardId === card.cardId));
 
       if (staleCards.length > 0) {
         store.primeActivityCards(staleCards);
       }
 
-      if (bootstrapCard) {
-        store.replaceActivityCards([bootstrapCard], nowMs);
+      const previousActiveCardId = store.getState().activityCards.activeCard?.cardId ?? null;
+      const result = reconcilePopupSession({
+        session: popupSessionRef.current,
+        nextCards: bootstrapCandidates,
+        seed,
+        nowMs,
+      });
+      popupSessionRef.current = result.session;
+      allowImmediateEmptyActivityCardSyncRef.current = false;
+      store.replaceActivityCards(result.cardsForStore, nowMs, {
+        allowPreemption: result.allowPreemption,
+      });
+
+      const nextActiveCard = store.getState().activityCards.activeCard;
+      const nextWindowIntent = nextActiveCard ? result.visibilityIntent : 'hide';
+      if (!nextActiveCard) {
+        popupSessionRef.current = createHiddenPopupSession();
+      }
+      if ((nextActiveCard?.cardId ?? null) !== previousActiveCardId) {
         setActivityCardRenderKey((value) => value + 1);
-        if (windowMode !== 'activity-card') {
-          await syncActivityCardWindowVisibility(bootstrapCard);
-        }
-        return;
+      }
+      setActivityCardWindowIntent(nextWindowIntent);
+      void debugLogActivityCardFrontend(
+        `[app-sync bootstrap] cards=${cards.length} bootstrap=${bootstrapCandidates.length} visibility=${nextWindowIntent} active=${nextActiveCard?.cardId ?? 'null'}`
+      );
+      await syncActivityCardWindowVisibility(nextActiveCard, windowMode);
+      return;
+    }
+
+    if (windowMode === 'activity-card') {
+      const previousActiveCardId = store.getState().activityCards.activeCard?.cardId ?? null;
+      const orderedCards = orderPopupSessionCards(cards);
+      const result = reconcilePopupSession({
+        session: popupSessionRef.current,
+        nextCards: orderedCards,
+        seed,
+        nowMs,
+        allowImmediateEmptySync: allowImmediateEmptyActivityCardSyncRef.current,
+      });
+
+      popupSessionRef.current = result.session;
+      allowImmediateEmptyActivityCardSyncRef.current = false;
+
+      store.replaceActivityCards(result.cardsForStore, nowMs, {
+        allowPreemption: result.allowPreemption,
+      });
+
+      const nextActiveCard = store.getState().activityCards.activeCard;
+      const nextWindowIntent = nextActiveCard ? result.visibilityIntent : 'hide';
+      if (!nextActiveCard) {
+        popupSessionRef.current = createHiddenPopupSession();
+      }
+      if ((nextActiveCard?.cardId ?? null) !== previousActiveCardId) {
+        setActivityCardRenderKey((value) => value + 1);
       }
 
-      if (windowMode !== 'activity-card') {
-        await syncActivityCardWindowVisibility(null);
-      }
+      setActivityCardWindowIntent(nextWindowIntent);
+      void debugLogActivityCardFrontend(
+        `[app-sync live] cards=${cards.length} ordered=${orderedCards.length} visibility=${nextWindowIntent} active=${nextActiveCard?.cardId ?? 'null'}`
+      );
+      await syncActivityCardWindowVisibility(nextActiveCard, windowMode);
       return;
     }
 
     const previousActiveCardId = store.getState().activityCards.activeCard?.cardId ?? null;
+
+    allowImmediateEmptyActivityCardSyncRef.current = false;
 
     store.replaceActivityCards(cards, nowMs);
 
@@ -331,9 +421,7 @@ export function App() {
       setActivityCardRenderKey((value) => value + 1);
     }
 
-    if (windowMode !== 'activity-card') {
-      await syncActivityCardWindowVisibility(nextActiveCard);
-    }
+    await syncActivityCardWindowVisibility(nextActiveCard, windowMode);
   };
 
   useEffect(() => {
@@ -343,6 +431,10 @@ export function App() {
 
     let disposed = false;
     activityCardsBootstrappedRef.current = false;
+    popupSessionRef.current = createHiddenPopupSession();
+    if (isActivityCardWindow) {
+      setActivityCardWindowIntent('hide');
+    }
     const client = new BrokerClient({ brokerUrl: settings.brokerUrl });
     let refreshInFlight = false;
     let refreshQueued = false;
@@ -397,9 +489,9 @@ export function App() {
 
             const nowMs = Date.now();
             const nextSnapshot = buildProjectSnapshot(seed);
-            const activitySeed = await loadActivityCardSeed(client, seed, currentProjectSetting);
+            const activitySeed = seed;
             const activityCards = buildActivityCardsFromSeed(activitySeed);
-            await syncActivityCards(activityCards, nowMs);
+            await syncActivityCards(activitySeed, activityCards, nowMs);
             if (isActivityCardWindow) {
               const activeCard = store.getState().activityCards.activeCard;
               const latestEventId = activitySeed.events.reduce(
@@ -407,7 +499,7 @@ export function App() {
                 0
               );
               setActivityCardDebugInfo({
-                project: derivePreferredProject(activitySeed.participants.filter(isAgentParticipant), currentProjectSetting),
+                project: ALL_AGENTS_PROJECT,
                 cardCount: activityCards.length,
                 activeCardId: activeCard?.cardId ?? null,
                 latestEventId: latestEventId || null,
@@ -464,28 +556,35 @@ export function App() {
     };
 
     void refreshSnapshot();
-    const unsubscribe = client.subscribe(() => {
-      void refreshSnapshot();
-    });
-    const disconnect = client.connectRealtime();
+    const unsubscribe = isActivityCardWindow
+      ? () => undefined
+      : client.subscribe(() => {
+        void refreshSnapshot();
+      });
+    const disconnect = isActivityCardWindow ? () => undefined : client.connectRealtime();
     const intervalId = window.setInterval(() => {
       void refreshSnapshot();
-    }, 5000);
+    }, 1000);
     const handleFocus = () => {
       void refreshSnapshot();
     };
-    window.addEventListener('focus', handleFocus);
-    document.addEventListener('visibilitychange', handleFocus);
+    if (!isActivityCardWindow) {
+      window.addEventListener('focus', handleFocus);
+      document.addEventListener('visibilitychange', handleFocus);
+    }
 
     return () => {
       disposed = true;
+      allowImmediateEmptyActivityCardSyncRef.current = false;
       unsubscribe();
       disconnect();
       window.clearInterval(intervalId);
-      window.removeEventListener('focus', handleFocus);
-      document.removeEventListener('visibilitychange', handleFocus);
+      if (!isActivityCardWindow) {
+        window.removeEventListener('focus', handleFocus);
+        document.removeEventListener('visibilitychange', handleFocus);
+      }
     };
-  }, [currentProjectSetting, isActivityCardPreviewWindow, reloadKey, settings.brokerUrl, store]);
+  }, [currentProjectSetting, isActivityCardPreviewWindow, isActivityCardWindow, reloadKey, settings.brokerUrl, store]);
 
   useEffect(() => {
     if (isActivityCardPreviewWindow) {
@@ -502,9 +601,22 @@ export function App() {
       }
 
       setActivityCardRenderKey((value) => value + 1);
-      if (windowMode !== 'activity-card') {
-        void syncActivityCardWindowVisibility(nextActiveCard);
+      if (windowMode === 'activity-card') {
+        popupSessionRef.current = nextActiveCard
+          ? {
+              visibility: 'visible',
+              activeCard: nextActiveCard,
+              pendingLocalResolutionKey: null,
+            }
+          : createHiddenPopupSession();
+        setActivityCardWindowIntent(nextActiveCard ? 'keep' : 'hide');
+        return;
       }
+
+      if (!nextActiveCard) {
+        return;
+      }
+      void syncActivityCardWindowVisibility(nextActiveCard, windowMode);
     }, 250);
 
     return () => {
@@ -529,9 +641,20 @@ export function App() {
 
         store.dismissActivityCard(Date.now());
         setActivityCardRenderKey((value) => value + 1);
-        if (windowMode !== 'activity-card') {
-          void syncActivityCardWindowVisibility(store.getState().activityCards.activeCard);
+        const nextActiveCard = store.getState().activityCards.activeCard;
+        if (windowMode === 'activity-card') {
+          popupSessionRef.current = nextActiveCard
+            ? {
+                visibility: 'visible',
+                activeCard: nextActiveCard,
+                pendingLocalResolutionKey: null,
+              }
+            : createHiddenPopupSession();
+          setActivityCardWindowIntent(nextActiveCard ? 'keep' : 'hide');
+          return;
         }
+
+        void syncActivityCardWindowVisibility(nextActiveCard, windowMode);
       }))
       .then((unlisten) => {
         dispose = unlisten;
@@ -623,6 +746,11 @@ export function App() {
 
     const activeCardId = store.getState().activityCards.activeCard?.cardId ?? null;
     if (!activeCardId) {
+      if (windowMode === 'activity-card') {
+        allowImmediateEmptyActivityCardSyncRef.current = false;
+        popupSessionRef.current = createHiddenPopupSession();
+        setActivityCardWindowIntent('hide');
+      }
       return;
     }
 
@@ -631,20 +759,26 @@ export function App() {
 
     if (windowMode === 'activity-card') {
       try {
-        const [{ emit }, { invoke }] = await Promise.all([
+        const [{ emit }] = await Promise.all([
           import('@tauri-apps/api/event'),
-          import('@tauri-apps/api/core'),
         ]);
         await emit('activity-card-dismissed', activeCardId);
         const nextActiveCard = store.getState().activityCards.activeCard;
-        await invoke(nextActiveCard ? 'show_activity_card_window' : 'hide_activity_card_window');
+        popupSessionRef.current = nextActiveCard
+          ? {
+              visibility: 'visible',
+              activeCard: nextActiveCard,
+              pendingLocalResolutionKey: null,
+            }
+          : createHiddenPopupSession();
+        setActivityCardWindowIntent(nextActiveCard ? 'keep' : 'hide');
       } catch {
         // Ignore when not running in Tauri.
       }
       return;
     }
 
-    await syncActivityCardWindowVisibility(store.getState().activityCards.activeCard);
+    await syncActivityCardWindowVisibility(store.getState().activityCards.activeCard, windowMode);
   };
 
   const handleActivityCardAction = async (action: AppActivityAction) => {
@@ -653,17 +787,32 @@ export function App() {
     }
 
     const client = new BrokerClient({ brokerUrl: settings.brokerUrl });
+    const activeCard = store.getState().activityCards.activeCard;
     if (action.kind === 'approval') {
       store.startApprovalAction(action.approvalId);
       setPendingApprovalIds(new Set(store.getState().pendingApprovalIds));
     }
 
     try {
+      if (windowMode === 'activity-card' && activeCard) {
+        popupSessionRef.current = markPopupSessionLocalAction(
+          popupSessionRef.current,
+          activeCard
+        );
+        allowImmediateEmptyActivityCardSyncRef.current = true;
+        setActivityCardWindowIntent('keep');
+      }
+
       await dispatchActivityCardAction(client, action);
 
+      if (action.kind === 'question') {
+        store.dismissActivityCard(Date.now());
+        setActivityCardRenderKey((value) => value + 1);
+      }
+
       const seed = await client.loadServiceSeed();
-      const activitySeed = await loadActivityCardSeed(client, seed, currentProjectSetting);
-      await syncActivityCards(buildActivityCardsFromSeed(activitySeed), Date.now());
+      const activitySeed = seed;
+      await syncActivityCards(activitySeed, buildActivityCardsFromSeed(activitySeed), Date.now());
       const nextSnapshot = buildProjectSnapshot(seed);
       store.setSnapshot(nextSnapshot);
       setSnapshot(nextSnapshot);
@@ -779,11 +928,23 @@ export function App() {
   const brokerLive = runtimeStatus?.healthy ?? snapshot?.overview.brokerHealthy ?? false;
   const panelSnapshot = snapshot ?? buildEmptySnapshot(participants, brokerLive);
   const activityCardState = store.getState().activityCards;
+  const activityCardId = activityCardState.activeCard?.cardId ?? null;
+
+  useEffect(() => {
+    if (!isActivityCardWindow) {
+      return;
+    }
+
+    void debugLogActivityCardFrontend(
+      `[app-render] intent=${activityCardWindowIntent} active=${activityCardId ?? 'null'} project=${currentProjectSetting}`
+    );
+  }, [activityCardId, activityCardWindowIntent, currentProjectSetting, isActivityCardWindow]);
 
   if (isActivityCardWindow) {
     return (
       <ActivityCardRoute
         card={activityCardState.activeCard}
+        windowVisibility={activityCardWindowIntent}
         pendingApprovalIds={pendingApprovalIds}
         debugInfo={activityCardDebugInfo}
         onDismiss={() => void handleDismissActivityCard()}

@@ -8,8 +8,8 @@ const PRIORITY_ORDER: Record<ActivityCardPriority, number> = {
 
 const CARD_DURATION_MS = {
   approval: null,
-  question: 6_000,
-  completion: 3_000,
+  question: 12_000,
+  completion: 12_000,
 } as const;
 
 export interface ActivityCardRuntimeState {
@@ -22,10 +22,14 @@ export interface ActivityCardRuntimeState {
   pausedRemainingMs: number | null;
 }
 
+export interface ReplaceQueueOptions {
+  allowPreemption?: boolean;
+}
+
 export interface ActivityCardStore {
   getState(): ActivityCardRuntimeState;
   primeExisting(cards: ActivityCardProjection[]): void;
-  replaceQueue(cards: ActivityCardProjection[], nowMs: number): void;
+  replaceQueue(cards: ActivityCardProjection[], nowMs: number, options?: ReplaceQueueOptions): void;
   setHovered(hovered: boolean, nowMs: number): void;
   tick(nowMs: number): void;
   dismissActiveCard(nowMs: number): void;
@@ -41,10 +45,8 @@ function getCardIdentity(card: ActivityCardProjection): string {
       return `approval:${card.approvalId}`;
     case 'question':
       return `question:${card.questionId}`;
-    case 'completion': {
-      const stableIdentity = card.taskId ?? card.threadId ?? card.cardId;
-      return `completion:${stableIdentity}`;
-    }
+    case 'completion':
+      return `completion:${card.cardId}`;
   }
 }
 
@@ -169,23 +171,32 @@ export function createActivityCardStore(): ActivityCardStore {
       state.queue = [];
       clearActiveCardState();
     },
-    replaceQueue(cards, nowMs) {
+    replaceQueue(cards, nowMs, options = {}) {
       const latestQueue = buildLatestQueue(cards);
       const activeIdentity = getActiveIdentity();
       const activeCard = activeIdentity ? latestQueue.get(activeIdentity) ?? null : null;
+      const sortedEntries = getSortedQueueEntries(latestQueue);
 
       if (activeCard) {
-        latestQueue.delete(activeIdentity as string);
-        state.activeCard = activeCard;
-        state.queue = getSortedQueueEntries(latestQueue).map(({ card }) => card);
-        return;
+        const strongestCandidate = sortedEntries[0]?.card ?? null;
+        const shouldKeepActive = !options.allowPreemption
+          || !strongestCandidate
+          || PRIORITY_ORDER[strongestCandidate.priority] >= PRIORITY_ORDER[activeCard.priority]
+          || getCardIdentity(strongestCandidate) === activeIdentity;
+
+        if (shouldKeepActive) {
+          latestQueue.delete(activeIdentity as string);
+          state.activeCard = activeCard;
+          state.queue = getSortedQueueEntries(latestQueue).map(({ card }) => card);
+          return;
+        }
       }
 
       if (state.activeCard) {
         clearActiveCardState();
       }
 
-      state.queue = getSortedQueueEntries(latestQueue).map(({ card }) => card);
+      state.queue = sortedEntries.map(({ card }) => card);
       promoteNextQueuedCard(nowMs);
     },
     setHovered(hovered, nowMs) {

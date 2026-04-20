@@ -49,22 +49,32 @@ function extractProjectLabel(event: BrokerEvent): string | undefined {
   return typeof projectName === 'string' && projectName.trim() ? projectName.trim() : undefined;
 }
 
-function isHookApprovalNoise(event: BrokerEvent): boolean {
+function isInternalApprovalNoise(event: BrokerEvent): boolean {
   const delivery = event.payload?.delivery;
   const approvalId = event.payload?.approvalId;
+  const nativeCodexApproval = event.payload?.nativeCodexApproval;
+  const nativeHookApproval = event.payload?.nativeHookApproval;
 
   if (delivery && typeof delivery === 'object' && !Array.isArray(delivery)) {
     const deliveryRecord = delivery as Record<string, unknown>;
-    if (deliveryRecord.source === 'codex-hook-approval') {
+    if (deliveryRecord.source === 'codex-hook-approval' || deliveryRecord.source === 'codex-native-approval') {
       return true;
     }
   }
 
-  if (typeof approvalId === 'string' && approvalId.startsWith('codex-hook-')) {
+  if (
+    (nativeCodexApproval && typeof nativeCodexApproval === 'object')
+    || (nativeHookApproval && typeof nativeHookApproval === 'object')
+  ) {
     return true;
   }
 
-  return typeof event.taskId === 'string' && event.taskId.startsWith('codex-hook-approval-');
+  if (typeof approvalId === 'string' && (approvalId.startsWith('codex-hook-') || approvalId.startsWith('codex-native-call_'))) {
+    return true;
+  }
+
+  return typeof event.taskId === 'string'
+    && (event.taskId.startsWith('codex-hook-approval-') || event.taskId.startsWith('codex-native-call_'));
 }
 
 export function buildRecentFeed(events: BrokerEvent[]): RecentItemProjection[] {
@@ -72,7 +82,7 @@ export function buildRecentFeed(events: BrokerEvent[]): RecentItemProjection[] {
   let lastSignature = '';
 
   for (const event of events) {
-    if (isHookApprovalNoise(event)) {
+    if (isInternalApprovalNoise(event)) {
       continue;
     }
 

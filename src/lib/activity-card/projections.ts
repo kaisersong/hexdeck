@@ -60,6 +60,50 @@ function normalizeDisplayText(value: string | undefined): string | undefined {
     .trim();
 }
 
+function splitLongDisplayText(value: string | undefined, fallbackSummary: string): { summary: string; detailText?: string } {
+  const normalized = normalizeDisplayText(value);
+  if (!normalized) {
+    return { summary: fallbackSummary };
+  }
+
+  const lines = normalized.split('\n').map((line) => line.trim()).filter(Boolean);
+  if (lines.length > 1) {
+    return {
+      summary: lines[0],
+      detailText: lines.slice(1).join('\n'),
+    };
+  }
+
+  if (normalized.length <= 96) {
+    return { summary: normalized };
+  }
+
+  const sentenceMatch = normalized.match(/^(.{24,96}?[。.!?？])\s*(.+)$/s);
+  if (sentenceMatch) {
+    return {
+      summary: sentenceMatch[1].trim(),
+      detailText: sentenceMatch[2].trim(),
+    };
+  }
+
+  return {
+    summary: `${normalized.slice(0, 93).trimEnd()}...`,
+    detailText: normalized,
+  };
+}
+
+function parseEventCreatedAtMs(event: ProjectSeed['events'][number]): number | undefined {
+  if (typeof event.createdAt !== 'string') {
+    return undefined;
+  }
+
+  const normalizedCreatedAt = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(event.createdAt)
+    ? `${event.createdAt.replace(' ', 'T')}Z`
+    : event.createdAt;
+  const createdAtMs = Date.parse(normalizedCreatedAt);
+  return Number.isFinite(createdAtMs) ? createdAtMs : undefined;
+}
+
 function readPayloadBody(payload: Record<string, unknown>): Record<string, unknown> | null {
   if (payload.body && typeof payload.body === 'object' && !Array.isArray(payload.body)) {
     return payload.body as Record<string, unknown>;
@@ -111,11 +155,13 @@ function deriveApprovalCommandTitle(
 function buildApprovalPresentation(
   summary: string,
   payload: Record<string, unknown>,
-  body: Record<string, unknown> | null
+  body: Record<string, unknown> | null,
+  summaryDetailText?: string
 ): Pick<ActivityCardApprovalProjection, 'detailText' | 'commandTitle' | 'commandLine' | 'commandPreview'> {
   const detailText = normalizeDisplayText(
     readStringValue(body, ['detailText', 'detail', 'description', 'reason', 'message'])
       ?? readStringValue(payload, ['detailText', 'detail', 'description', 'reason', 'message'])
+      ?? summaryDetailText
   );
   const commandLine = normalizeDisplayText(
     readStringValue(body, ['commandLine', 'command', 'script', 'shellCommand'])
@@ -211,6 +257,29 @@ function buildQuestionPayload(payload: Record<string, unknown>): Record<string, 
   return body ? { ...payload, ...body } : payload;
 }
 
+function getQuestionIdentity(payload: Record<string, unknown>, eventId: number): string {
+  const mergedPayload = buildQuestionPayload(payload);
+  const explicitQuestionId = readStringValue(mergedPayload, ['questionId', 'clarificationId']);
+  return explicitQuestionId ? `question:${explicitQuestionId}` : `question:${eventId}`;
+}
+
+function getQuestionResolutionEventKey(
+  event: ProjectSeed['events'][number],
+  payload: Record<string, unknown>
+): string | null {
+  const mergedPayload = buildQuestionPayload(payload);
+  const explicitQuestionId = readStringValue(mergedPayload, ['questionId', 'clarificationId']);
+  if (explicitQuestionId) {
+    return `question:${explicitQuestionId}`;
+  }
+
+  return getTaskThreadResolutionKey(event);
+}
+
+function getCompletionResolutionKey(event: Pick<ProjectSeed['events'][number], 'id'>): string {
+  return `completion:${event.id}`;
+}
+
 function buildParticipantLabels(
   participantId: string | undefined,
   participantsById: Map<string, ProjectSeed['participants'][number]>
@@ -245,6 +314,32 @@ function isSuppressedApprovalSummary(summary: string | undefined | null): boolea
   }
 
   return /^codex needs approval\b/i.test(summary.trim());
+}
+
+function isSuppressedApprovalIdentity(approvalId: string | null | undefined, taskId: string | null | undefined): boolean {
+  return Boolean(
+    approvalId?.startsWith('preview-approval-')
+      || taskId?.startsWith('preview-task-')
+  );
+}
+
+function isSuppressedInternalApprovalNoise(
+  source: Record<string, unknown> | null | undefined,
+  approvalId: string | null | undefined,
+  taskId: string | null | undefined
+): boolean {
+  const delivery = source?.delivery;
+  if (delivery && typeof delivery === 'object' && !Array.isArray(delivery)) {
+    const deliverySource = (delivery as Record<string, unknown>).source;
+    if (deliverySource === 'codex-native-approval') {
+      return true;
+    }
+  }
+
+  return Boolean(
+    approvalId?.startsWith('codex-native-call_')
+      || taskId?.startsWith('codex-native-call_')
+  );
 }
 
 function normalizeApprovalAction(
@@ -297,6 +392,27 @@ function buildApprovalActions(payload: Record<string, unknown> | null | undefine
   return DEFAULT_APPROVAL_ACTIONS;
 }
 
+function getTaskThreadResolutionKey(event: Pick<ProjectSeed['events'][number], 'taskId' | 'threadId'>): string | null {
+  if (event.taskId && event.threadId) {
+    return `task-thread:${event.taskId}:${event.threadId}`;
+  }
+
+  if (event.taskId) {
+    return `task:${event.taskId}`;
+  }
+
+  if (event.threadId) {
+    return `thread:${event.threadId}`;
+  }
+
+  return null;
+}
+
+function isCompletedProgressEvent(event: ProjectSeed['events'][number]): boolean {
+  const payload = (event.payload ?? {}) as Record<string, unknown>;
+  return event.type === 'report_progress' && payload.stage === 'completed';
+}
+
 export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProjection[] {
   const participantsById = new Map(seed.participants.map((participant) => [participant.participantId, participant]));
   const approvalCards: ActivityCardApprovalProjection[] = [];
@@ -304,6 +420,32 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
   const completionCards: ActivityCardCompletionProjection[] = [];
   const approvalCardsById = new Map<string, ActivityCardApprovalProjection>();
   const resolvedApprovalIds = new Set<string>();
+  const questionResolutionEventIdByKey = new Map<string, number>();
+  const completedTaskKeys = new Set<string>();
+
+  for (const event of seed.events) {
+    const resolutionKey = getTaskThreadResolutionKey(event);
+    const payload = (event.payload ?? {}) as Record<string, unknown>;
+
+    if (event.type === 'answer_clarification') {
+      const questionResolutionKey = getQuestionResolutionEventKey(event, payload);
+      if (questionResolutionKey) {
+        questionResolutionEventIdByKey.set(
+          questionResolutionKey,
+          Math.max(questionResolutionEventIdByKey.get(questionResolutionKey) ?? 0, event.id)
+        );
+      }
+    } else if (event.type === 'report_progress' && resolutionKey) {
+      questionResolutionEventIdByKey.set(
+        resolutionKey,
+        Math.max(questionResolutionEventIdByKey.get(resolutionKey) ?? 0, event.id)
+      );
+    }
+
+    if (resolutionKey && isCompletedProgressEvent(event)) {
+      completedTaskKeys.add(resolutionKey);
+    }
+  }
 
   for (const approval of seed.approvals) {
     if ((approval.decision ?? 'pending') !== 'pending') {
@@ -314,19 +456,32 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
     const approvalBody = approval.body && typeof approval.body === 'object' && !Array.isArray(approval.body)
       ? approval.body as Record<string, unknown>
       : null;
-    const approvalSummary = normalizeDisplayText(
+    const approvalDisplay = splitLongDisplayText(
       readStringValue(approvalBody, ['summary'])
         ?? (typeof approval.summary === 'string' ? approval.summary : undefined)
-    ) ?? 'Approval requested';
+        ?? 'Approval requested',
+      'Approval requested'
+    );
+    const approvalSummary = approvalDisplay.summary;
     if (isSuppressedApprovalSummary(approvalSummary)) {
       continue;
     }
     const approvalParticipantId = typeof approval.participantId === 'string' ? approval.participantId : undefined;
+    const approvalResolutionKey = getTaskThreadResolutionKey(approval);
+    if (
+      isSuppressedApprovalIdentity(approval.approvalId, approval.taskId)
+      || isSuppressedInternalApprovalNoise(approvalRecord, approval.approvalId, approval.taskId)
+      || (approvalResolutionKey !== null && completedTaskKeys.has(approvalResolutionKey))
+    ) {
+      continue;
+    }
+
     const participantLabels = buildParticipantLabels(approvalParticipantId, participantsById);
     const jumpTarget = approvalParticipantId ? buildParticipantJumpTarget(approvalParticipantId, participantsById) : null;
 
     approvalCardsById.set(approval.approvalId, {
       cardId: `approval:${approval.approvalId}`,
+      resolutionKey: `approval:${approval.approvalId}`,
       kind: 'approval',
       priority: 'critical',
       summary: approvalSummary,
@@ -335,7 +490,7 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
       taskId: approval.taskId,
       decision: approval.decision ?? 'pending',
       actions: buildApprovalActions(approvalRecord),
-      ...buildApprovalPresentation(approvalSummary, approvalRecord, approvalBody),
+      ...buildApprovalPresentation(approvalSummary, approvalRecord, approvalBody, approvalDisplay.detailText),
       participantId: approvalParticipantId,
       ...participantLabels,
       jumpTarget,
@@ -348,18 +503,27 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
     const participantId = resolveEventParticipantId(event, payload);
     const participantLabels = buildParticipantLabels(participantId, participantsById);
     const jumpTarget = participantId ? buildParticipantJumpTarget(participantId, participantsById) : null;
+    const createdAtMs = parseEventCreatedAtMs(event);
 
     if (event.type === 'request_approval') {
       const approvalId = typeof payload.approvalId === 'string' ? payload.approvalId : null;
       const taskId = typeof event.taskId === 'string' ? event.taskId : null;
-      const summary = normalizeDisplayText(String(body?.summary ?? payload.summary ?? 'Approval requested')) ?? 'Approval requested';
-      if (isSuppressedApprovalSummary(summary)) {
+      const approvalDisplay = splitLongDisplayText(String(body?.summary ?? payload.summary ?? 'Approval requested'), 'Approval requested');
+      const summary = approvalDisplay.summary;
+      const approvalResolutionKey = getTaskThreadResolutionKey(event);
+      if (
+        isSuppressedApprovalSummary(summary)
+        || isSuppressedApprovalIdentity(approvalId, taskId)
+        || isSuppressedInternalApprovalNoise(payload, approvalId, taskId)
+        || (approvalResolutionKey !== null && completedTaskKeys.has(approvalResolutionKey))
+      ) {
         continue;
       }
 
       if (approvalId && taskId && !resolvedApprovalIds.has(approvalId) && !approvalCardsById.has(approvalId)) {
         approvalCardsById.set(approvalId, {
           cardId: `approval:${approvalId}`,
+          resolutionKey: `approval:${approvalId}`,
           kind: 'approval',
           priority: 'critical',
           summary,
@@ -368,7 +532,7 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
           taskId,
           decision: 'pending',
           actions: buildApprovalActions(payload),
-          ...buildApprovalPresentation(summary, payload, body),
+          ...buildApprovalPresentation(summary, payload, body, approvalDisplay.detailText),
           participantId,
           ...participantLabels,
           jumpTarget,
@@ -387,19 +551,34 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
     const questionPayload = buildQuestionPayload(payload);
 
     if (event.type === 'ask_clarification' && isSingleSelectQuestionPayload(questionPayload)) {
-      const questionId = `question:${event.id}`;
+      const questionIdentity = getQuestionIdentity(payload, event.id);
+      const coarseQuestionKey = getTaskThreadResolutionKey(event);
+      if ((questionResolutionEventIdByKey.get(questionIdentity) ?? 0) > event.id) {
+        continue;
+      }
+
+      if (
+        questionIdentity === `question:${event.id}`
+        && (questionResolutionEventIdByKey.get(coarseQuestionKey ?? '') ?? 0) > event.id
+      ) {
+        continue;
+      }
+
+      const questionId = questionIdentity;
       const summary = normalizeDisplayText(String(questionPayload.summary ?? questionPayload.prompt ?? 'Clarification requested'))
         ?? 'Clarification requested';
       const prompt = normalizeDisplayText(String(questionPayload.prompt ?? questionPayload.summary ?? 'Clarification requested'))
         ?? 'Clarification requested';
 
       questionCards.push({
-        cardId: questionId,
+        cardId: `question:${event.id}`,
         questionId,
+        resolutionKey: questionIdentity,
         kind: 'question',
         priority: 'attention',
         summary,
         prompt,
+        createdAtMs,
         detailText: normalizeDisplayText(readStringValue(questionPayload, ['detailText', 'detail', 'description', 'context'])),
         selectionMode: 'single-select',
         options: toQuestionOptions(questionPayload.options),
@@ -415,11 +594,16 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
       event.type === 'report_progress'
       && payload.stage === 'completed'
     ) {
+      const completionText = normalizeDisplayText(String(body?.summary ?? payload.summary ?? payload.message ?? 'Completed')) ?? 'Completed';
+      const completionDisplay = splitLongDisplayText(completionText, 'Completed');
       completionCards.push({
         cardId: `completion:${event.id}`,
+        resolutionKey: getCompletionResolutionKey(event),
         kind: 'completion',
         priority: 'ambient',
-        summary: normalizeDisplayText(String(body?.summary ?? payload.summary ?? payload.message ?? 'Completed')) ?? 'Completed',
+        summary: completionDisplay.summary,
+        detailText: completionDisplay.detailText,
+        createdAtMs,
         stage: 'completed',
         participantId,
         ...participantLabels,

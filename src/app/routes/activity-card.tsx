@@ -5,7 +5,6 @@ import type { JumpTarget } from '../../lib/jump/types';
 import { FloatingActivityCard } from '../../features/activity-card/FloatingActivityCard';
 
 const ACTIVITY_CARD_WINDOW_WIDTH = 680;
-const ACTIVITY_CARD_EMPTY_HEIGHT = 152;
 const ACTIVITY_CARD_MIN_HEIGHTS = {
   approval: 336,
   question: 232,
@@ -44,11 +43,7 @@ export interface ActivityCardDebugInfo {
   error: string | null;
 }
 
-function getEstimatedWindowHeightForCard(card: ActivityCardProjection | null): number {
-  if (!card) {
-    return ACTIVITY_CARD_EMPTY_HEIGHT;
-  }
-
+function getEstimatedWindowHeightForCard(card: ActivityCardProjection): number {
   return ACTIVITY_CARD_MIN_HEIGHTS[card.kind];
 }
 
@@ -56,9 +51,9 @@ function clampActivityCardHeight(height: number, minHeight: number): number {
   return Math.min(Math.max(height, minHeight), ACTIVITY_CARD_MAX_HEIGHT);
 }
 
-function getMeasuredWindowHeight(shell: HTMLElement | null, card: ActivityCardProjection | null): ActivityCardMeasurement {
+function getMeasuredWindowHeight(shell: HTMLElement | null, card: ActivityCardProjection): ActivityCardMeasurement {
   const estimatedHeight = getEstimatedWindowHeightForCard(card);
-  if (!shell || !card) {
+  if (!shell) {
     return {
       shellHeight: 0,
       cardHeight: 0,
@@ -160,6 +155,7 @@ function getPreviewCard(): ActivityCardProjection | null {
   if (preview === 'question') {
     return {
       cardId: 'preview:question',
+      resolutionKey: 'question:preview-question',
       kind: 'question',
       priority: 'attention',
       summary: 'Which target should I use?',
@@ -182,6 +178,7 @@ function getPreviewCard(): ActivityCardProjection | null {
   if (preview === 'completion') {
     return {
       cardId: 'preview:completion',
+      resolutionKey: 'completion:preview-completion',
       kind: 'completion',
       priority: 'ambient',
       summary: 'Completed rollout tracking slice.',
@@ -197,6 +194,7 @@ function getPreviewCard(): ActivityCardProjection | null {
 
   return {
     cardId: 'preview:approval',
+    resolutionKey: 'approval:preview-approval',
     kind: 'approval',
     priority: 'critical',
     summary: 'Claude wants to run Bash.',
@@ -232,8 +230,28 @@ function getActivityCardDebugMode(): boolean {
     || (Boolean((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV) && params.get('view') === 'activity-card');
 }
 
+async function debugLogActivityCardFrontend(message: string): Promise<void> {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  const params = new URLSearchParams(window.location.search);
+  const debugEnabled = params.has('debugLive') || params.get('debug') === 'activity-card';
+  if (!debugEnabled) {
+    return;
+  }
+
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('debug_log_activity_card_frontend', { message });
+  } catch {
+    // Ignore when not running in Tauri.
+  }
+}
+
 export interface ActivityCardRouteProps {
   card: ActivityCardProjection | null;
+  windowVisibility?: 'hide' | 'keep' | 'show';
   pendingApprovalIds?: Set<string>;
   debugInfo?: ActivityCardDebugInfo | null;
   onApprovalAction?: (card: ActivityCardApprovalProjection, decisionMode: BrokerApprovalDecisionMode) => void;
@@ -305,6 +323,7 @@ function DebugMetrics({
 
 export function ActivityCardRoute({
   card,
+  windowVisibility = card ? 'show' : 'hide',
   pendingApprovalIds,
   debugInfo,
   onApprovalAction,
@@ -318,9 +337,10 @@ export function ActivityCardRoute({
   const showDebugMetrics = useMemo(() => Boolean(previewCard) || getActivityCardDebugMode(), [previewCard]);
   const displayCard = previewCard ?? card;
   const compactDebugMetrics = !previewCard && showDebugMetrics;
-  const hasDisplayedBrokerCardRef = useRef(false);
   const hasHiddenActivityCardWindowRef = useRef(false);
+  const hasShownActivityCardWindowRef = useRef(false);
   const [measurement, setMeasurement] = useState<ActivityCardMeasurement | null>(null);
+  const displayCardId = displayCard?.cardId ?? null;
 
   useEffect(() => {
     document.body.classList.add('activity-card-window');
@@ -340,32 +360,53 @@ export function ActivityCardRoute({
   }, [previewCard]);
 
   useEffect(() => {
-    if (!previewCard && card) {
-      hasDisplayedBrokerCardRef.current = true;
-    }
-  }, [card, previewCard]);
+    void debugLogActivityCardFrontend(
+      `[route-render] visibility=${windowVisibility} card=${card?.cardId ?? 'null'} preview=${previewCard?.cardId ?? 'null'} display=${displayCardId ?? 'null'}`
+    );
+  }, [card?.cardId, displayCardId, previewCard?.cardId, windowVisibility]);
 
   useEffect(() => {
-    if (previewCard || displayCard) {
+    if (previewCard || windowVisibility !== 'hide') {
       return;
     }
 
     hasHiddenActivityCardWindowRef.current = true;
-    void import('@tauri-apps/api/core')
-      .then(({ invoke }) => invoke('hide_activity_card_window'))
+    void debugLogActivityCardFrontend(
+      `[route-hide] visibility=${windowVisibility} display=${displayCardId ?? 'null'}`
+    );
+    void Promise.all([
+      import('@tauri-apps/api/core'),
+      import('@tauri-apps/api/window'),
+    ])
+      .then(async ([{ invoke }, { getCurrentWindow }]) => {
+        await Promise.resolve(invoke('hide_activity_card_window')).catch(() => undefined);
+        await getCurrentWindow().hide().catch(() => undefined);
+      })
       .catch(() => undefined);
-  }, [displayCard, previewCard]);
+  }, [previewCard, windowVisibility]);
 
   useEffect(() => {
-    if (previewCard || !displayCard || !hasHiddenActivityCardWindowRef.current) {
+    if (previewCard || windowVisibility === 'hide' || !displayCard) {
+      return;
+    }
+
+    const shouldShow = windowVisibility === 'show'
+      ? !hasShownActivityCardWindowRef.current || hasHiddenActivityCardWindowRef.current
+      : hasHiddenActivityCardWindowRef.current;
+
+    if (!shouldShow) {
       return;
     }
 
     hasHiddenActivityCardWindowRef.current = false;
+    hasShownActivityCardWindowRef.current = true;
+    void debugLogActivityCardFrontend(
+      `[route-show] visibility=${windowVisibility} display=${displayCardId ?? 'null'} hiddenSeen=${hasHiddenActivityCardWindowRef.current}`
+    );
     void import('@tauri-apps/api/core')
       .then(({ invoke }) => invoke('show_activity_card_window'))
       .catch(() => undefined);
-  }, [displayCard, previewCard]);
+  }, [displayCard, displayCardId, previewCard, windowVisibility]);
 
   useLayoutEffect(() => {
     let cancelled = false;
@@ -385,6 +426,9 @@ export function ActivityCardRoute({
           import('@tauri-apps/api/dpi'),
         ]);
         const currentWindow = getCurrentWindow();
+        if (!displayCard) {
+          return;
+        }
         const nextMeasurement = getMeasuredWindowHeight(shellRef.current, displayCard);
         const nativeResizeMeasurement = parseNativeActivityCardMeasurement(
           await Promise.resolve(
@@ -415,6 +459,11 @@ export function ActivityCardRoute({
         // Ignore when not running in Tauri.
       }
     };
+
+    if (!displayCard) {
+      setMeasurement(null);
+      return;
+    }
 
     const scheduleWindowSizeSync = () => {
       if (cancelled) {
@@ -465,18 +514,7 @@ export function ActivityCardRoute({
   }, [displayCard]);
 
   if (!displayCard) {
-    return (
-      <main
-        ref={shellRef}
-        className="activity-card-shell activity-card-shell--empty"
-        style={ACTIVITY_CARD_SHELL_STYLE}
-        aria-label="activity-card"
-      >
-        {showDebugMetrics ? (
-          <DebugMetrics measurement={measurement} debugInfo={debugInfo} compact={compactDebugMetrics} />
-        ) : null}
-      </main>
-    );
+    return null;
   }
 
   return (

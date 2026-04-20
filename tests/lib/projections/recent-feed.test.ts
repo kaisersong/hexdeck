@@ -68,4 +68,40 @@ describe('buildRecentFeed', () => {
       }),
     ]);
   });
+
+  it('drops codex native approval noise so other agent updates stay visible', () => {
+    const recent = buildRecentFeed([
+      {
+        id: 11,
+        type: 'request_approval',
+        taskId: 'codex-native-call_1',
+        payload: {
+          approvalId: 'codex-native-call_1',
+          delivery: { source: 'codex-native-approval' },
+          nativeCodexApproval: { callId: 'call_1' },
+          body: {
+            summary: 'Do you want to let me stop the stalled npm smoke-test install so I can rerun it against the official npm registry?',
+          },
+        },
+      },
+      {
+        id: 12,
+        type: 'report_progress',
+        fromAlias: 'xiaok',
+        fromProjectName: 'xiaok-cli',
+        payload: {
+          participantId: 'xiaok-code-session-1',
+          body: { summary: 'Xiaok finished the export task.' },
+        },
+      },
+    ]);
+
+    expect(recent).toEqual([
+      expect.objectContaining({
+        actorLabel: '@xiaok',
+        projectLabel: 'xiaok-cli',
+        summary: 'Xiaok finished the export task.',
+      }),
+    ]);
+  });
 });

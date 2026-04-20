@@ -20,6 +20,16 @@ interface BrokerClientOptions {
 type BrokerEventListener = (event: BrokerEvent) => void;
 const REPLAY_PAGE_SIZE = 100;
 const BROKER_UI_PARTICIPANT_ID = 'human.local';
+const BROKER_UI_PARTICIPANT = {
+  participantId: BROKER_UI_PARTICIPANT_ID,
+  alias: 'human',
+  kind: 'human',
+  roles: ['approver'],
+  capabilities: ['activity-card'],
+  metadata: {
+    source: 'hexdeck',
+  },
+};
 
 function mergeParticipantsWithPresence(
   participants: BrokerParticipant[],
@@ -365,14 +375,11 @@ export class BrokerClient {
   }
 
   connectRealtime(): () => void {
-    if (isTauriEnvironment()) {
-      return () => undefined;
-    }
-
     if (this.realtimeCleanup) {
       return this.realtimeCleanup;
     }
 
+    this.registerRealtimeParticipant();
     const socket = this.websocketFactory(buildBrokerWebSocketUrl(this.brokerUrl));
 
     const handleMessage = (message: MessageEvent<string>) => {
@@ -431,6 +438,27 @@ export class BrokerClient {
 
     this.realtimeCleanup = cleanup;
     return cleanup;
+  }
+
+  private registerRealtimeParticipant(): void {
+    if (isTauriEnvironment()) {
+      void Promise.resolve(
+        invoke('register_broker_ui_participant', {
+          brokerUrl: this.brokerUrl,
+        })
+      ).catch(() => undefined);
+      return;
+    }
+
+    void Promise.resolve(
+      this.fetchImpl(`${this.brokerUrl}/participants/register`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(BROKER_UI_PARTICIPANT),
+      })
+    )
+      .then(() => undefined)
+      .catch(() => undefined);
   }
 
   private async request<T>(path: string): Promise<T> {

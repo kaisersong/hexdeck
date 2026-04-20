@@ -15,9 +15,11 @@ export type ActivityCardQuestionSelectionMode = 'single-select';
 
 export interface ActivityCardBaseProjection {
   cardId: string;
+  resolutionKey: string;
   kind: ActivityCardKind;
   summary: string;
   priority: ActivityCardPriority;
+  createdAtMs?: number;
   participantId?: string;
   actorLabel?: string;
   projectLabel?: string;
@@ -59,6 +61,7 @@ export interface ActivityCardQuestionProjection extends ActivityCardBaseProjecti
 export interface ActivityCardCompletionProjection extends ActivityCardBaseProjection {
   kind: 'completion';
   stage: 'completed';
+  detailText?: string;
   taskId?: string;
   threadId?: string;
 }

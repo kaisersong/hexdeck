@@ -5,6 +5,7 @@ import { createActivityCardStore } from '../../../src/lib/activity-card/store';
 function makeApproval(cardId: string, approvalId = 'approval-1'): ActivityCardProjection {
   return {
     cardId,
+    resolutionKey: `approval:${approvalId}`,
     kind: 'approval',
     priority: 'critical',
     summary: 'Approval requested',
@@ -27,6 +28,7 @@ function makeQuestion(
 ): ActivityCardProjection {
   return {
     cardId,
+    resolutionKey: `question:${questionId}`,
     kind: 'question',
     priority: 'attention',
     summary,
@@ -54,6 +56,7 @@ function makeCompletion(options: {
 
   return {
     cardId,
+    resolutionKey: `completion:${cardId.replace(/^completion:/, '')}`,
     kind: 'completion',
     priority: 'ambient',
     summary,
@@ -169,11 +172,11 @@ describe('createActivityCardStore', () => {
     }
     expect(questionCard.questionId).toBe('question-1');
 
-    store.tick(12_102);
+    store.tick(18_102);
     expect(store.getState().dismissedCardIds.has('question:question-1')).toBe(true);
     expect(store.getState().activeCard?.cardId).toBe('completion:1');
 
-    store.tick(15_103);
+    store.tick(30_103);
     expect(store.getState().dismissedCardIds.has('completion:completion:1')).toBe(true);
     expect(store.getState().activeCard).toBeNull();
   });
@@ -192,18 +195,42 @@ describe('createActivityCardStore', () => {
     expect(store.getState().queue).toEqual([]);
   });
 
-  it('keeps a dismissed completion identity out of the queue after refresh even when the cardId and summary change', () => {
+  it('surfaces a new completion event for the same task after the previous completion expires', () => {
     const store = createActivityCardStore();
 
     store.replaceQueue([makeCompletion({ cardId: 'completion:1', taskId: 'task-1', summary: 'Completed rollout' })], 0);
-    store.tick(3_001);
+    store.tick(12_001);
 
-    expect(store.getState().dismissedCardIds.has('completion:task-1')).toBe(true);
+    expect(store.getState().dismissedCardIds.has('completion:completion:1')).toBe(true);
 
-    store.replaceQueue([makeCompletion({ cardId: 'completion:2', taskId: 'task-1', summary: 'Completion text refreshed' })], 4_000);
+    store.replaceQueue([makeCompletion({ cardId: 'completion:2', taskId: 'task-1', summary: 'Completion text refreshed' })], 13_000);
 
-    expect(store.getState().activeCard).toBeNull();
+    expect(store.getState().activeCard?.cardId).toBe('completion:2');
     expect(store.getState().queue).toEqual([]);
+  });
+
+  it('preempts a visible completion when a higher-priority approval arrives', () => {
+    const store = createActivityCardStore();
+
+    store.replaceQueue([makeCompletion({ cardId: 'completion:1' })], 0, { allowPreemption: true });
+    expect(store.getState().activeCard?.cardId).toBe('completion:1');
+
+    store.replaceQueue(
+      [
+        makeCompletion({ cardId: 'completion:1' }),
+        makeApproval('approval:2', 'approval-2'),
+      ],
+      1_000,
+      { allowPreemption: true }
+    );
+
+    const activeCard = store.getState().activeCard;
+    if (!activeCard || activeCard.kind !== 'approval') {
+      throw new Error(`expected approval card, got ${activeCard?.kind ?? 'null'}`);
+    }
+
+    expect(activeCard.approvalId).toBe('approval-2');
+    expect(store.getState().queue.map((card) => card.cardId)).toEqual(['completion:1']);
   });
 
   it('does not merge distinct completion cards that only share the same summary', () => {
@@ -227,7 +254,7 @@ describe('createActivityCardStore', () => {
     expect(store.getState().queue[0].cardId).toBe('completion:2');
   });
 
-  it('uses threadId as the completion fallback identity when taskId is missing', () => {
+  it('keeps same-thread completion events separate by broker event cardId', () => {
     const store = createActivityCardStore();
 
     store.replaceQueue(
@@ -254,7 +281,7 @@ describe('createActivityCardStore', () => {
     }
 
     expect(activeCard.cardId).toBe('completion:1');
-    expect(store.getState().queue).toEqual([]);
+    expect(store.getState().queue.map((card) => card.cardId)).toEqual(['completion:2']);
   });
 
   it('keeps different thread completions separate even for the same participant', () => {

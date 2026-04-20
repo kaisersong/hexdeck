@@ -1,4 +1,3 @@
-import { useEffect } from 'react';
 import type {
   ActivityCardApprovalProjection,
   ActivityCardQuestionOption,
@@ -37,7 +36,7 @@ function getCardSupportingText(card: ActivityCardProjection): string {
     case 'question':
       return card.prompt;
     case 'completion':
-      return '任务已完成，点击可直接跳回对应 agent';
+      return card.detailText ?? '任务已完成，点击可直接跳回对应 agent';
   }
 }
 
@@ -169,38 +168,7 @@ export function FloatingActivityCard({
   const sourceLine = getSourceLine(card);
   const supportingText = getCardSupportingText(card);
   const approvalPending = card.kind === 'approval' && (pendingApprovalIds?.has(card.approvalId) ?? false);
-  const canJump = Boolean(card.jumpTarget && onJump);
-
-  useEffect(() => {
-    if (card.kind !== 'approval' || !onApprovalDecision || approvalPending) {
-      return;
-    }
-
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.metaKey || event.ctrlKey || event.altKey) {
-        return;
-      }
-
-      const key = event.key.toLowerCase();
-      if (key === 'y') {
-        event.preventDefault();
-        onApprovalDecision('yes');
-      }
-      if (key === 'a') {
-        event.preventDefault();
-        onApprovalDecision('always');
-      }
-      if (key === 'n') {
-        event.preventDefault();
-        onApprovalDecision('no');
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-    };
-  }, [approvalPending, card, onApprovalDecision]);
+  const canJump = card.kind === 'completion' && Boolean(card.jumpTarget && onJump);
 
   return (
     <article

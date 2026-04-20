@@ -112,9 +112,25 @@ function makeSeed() {
   };
 }
 
+function makeProjectParticipant() {
+  return {
+    participantId: 'codex.main',
+    alias: 'codex4',
+    kind: 'agent',
+    tool: 'codex',
+    metadata: {
+      terminalApp: 'Ghostty',
+      terminalSessionID: 'ghostty-1',
+      projectPath: '/Users/song/projects/hexdeck',
+    },
+    context: { projectName: 'HexDeck' },
+  };
+}
+
 function makeApprovalCard(approvalId = 'approval-1'): ActivityCardApprovalProjection {
   return {
     cardId: `approval:${approvalId}`,
+    resolutionKey: `approval:${approvalId}`,
     kind: 'approval',
     priority: 'critical',
     summary: 'Deploy approval needed',
@@ -137,6 +153,7 @@ function makeApprovalCard(approvalId = 'approval-1'): ActivityCardApprovalProjec
 function makeQuestionCard(): ActivityCardQuestionProjection {
   return {
     cardId: 'question:1',
+    resolutionKey: 'question:question-1',
     kind: 'question',
     priority: 'attention',
     summary: 'Which target should I use?',
@@ -161,6 +178,7 @@ function makeQuestionCard(): ActivityCardQuestionProjection {
 function makeCompletionCard(): ActivityCardCompletionProjection {
   return {
     cardId: 'completion:1',
+    resolutionKey: 'completion:1',
     kind: 'completion',
     priority: 'ambient',
     summary: 'Completed rollout tracking slice.',
@@ -199,6 +217,7 @@ function makeBrokerClientMock() {
 let brokerClientInstance = makeBrokerClientMock();
 
 beforeEach(() => {
+  vi.useRealTimers();
   window.history.pushState({}, '', '/');
   expandedRouteSpy.mockClear();
   getBrokerRuntimeStatusMock.mockReset();
@@ -615,7 +634,7 @@ describe('FloatingActivityCard', () => {
     expect(onHoverChange).toHaveBeenNthCalledWith(2, false);
   });
 
-  it('maps y, a, and n keyboard shortcuts onto approval decisions', () => {
+  it('does not map y, a, and n keyboard shortcuts onto approval decisions', () => {
     const onApprovalDecision = vi.fn();
 
     render(
@@ -629,9 +648,7 @@ describe('FloatingActivityCard', () => {
     fireEvent.keyDown(window, { key: 'a' });
     fireEvent.keyDown(window, { key: 'n' });
 
-    expect(onApprovalDecision).toHaveBeenNthCalledWith(1, 'yes');
-    expect(onApprovalDecision).toHaveBeenNthCalledWith(2, 'always');
-    expect(onApprovalDecision).toHaveBeenNthCalledWith(3, 'no');
+    expect(onApprovalDecision).not.toHaveBeenCalled();
   });
 
   it('does not map approval keyboard shortcuts for non-approval cards', () => {
@@ -649,6 +666,25 @@ describe('FloatingActivityCard', () => {
     fireEvent.keyDown(window, { key: 'n' });
 
     expect(onQuestionSelect).not.toHaveBeenCalled();
+  });
+
+  it('does not turn approval cards into jump buttons even when a jump target exists', () => {
+    const onJump = vi.fn();
+    const completionCard = makeCompletionCard();
+
+    render(
+      <FloatingActivityCard
+        card={{
+          ...makeApprovalCard(),
+          jumpTarget: completionCard.jumpTarget,
+        }}
+        onJump={onJump}
+      />
+    );
+
+    expect(screen.queryByRole('button', { name: /Open agent context/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText('@codex4 · Deploy approval needed'));
+    expect(onJump).not.toHaveBeenCalled();
   });
 
   it('renders completion summaries and jump actions when a jump target exists', () => {
@@ -739,6 +775,28 @@ describe('ActivityCardRoute', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Close activity card' }));
 
     expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not render an empty card when the live route has no active card', async () => {
+    const onDismiss = vi.fn();
+
+    render(
+      <ActivityCardRoute
+        card={null}
+        onDismiss={onDismiss}
+      />
+    );
+
+    expect(screen.queryByText('No active activity card')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('No active activity card')).not.toBeInTheDocument();
+    expect(onDismiss).not.toHaveBeenCalled();
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    });
+    await waitFor(() => {
+      expect(hideWindowMock).toHaveBeenCalled();
+    });
   });
 
   it('uses a fixed window width and approval fallback height before measurement is available', async () => {
@@ -944,9 +1002,8 @@ describe('ActivityCardRoute', () => {
     }
   });
 
-  it('keeps live debug diagnostics compact before native measurement completes', () => {
+  it('does not keep a debug shell mounted when the live route has no active card', () => {
     window.history.pushState({}, '', '/?view=activity-card&debugLive=1&project=hexdeck');
-    invokeMock.mockImplementation(() => new Promise(() => undefined));
 
     render(
       <ActivityCardRoute
@@ -963,12 +1020,8 @@ describe('ActivityCardRoute', () => {
       />
     );
 
-    const metrics = screen.getByLabelText('activity card debug measurements');
-    expect(metrics).toHaveTextContent('card pending');
-    expect(metrics).toHaveTextContent('inner pending');
-    expect(metrics).toHaveTextContent('outer pending');
-    expect(metrics).not.toHaveTextContent('project hexdeck');
-    expect(metrics).not.toHaveTextContent('latest 2796');
+    expect(screen.queryByLabelText('activity-card')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('activity card debug measurements')).not.toBeInTheDocument();
   });
 
   it('hides the live activity-card window after a real card clears', async () => {
@@ -983,6 +1036,34 @@ describe('ActivityCardRoute', () => {
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
     });
+  });
+
+  it('does not hide the native window when controller intent keeps the popup alive during a transient null card', async () => {
+    const { rerender } = render(
+      <ActivityCardRoute
+        card={makeApprovalCard()}
+        windowVisibility="show"
+      />
+    );
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+    });
+
+    invokeMock.mockClear();
+    hideWindowMock.mockClear();
+
+    rerender(
+      <ActivityCardRoute
+        card={null}
+        windowVisibility="keep"
+      />
+    );
+
+    await Promise.resolve();
+
+    expect(invokeMock).not.toHaveBeenCalledWith('hide_activity_card_window');
+    expect(hideWindowMock).not.toHaveBeenCalled();
   });
 
   it('reopens the live activity-card window when a new real card arrives after hiding', async () => {
@@ -1115,8 +1196,11 @@ describe('activity-card window routing', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+      expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(1);
     });
+    expect(invokeMock).not.toHaveBeenCalledWith('hide_activity_card_window');
+    expect(invokeMock).not.toHaveBeenCalledWith('prepare_activity_card_window');
+    expect(invokeMock).not.toHaveBeenCalledWith('show_activity_card_window');
   });
 
   it('shows pending startup approvals in panel mode so real agent hooks can be answered', async () => {
@@ -1134,7 +1218,7 @@ describe('activity-card window routing', () => {
         context: { projectName: 'HexDeck' },
       },
     ];
-    const initialProjectSeed = {
+    const initialServiceSeed = {
       health: { ok: true },
       participants: projectParticipants,
       workStates: [],
@@ -1150,11 +1234,8 @@ describe('activity-card window routing', () => {
     };
 
     brokerClientInstance = {
-      loadServiceSeed: vi.fn().mockResolvedValue({
-        ...makeSeed(),
-        participants: projectParticipants,
-      }),
-      loadProjectSeed: vi.fn().mockResolvedValue(initialProjectSeed),
+      loadServiceSeed: vi.fn().mockResolvedValue(initialServiceSeed),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
       subscribe: vi.fn(() => () => undefined),
       connectRealtime: vi.fn(() => () => undefined),
       respondToApproval: vi.fn().mockResolvedValue(undefined),
@@ -1166,8 +1247,78 @@ describe('activity-card window routing', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+      expect(invokeMock).toHaveBeenCalledWith('prepare_activity_card_window');
     });
+    expect(invokeMock).not.toHaveBeenCalledWith('show_activity_card_window');
+  });
+
+  it('shows fresh startup question and completion cards in panel mode instead of marking them as stale backlog', async () => {
+    const participants = [
+      makeProjectParticipant(),
+      {
+        participantId: 'xiaok.session',
+        alias: 'xiaok4',
+        kind: 'agent',
+        tool: 'xiaok',
+        metadata: {
+          terminalApp: 'Ghostty',
+          terminalSessionID: 'ghostty-xiaok',
+          projectPath: '/Users/song/projects/xiaok-cli',
+        },
+        context: { projectName: 'xiaok-cli' },
+      },
+    ];
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue({
+        health: { ok: true },
+        participants,
+        workStates: [],
+        events: [
+          {
+            id: 710,
+            type: 'ask_clarification',
+            createdAt: new Date().toISOString(),
+            taskId: 'fresh-startup-question',
+            threadId: 'fresh-startup-thread',
+            payload: {
+              participantId: 'xiaok.session',
+              summary: 'Fresh startup question',
+              prompt: 'Fresh startup question',
+              selectionMode: 'single-select',
+              options: [{ label: 'Use fix', value: 'fixed' }],
+            },
+          },
+          {
+            id: 711,
+            type: 'report_progress',
+            createdAt: new Date().toISOString(),
+            taskId: 'fresh-startup-completion',
+            threadId: 'fresh-startup-completion-thread',
+            payload: {
+              participantId: 'xiaok.session',
+              summary: 'Fresh startup completion',
+              stage: 'completed',
+            },
+          },
+        ],
+        approvals: [],
+      }),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    render(<App />);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('prepare_activity_card_window');
+    });
+    expect(invokeMock).not.toHaveBeenCalledWith('show_activity_card_window');
   });
 
   it('keeps passive startup backlog hidden in panel mode and only shows newly arrived floating cards after refresh', async () => {
@@ -1185,7 +1336,7 @@ describe('activity-card window routing', () => {
         context: { projectName: 'HexDeck' },
       },
     ];
-    const initialProjectSeed = {
+    const initialServiceSeed = {
       health: { ok: true },
       participants: projectParticipants,
       workStates: [],
@@ -1206,8 +1357,8 @@ describe('activity-card window routing', () => {
       ],
       approvals: [],
     };
-    const nextProjectSeed = {
-      ...initialProjectSeed,
+    const nextServiceSeed = {
+      ...initialServiceSeed,
       approvals: [
         {
           approvalId: 'approval-new',
@@ -1219,11 +1370,8 @@ describe('activity-card window routing', () => {
     };
 
     brokerClientInstance = {
-      loadServiceSeed: vi.fn().mockResolvedValue({
-        ...makeSeed(),
-        participants: projectParticipants,
-      }),
-      loadProjectSeed: vi.fn().mockResolvedValueOnce(initialProjectSeed).mockResolvedValueOnce(nextProjectSeed),
+      loadServiceSeed: vi.fn().mockResolvedValueOnce(initialServiceSeed).mockResolvedValueOnce(nextServiceSeed),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
       subscribe: vi.fn(() => () => undefined),
       connectRealtime: vi.fn(() => () => undefined),
       respondToApproval: vi.fn().mockResolvedValue(undefined),
@@ -1235,17 +1383,21 @@ describe('activity-card window routing', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+      expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(1);
     });
+    expect(invokeMock).not.toHaveBeenCalledWith('hide_activity_card_window');
+    expect(invokeMock).not.toHaveBeenCalledWith('prepare_activity_card_window');
 
     window.dispatchEvent(new Event('focus'));
 
     await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+      expect(invokeMock).toHaveBeenCalledWith('prepare_activity_card_window');
     });
+    expect(invokeMock).not.toHaveBeenCalledWith('hide_activity_card_window');
+    expect(invokeMock).not.toHaveBeenCalledWith('show_activity_card_window');
   });
 
-  it('hides the floating activity-card window when broker data has no active card', async () => {
+  it('does not try to hide the floating activity-card window when broker data has no active card', async () => {
     brokerClientInstance = {
       loadServiceSeed: vi.fn().mockResolvedValue(makeSeed()),
       loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
@@ -1260,8 +1412,11 @@ describe('activity-card window routing', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+      expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(1);
     });
+    expect(invokeMock).not.toHaveBeenCalledWith('hide_activity_card_window');
+    expect(invokeMock).not.toHaveBeenCalledWith('prepare_activity_card_window');
+    expect(invokeMock).not.toHaveBeenCalledWith('show_activity_card_window');
   });
 
   it('reopens the floating activity card route when view=activity-card after clearing the initial empty shell', async () => {
@@ -1342,6 +1497,276 @@ describe('activity-card window routing', () => {
     expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
   });
 
+  it('keeps the live activity-card window stable across a transient empty refresh for the same broker card', async () => {
+    const approvalSeed = {
+      health: { ok: true },
+      participants: [makeProjectParticipant()],
+      workStates: [],
+      events: [],
+      approvals: [
+        {
+          approvalId: 'approval-live',
+          taskId: 'task-live',
+          summary: 'Live approval request',
+          decision: 'pending',
+          participantId: 'codex.main',
+        },
+      ],
+    };
+    const emptySeed = {
+      ...approvalSeed,
+      approvals: [],
+    };
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn()
+        .mockResolvedValueOnce(approvalSeed)
+        .mockResolvedValueOnce(emptySeed)
+        .mockResolvedValueOnce(approvalSeed),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: '@codex4 · Live approval request' })).toBeInTheDocument();
+    });
+
+    invokeMock.mockClear();
+    hideWindowMock.mockClear();
+
+    await waitFor(
+      () => {
+        expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(2);
+      },
+      { timeout: 1_500 }
+    );
+
+    await waitFor(
+      () => {
+        expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(3);
+      },
+      { timeout: 1_500 }
+    );
+
+    expect(screen.getByRole('heading', { name: '@codex4 · Live approval request' })).toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith('hide_activity_card_window');
+    expect(invokeMock).not.toHaveBeenCalledWith('show_activity_card_window');
+    expect(hideWindowMock).not.toHaveBeenCalled();
+  });
+
+  it('replaces a visible completion with a later approval without hide-show churn', async () => {
+    const completionSeed = {
+      health: { ok: true },
+      participants: [makeProjectParticipant()],
+      workStates: [],
+      events: [
+        {
+          id: 301,
+          type: 'report_progress',
+          createdAt: new Date().toISOString(),
+          taskId: 'completion-task',
+          threadId: 'completion-thread',
+          payload: {
+            participantId: 'codex.main',
+            summary: 'Real completion',
+            stage: 'completed',
+          },
+        },
+      ],
+      approvals: [],
+    };
+    const approvalSeed = {
+      ...completionSeed,
+      approvals: [
+        {
+          approvalId: 'approval-live',
+          taskId: 'approval-task',
+          summary: 'Live approval request',
+          decision: 'pending',
+          participantId: 'codex.main',
+        },
+      ],
+    };
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn()
+        .mockResolvedValueOnce(completionSeed)
+        .mockResolvedValueOnce(approvalSeed),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: '@codex4 · Real completion' })).toBeInTheDocument();
+    });
+
+    invokeMock.mockClear();
+    hideWindowMock.mockClear();
+
+    await waitFor(
+      () => {
+        expect(screen.getByRole('heading', { name: '@codex4 · Live approval request' })).toBeInTheDocument();
+      },
+      { timeout: 1_500 }
+    );
+
+    expect(invokeMock).not.toHaveBeenCalledWith('hide_activity_card_window');
+    expect(invokeMock).not.toHaveBeenCalledWith('show_activity_card_window');
+    expect(hideWindowMock).not.toHaveBeenCalled();
+  });
+
+  it('does not open broker realtime in the live activity-card window', async () => {
+    const approvalSeed = {
+      health: { ok: true },
+      participants: [makeProjectParticipant()],
+      workStates: [],
+      events: [],
+      approvals: [
+        {
+          approvalId: 'approval-live',
+          taskId: 'task-live',
+          summary: 'Live approval request',
+          decision: 'pending',
+          participantId: 'codex.main',
+        },
+      ],
+    };
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue(approvalSeed),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(1);
+    });
+
+    expect(brokerClientInstance.connectRealtime).not.toHaveBeenCalled();
+  });
+
+  it('does not refetch broker seed when the live activity-card window fires focus or visibility events', async () => {
+    const approvalSeed = {
+      health: { ok: true },
+      participants: [makeProjectParticipant()],
+      workStates: [],
+      events: [],
+      approvals: [
+        {
+          approvalId: 'approval-live',
+          taskId: 'task-live',
+          summary: 'Live approval request',
+          decision: 'pending',
+          participantId: 'codex.main',
+        },
+      ],
+    };
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue(approvalSeed),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(1);
+    });
+
+    window.dispatchEvent(new Event('focus'));
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    await new Promise((resolve) => {
+      window.setTimeout(resolve, 50);
+    });
+
+    expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores non-popup realtime events in the live activity-card window', async () => {
+    const realtimeListenerRef: { current: ((event: unknown) => void) | null } = { current: null };
+    const approvalSeed = {
+      health: { ok: true },
+      participants: [makeProjectParticipant()],
+      workStates: [],
+      events: [],
+      approvals: [
+        {
+          approvalId: 'approval-live',
+          taskId: 'task-live',
+          summary: 'Live approval request',
+          decision: 'pending',
+          participantId: 'codex.main',
+        },
+      ],
+    };
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue(approvalSeed),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn((listener: (event: unknown) => void) => {
+        realtimeListenerRef.current = listener;
+        return () => undefined;
+      }),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(1);
+    });
+
+    realtimeListenerRef.current?.({ id: 9301, type: 'participant_online' });
+
+    await new Promise((resolve) => {
+      window.setTimeout(resolve, 50);
+    });
+
+    expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(1);
+  });
+
   it('hides an empty live activity-card window on first boot when broker returns no cards', async () => {
     brokerClientInstance = {
       loadServiceSeed: vi.fn().mockResolvedValue(makeSeed()),
@@ -1361,6 +1786,477 @@ describe('activity-card window routing', () => {
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
     });
+  });
+
+  it.each([
+    {
+      kind: 'approval',
+      seed: {
+        health: { ok: true },
+        participants: [makeProjectParticipant()],
+        workStates: [],
+        events: [],
+        approvals: [
+          {
+            approvalId: 'approval-real',
+            taskId: 'task-real',
+            summary: 'Real approval request',
+            decision: 'pending',
+            participantId: 'codex.main',
+          },
+        ],
+      },
+      heading: '@codex4 · Real approval request',
+    },
+    {
+      kind: 'question',
+      seed: {
+        health: { ok: true },
+        participants: [makeProjectParticipant()],
+        workStates: [],
+        events: [
+          {
+            id: 201,
+            type: 'ask_clarification',
+            createdAt: new Date().toISOString(),
+            taskId: 'question-task',
+            threadId: 'question-thread',
+            payload: {
+              participantId: 'codex.main',
+              summary: 'Real question',
+              prompt: 'Real question',
+              selectionMode: 'single-select',
+              options: [{ label: 'Use staging', value: 'staging' }],
+            },
+          },
+        ],
+        approvals: [],
+      },
+      heading: '@codex4 · Real question',
+    },
+    {
+      kind: 'completion',
+      seed: {
+        health: { ok: true },
+        participants: [makeProjectParticipant()],
+        workStates: [],
+        events: [
+          {
+            id: 301,
+            type: 'report_progress',
+            createdAt: new Date().toISOString(),
+            taskId: 'completion-task',
+            threadId: 'completion-thread',
+            payload: {
+              participantId: 'codex.main',
+              summary: 'Real completion',
+              stage: 'completed',
+            },
+          },
+        ],
+        approvals: [],
+      },
+      heading: '@codex4 · Real completion',
+    },
+  ])('shows a native activity-card window for real broker $kind messages', async ({ seed, heading }) => {
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue(seed),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: heading })).toBeInTheDocument();
+    });
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+    });
+  });
+
+  it('does not revive stale question and completion replay cards when the activity-card window boots', async () => {
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue({
+        health: { ok: true },
+        participants: [makeProjectParticipant()],
+        workStates: [],
+        events: [
+          {
+            id: 101,
+            type: 'ask_clarification',
+            createdAt: '2000-01-01T00:00:00.000Z',
+            taskId: 'question-task',
+            threadId: 'question-thread',
+            payload: {
+              participantId: 'codex.main',
+              summary: 'Old question',
+              prompt: 'Old question',
+              selectionMode: 'single-select',
+              options: [{ label: 'A', value: 'a' }],
+            },
+          },
+          {
+            id: 102,
+            type: 'report_progress',
+            createdAt: '2000-01-01T00:00:00.000Z',
+            taskId: 'completion-task',
+            threadId: 'completion-thread',
+            payload: {
+              participantId: 'codex.main',
+              summary: 'Old completion',
+              stage: 'completed',
+            },
+          },
+        ],
+        approvals: [],
+      }),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    });
+    await waitFor(() => {
+      expect(hideWindowMock).toHaveBeenCalled();
+    });
+
+    expect(screen.queryByText('Old question')).not.toBeInTheDocument();
+    expect(screen.queryByText('Old completion')).not.toBeInTheDocument();
+    expect(screen.queryByText('No active activity card')).not.toBeInTheDocument();
+  });
+
+  it('does not revive question and completion replay cards without createdAt when the activity-card window boots', async () => {
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue({
+        health: { ok: true },
+        participants: [makeProjectParticipant()],
+        workStates: [],
+        events: [
+          {
+            id: 111,
+            type: 'ask_clarification',
+            taskId: 'question-task',
+            threadId: 'question-thread',
+            payload: {
+              participantId: 'codex.main',
+              summary: 'Question without createdAt',
+              prompt: 'Question without createdAt',
+              selectionMode: 'single-select',
+              options: [{ label: 'Use fix', value: 'fixed' }],
+            },
+          },
+          {
+            id: 112,
+            type: 'report_progress',
+            taskId: 'completion-task',
+            threadId: 'completion-thread',
+            payload: {
+              participantId: 'codex.main',
+              summary: 'Completion without createdAt',
+              stage: 'completed',
+            },
+          },
+        ],
+        approvals: [],
+      }),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    });
+    await waitFor(() => {
+      expect(hideWindowMock).toHaveBeenCalled();
+    });
+
+    expect(screen.queryByText('Question without createdAt')).not.toBeInTheDocument();
+    expect(screen.queryByText('Completion without createdAt')).not.toBeInTheDocument();
+  });
+
+  it('shows a recent completion that arrived before the activity-card child window finished booting', async () => {
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue({
+        health: { ok: true },
+        participants: [makeProjectParticipant()],
+        workStates: [],
+        events: [
+          {
+            id: 401,
+            type: 'report_progress',
+            createdAt: new Date(Date.now() - 120_000).toISOString(),
+            taskId: 'completion-task',
+            threadId: 'completion-thread',
+            payload: {
+              participantId: 'codex.main',
+              summary: 'Slightly delayed completion',
+              stage: 'completed',
+            },
+          },
+        ],
+        approvals: [],
+      }),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: '@codex4 · Slightly delayed completion' })).toBeInTheDocument();
+    });
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+    });
+  });
+
+  it.each([
+    {
+      kind: 'question',
+      event: {
+        id: 501,
+        type: 'ask_clarification',
+        createdAt: new Date().toISOString(),
+        taskId: 'question-live-task',
+        threadId: 'question-live-thread',
+        payload: {
+          participantId: 'codex.main',
+          summary: 'Realtime question',
+          prompt: 'Realtime question',
+          selectionMode: 'single-select',
+          options: [{ label: 'Use fix', value: 'fixed' }],
+        },
+      },
+    },
+    {
+      kind: 'completion',
+      event: {
+        id: 502,
+        type: 'report_progress',
+        createdAt: new Date().toISOString(),
+        taskId: 'completion-live-task',
+        threadId: 'completion-live-thread',
+        payload: {
+          participantId: 'codex.main',
+          summary: 'Realtime completion',
+          stage: 'completed',
+        },
+      },
+    },
+  ])('opens the native activity-card window when a realtime $kind arrives after panel boot', async ({ event }) => {
+    const realtimeListenerRef: { current: ((event: unknown) => void) | null } = { current: null };
+    const initialSeed = {
+      health: { ok: true },
+      participants: [makeProjectParticipant()],
+      workStates: [],
+      events: [],
+      approvals: [],
+    };
+    const realtimeSeed = {
+      ...initialSeed,
+      events: [event],
+    };
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn()
+        .mockResolvedValueOnce(initialSeed)
+        .mockResolvedValue(realtimeSeed),
+      loadProjectSeed: vi.fn()
+        .mockResolvedValueOnce(initialSeed)
+        .mockResolvedValue(realtimeSeed),
+      subscribe: vi.fn((listener: (event: unknown) => void) => {
+        realtimeListenerRef.current = listener;
+        return () => undefined;
+      }),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(1);
+    });
+    invokeMock.mockClear();
+
+    realtimeListenerRef.current?.({ id: event.id, type: event.type });
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('prepare_activity_card_window');
+    });
+    expect(invokeMock).not.toHaveBeenCalledWith('show_activity_card_window');
+  });
+
+  it.each([
+    {
+      kind: 'approval',
+      realtimeSeedPatch: {
+        events: [],
+        approvals: [
+          {
+            approvalId: 'xiaok-approval',
+            taskId: 'xiaok-approval-task',
+            summary: 'Xiaok approval from another project',
+            decision: 'pending',
+            participantId: 'xiaok.session',
+          },
+        ],
+      },
+      realtimeEvent: { id: 700, type: 'request_approval' },
+    },
+    {
+      kind: 'question',
+      realtimeSeedPatch: {
+        events: [
+          {
+            id: 701,
+            type: 'ask_clarification',
+            createdAt: new Date().toISOString(),
+            taskId: 'xiaok-question-task',
+            threadId: 'xiaok-question-thread',
+            payload: {
+              participantId: 'xiaok.session',
+              summary: 'Xiaok question from another project',
+              prompt: 'Xiaok question from another project',
+              selectionMode: 'single-select',
+              options: [{ label: 'Use fix', value: 'fixed' }],
+            },
+          },
+        ],
+        approvals: [],
+      },
+      realtimeEvent: { id: 701, type: 'ask_clarification' },
+    },
+    {
+      kind: 'completion',
+      realtimeSeedPatch: {
+        events: [
+          {
+            id: 702,
+            type: 'report_progress',
+            createdAt: new Date().toISOString(),
+            taskId: 'xiaok-completion-task',
+            threadId: 'xiaok-completion-thread',
+            payload: {
+              participantId: 'xiaok.session',
+              summary: 'Xiaok completion from another project',
+              stage: 'completed',
+            },
+          },
+        ],
+        approvals: [],
+      },
+      realtimeEvent: { id: 702, type: 'report_progress' },
+    },
+  ])('opens $kind floating cards from any project regardless of the panel project filter', async ({
+    realtimeSeedPatch,
+    realtimeEvent,
+  }) => {
+    loadLocalSettingsMock.mockReturnValue({
+      brokerUrl: 'http://broker.test',
+      globalShortcut: 'CmdOrCtrl+Shift+H',
+      currentProject: 'HexDeck',
+      recentProjects: ['HexDeck'],
+    });
+
+    const realtimeListenerRef: { current: ((event: unknown) => void) | null } = { current: null };
+    const participants = [
+      makeProjectParticipant(),
+      {
+        participantId: 'xiaok.session',
+        alias: 'xiaok4',
+        kind: 'agent',
+        tool: 'xiaok',
+        metadata: {
+          terminalApp: 'Ghostty',
+          terminalSessionID: 'ghostty-xiaok',
+          projectPath: '/Users/song/projects/xiaok-cli',
+        },
+        context: { projectName: 'xiaok-cli' },
+      },
+    ];
+    const initialSeed = {
+      health: { ok: true },
+      participants,
+      workStates: [],
+      events: [],
+      approvals: [],
+    };
+    const realtimeSeed = {
+      ...initialSeed,
+      ...realtimeSeedPatch,
+    };
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn()
+        .mockResolvedValueOnce(initialSeed)
+        .mockResolvedValue(realtimeSeed),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn((listener: (event: unknown) => void) => {
+        realtimeListenerRef.current = listener;
+        return () => undefined;
+      }),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(1);
+    });
+    invokeMock.mockClear();
+
+    realtimeListenerRef.current?.(realtimeEvent);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('prepare_activity_card_window');
+    });
+    expect(brokerClientInstance.loadProjectSeed).not.toHaveBeenCalled();
   });
 
   it('hides the floating activity-card window after approving the last live startup approval', async () => {
@@ -1429,6 +2325,136 @@ describe('activity-card window routing', () => {
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
     });
+    await waitFor(() => {
+      expect(hideWindowMock).toHaveBeenCalled();
+    });
+  });
+
+  it('hides the floating activity-card window after answering the last live question', async () => {
+    const serviceSeed = {
+      health: { ok: true },
+      participants: [makeProjectParticipant()],
+      workStates: [],
+      events: [
+        {
+          id: 1201,
+          type: 'ask_clarification',
+          createdAt: new Date().toISOString(),
+          taskId: 'question-task',
+          threadId: 'question-thread',
+          payload: {
+            participantId: 'codex.main',
+            summary: 'Ship the current fix?',
+            prompt: 'Ship the current fix?',
+            selectionMode: 'single-select',
+            options: [{ label: 'Ship it', value: 'ship-it' }],
+          },
+        },
+      ],
+      approvals: [],
+    };
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn()
+        .mockResolvedValueOnce(serviceSeed)
+        .mockResolvedValueOnce({
+          ...serviceSeed,
+          events: [],
+        }),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Ship it' })).toBeInTheDocument();
+    });
+
+    invokeMock.mockClear();
+    hideWindowMock.mockClear();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Ship it' }));
+
+    await waitFor(() => {
+      expect(brokerClientInstance.answerClarification).toHaveBeenCalled();
+    });
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    });
+    await waitFor(() => {
+      expect(hideWindowMock).toHaveBeenCalled();
+    });
+  });
+
+  it('hides the floating activity-card window instead of leaving an empty shell when an answered question lingers in the next seed refresh', async () => {
+    const lingeringQuestionSeed = {
+      health: { ok: true },
+      participants: [makeProjectParticipant()],
+      workStates: [],
+      events: [
+        {
+          id: 1301,
+          type: 'ask_clarification',
+          createdAt: new Date().toISOString(),
+          taskId: 'question-task',
+          threadId: 'question-thread',
+          payload: {
+            participantId: 'codex.main',
+            summary: 'Ship the current fix?',
+            prompt: 'Ship the current fix?',
+            selectionMode: 'single-select',
+            options: [{ label: 'Ship it', value: 'ship-it' }],
+          },
+        },
+      ],
+      approvals: [],
+    };
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn()
+        .mockResolvedValueOnce(lingeringQuestionSeed)
+        .mockResolvedValueOnce(lingeringQuestionSeed),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Ship it' })).toBeInTheDocument();
+    });
+
+    invokeMock.mockClear();
+    hideWindowMock.mockClear();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Ship it' }));
+
+    await waitFor(() => {
+      expect(brokerClientInstance.answerClarification).toHaveBeenCalled();
+    });
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    });
+    await waitFor(() => {
+      expect(hideWindowMock).toHaveBeenCalled();
+    });
+
+    expect(screen.queryByRole('button', { name: 'Ship it' })).not.toBeInTheDocument();
   });
 
   it('shows only the latest highest-priority card when the activity-card window boots with backlog', async () => {
@@ -1507,11 +2533,11 @@ describe('activity-card window routing', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText('@codex4 · Newest approval')).toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: '@codex4 · Newest approval' })).toBeInTheDocument();
     });
 
-    expect(screen.queryByText('Old approval')).not.toBeInTheDocument();
-    expect(screen.queryByText('Old question')).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '@codex4 · Old approval' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '@codex4 · Old question' })).not.toBeInTheDocument();
   });
 
   it('keeps floating activity cards on the all-agent service replay even when a saved project exists', async () => {
@@ -1707,6 +2733,7 @@ describe('activity-card window routing', () => {
           {
             id: 900,
             type: 'report_progress',
+            createdAt: new Date().toISOString(),
             taskId: 'task-claude5',
             threadId: 'thread-claude5',
             payload: {
@@ -1734,12 +2761,12 @@ describe('activity-card window routing', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText('Claude 7 completed the task')).toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: 'Claude 7 completed the task' })).toBeInTheDocument();
     });
     expect(brokerClientInstance.loadProjectSeed).not.toHaveBeenCalled();
   });
 
-  it('uses the activity-card project query override when running live debug', async () => {
+  it('ignores the activity-card project query for popup data when running live debug', async () => {
     loadLocalSettingsMock.mockReturnValue({
       brokerUrl: 'http://broker.test',
       globalShortcut: 'CmdOrCtrl+Shift+H',
@@ -1792,8 +2819,8 @@ describe('activity-card window routing', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(brokerClientInstance.loadProjectSeed).toHaveBeenCalledWith('hexdeck');
+      expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalled();
     });
-    expect(brokerClientInstance.loadProjectSeed).not.toHaveBeenCalledWith('projects');
+    expect(brokerClientInstance.loadProjectSeed).not.toHaveBeenCalled();
   });
 });

@@ -320,7 +320,7 @@ async fn collect_broker_runtime_status(
     ))
 }
 
-async fn broker_get_json(broker_url: &str, path: &str) -> Result<serde_json::Value, String> {
+pub(crate) async fn broker_get_json(broker_url: &str, path: &str) -> Result<serde_json::Value, String> {
     let url = format!("{}{}", broker_url.trim_end_matches('/'), path);
     let response = reqwest::get(&url)
         .await
@@ -340,7 +340,7 @@ async fn broker_get_json(broker_url: &str, path: &str) -> Result<serde_json::Val
         .map_err(|e| format!("broker_response_parse_failed {} {}", path, e))
 }
 
-fn value_items(payload: serde_json::Value, key: &str) -> serde_json::Value {
+pub(crate) fn value_items(payload: serde_json::Value, key: &str) -> serde_json::Value {
     if payload.is_array() {
         return payload;
     }
@@ -385,7 +385,7 @@ where
     Ok(json!(events))
 }
 
-async fn load_all_replay_events(broker_url: &str) -> Result<serde_json::Value, String> {
+pub(crate) async fn load_all_replay_events(broker_url: &str) -> Result<serde_json::Value, String> {
     load_all_replay_events_with(|after| async move {
         broker_get_json(broker_url, &format!("/events/replay?after={after}")).await
     })
@@ -600,6 +600,36 @@ pub async fn load_broker_pending_approvals(
     );
     let approvals = broker_get_json(&broker_url, &path).await?;
     Ok(value_items(approvals, "items"))
+}
+
+#[tauri::command]
+pub async fn register_broker_ui_participant(broker_url: Option<String>) -> Result<(), String> {
+    let broker_url = broker_url.unwrap_or_else(|| "http://127.0.0.1:4318".to_string());
+    let url = format!("{}/participants/register", broker_url.trim_end_matches('/'));
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&json!({
+            "participantId": "human.local",
+            "alias": "human",
+            "kind": "human",
+            "roles": ["approver"],
+            "capabilities": ["activity-card"],
+            "metadata": {
+                "source": "hexdeck"
+            }
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("broker_register_ui_participant_failed {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "broker_register_ui_participant_failed {}",
+            response.status().as_u16()
+        ));
+    }
+
+    Ok(())
 }
 
 #[tauri::command]

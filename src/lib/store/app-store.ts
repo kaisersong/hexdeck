@@ -1,6 +1,7 @@
 import type { ActivityCardProjection } from '../activity-card/types';
 import {
   createActivityCardStore,
+  type ReplaceQueueOptions,
   type ActivityCardRuntimeState,
 } from '../activity-card/store';
 import type { ProjectSnapshotProjection } from '../projections/types';
@@ -15,7 +16,7 @@ export interface AppStore {
   getState(): AppState;
   setSnapshot(snapshot: ProjectSnapshotProjection): void;
   primeActivityCards(cards: ActivityCardProjection[]): void;
-  replaceActivityCards(cards: ActivityCardProjection[], nowMs: number): void;
+  replaceActivityCards(cards: ActivityCardProjection[], nowMs: number, options?: ReplaceQueueOptions): void;
   setActivityCardHovered(hovered: boolean, nowMs: number): void;
   tickActivityCards(nowMs: number): void;
   dismissActivityCard(nowMs: number): void;
@@ -56,8 +57,8 @@ export function createAppStore(): AppStore {
     primeActivityCards(cards) {
       activityCardStore.primeExisting(cards);
     },
-    replaceActivityCards(cards, nowMs) {
-      activityCardStore.replaceQueue(cards, nowMs);
+    replaceActivityCards(cards, nowMs, options) {
+      activityCardStore.replaceQueue(cards, nowMs, options);
     },
     setActivityCardHovered(hovered, nowMs) {
       activityCardStore.setHovered(hovered, nowMs);

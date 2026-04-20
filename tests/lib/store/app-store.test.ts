@@ -52,6 +52,7 @@ describe('createAppStore', () => {
       [
         {
           cardId: 'question:1',
+          resolutionKey: 'question:question-1',
           kind: 'question',
           priority: 'attention',
           summary: 'Which target?',
@@ -62,6 +63,7 @@ describe('createAppStore', () => {
         },
         {
           cardId: 'approval:1',
+          resolutionKey: 'approval:approval-1',
           kind: 'approval',
           priority: 'critical',
           summary: 'Approval requested',

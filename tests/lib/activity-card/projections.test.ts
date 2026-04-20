@@ -157,6 +157,112 @@ describe('buildActivityCardsFromSeed', () => {
     ]);
   });
 
+  it('preserves broker event timestamps on replay-derived ephemeral cards', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [],
+      workStates: [],
+      events: [
+        {
+          id: 201,
+          type: 'ask_clarification',
+          createdAt: '2026-04-17T06:19:40.000Z',
+          payload: {
+            summary: 'Which target?',
+            selectionMode: 'single-select',
+            options: [{ value: 'staging', label: 'Staging' }],
+          },
+        },
+        {
+          id: 202,
+          type: 'report_progress',
+          createdAt: '2026-04-17T06:19:45.000Z',
+          payload: {
+            summary: 'Done',
+            stage: 'completed',
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards[0]).toMatchObject({
+      kind: 'question',
+      createdAtMs: Date.parse('2026-04-17T06:19:40.000Z'),
+    });
+    expect(cards[1]).toMatchObject({
+      kind: 'completion',
+      createdAtMs: Date.parse('2026-04-17T06:19:45.000Z'),
+    });
+  });
+
+  it('assigns a stable resolutionKey to approval, question, and completion cards', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [],
+      workStates: [],
+      events: [
+        {
+          id: 101,
+          type: 'ask_clarification',
+          payload: {
+            questionId: 'question-live-101',
+            summary: 'Which target?',
+            selectionMode: 'single-select',
+            options: [{ value: 'staging', label: 'Staging' }],
+          },
+        },
+        {
+          id: 102,
+          type: 'report_progress',
+          payload: {
+            summary: 'Done',
+            stage: 'completed',
+          },
+        },
+      ],
+      approvals: [
+        {
+          approvalId: 'approval-1',
+          taskId: 'task-1',
+          summary: 'Need approval',
+          decision: 'pending',
+        },
+      ],
+    });
+
+    expect(cards).toMatchObject([
+      { kind: 'approval', resolutionKey: 'approval:approval-1' },
+      { kind: 'question', resolutionKey: 'question:question-live-101' },
+      { kind: 'completion', resolutionKey: 'completion:102' },
+    ]);
+  });
+
+  it('parses broker sqlite timestamps as UTC for replay-derived ephemeral cards', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [],
+      workStates: [],
+      events: [
+        {
+          id: 301,
+          type: 'report_progress',
+          createdAt: '2026-04-17 07:16:33',
+          payload: {
+            summary: 'Done',
+            stage: 'completed',
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards[0]).toMatchObject({
+      kind: 'completion',
+      createdAtMs: Date.parse('2026-04-17T07:16:33.000Z'),
+    });
+  });
+
   it('keeps approval, question, and completion grouped even when completion appears before question', () => {
     const cards = buildActivityCardsFromSeed({
       health: { ok: true },
@@ -242,6 +348,76 @@ describe('buildActivityCardsFromSeed', () => {
     }));
   });
 
+  it('keeps long completion report content in the card body instead of the title', () => {
+    const longSummary = [
+      '修复已经构建到本地主目录的 dist 里了。',
+      '本次关键修复：',
+      '- scroll region 不再复制输入栏。',
+      '- footer 状态栏保持固定。',
+    ].join('\n');
+
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [],
+      workStates: [],
+      events: [
+        {
+          id: 901,
+          type: 'report_progress',
+          taskId: 'task-long-completion',
+          payload: {
+            stage: 'completed',
+            body: {
+              summary: longSummary,
+            },
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards).toContainEqual(expect.objectContaining({
+      kind: 'completion',
+      summary: '修复已经构建到本地主目录的 dist 里了。',
+      detailText: '本次关键修复：\n- scroll region 不再复制输入栏。\n- footer 状态栏保持固定。',
+    }));
+  });
+
+  it('keeps long approval request content in the card body instead of the title', () => {
+    const longSummary = [
+      'Claude wants to run Bash.',
+      '命令会写入本地构建产物。',
+      '请只在确认当前变更后批准。',
+    ].join('\n');
+
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [],
+      workStates: [],
+      events: [
+        {
+          id: 902,
+          type: 'request_approval',
+          taskId: 'task-long-approval',
+          payload: {
+            approvalId: 'approval-long-body',
+            body: {
+              summary: longSummary,
+            },
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards).toContainEqual(expect.objectContaining({
+      kind: 'approval',
+      approvalId: 'approval-long-body',
+      summary: 'Claude wants to run Bash.',
+      detailText: '命令会写入本地构建产物。\n请只在确认当前变更后批准。',
+    }));
+  });
+
   it('preserves distinct question summary and prompt text when both are present', () => {
     const cards = buildActivityCardsFromSeed({
       health: { ok: true },
@@ -292,6 +468,149 @@ describe('buildActivityCardsFromSeed', () => {
           payload: {
             summary: 'Still working',
             stage: 'in_progress',
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards).toEqual([]);
+  });
+
+  it('skips clarification questions that already have an answer event for the same task thread', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [],
+      workStates: [],
+      events: [
+        {
+          id: 601,
+          type: 'ask_clarification',
+          taskId: 'question-task',
+          threadId: 'question-thread',
+          payload: {
+            summary: 'Use this fix?',
+            selectionMode: 'single-select',
+            options: [{ value: 'fixed', label: 'Use current fix' }],
+          },
+        },
+        {
+          id: 602,
+          type: 'answer_clarification',
+          taskId: 'question-task',
+          threadId: 'question-thread',
+          payload: {
+            body: { summary: 'Use current fix' },
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards).toEqual([]);
+  });
+
+  it('does not collapse two explicit question ids that share the same task and thread', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [],
+      workStates: [],
+      events: [
+        {
+          id: 201,
+          type: 'ask_clarification',
+          taskId: 'task-shared',
+          threadId: 'thread-shared',
+          payload: {
+            questionId: 'question-a',
+            summary: 'Pick target A',
+            selectionMode: 'single-select',
+            options: [{ value: 'a', label: 'A' }],
+          },
+        },
+        {
+          id: 202,
+          type: 'ask_clarification',
+          taskId: 'task-shared',
+          threadId: 'thread-shared',
+          payload: {
+            questionId: 'question-b',
+            summary: 'Pick target B',
+            selectionMode: 'single-select',
+            options: [{ value: 'b', label: 'B' }],
+          },
+        },
+        {
+          id: 203,
+          type: 'answer_clarification',
+          taskId: 'task-shared',
+          threadId: 'thread-shared',
+          payload: {
+            questionId: 'question-b',
+            body: { summary: 'Use B' },
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards.filter((card) => card.kind === 'question')).toMatchObject([
+      {
+        kind: 'question',
+        questionId: 'question:question-a',
+        resolutionKey: 'question:question-a',
+        summary: 'Pick target A',
+      },
+    ]);
+  });
+
+  it('skips clarification questions when the agent has already reported progress for the same task thread', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [],
+      workStates: [],
+      events: [
+        {
+          id: 611,
+          type: 'ask_clarification',
+          taskId: 'question-task',
+          threadId: 'question-thread',
+          payload: {
+            summary: 'Use this fix?',
+            selectionMode: 'single-select',
+            options: [{ value: 'fixed', label: 'Use current fix' }],
+          },
+        },
+        {
+          id: 612,
+          type: 'report_progress',
+          taskId: 'question-task',
+          threadId: 'question-thread',
+          payload: {
+            summary: 'Handled directly in the agent session',
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards).toEqual([]);
+  });
+
+  it('skips stale preview approval smoke cards from replay', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [],
+      workStates: [],
+      events: [
+        {
+          id: 621,
+          type: 'request_approval',
+          taskId: 'preview-task-clean-3310',
+          threadId: 'preview-thread-clean-3310',
+          payload: {
+            approvalId: 'preview-approval-clean-3310',
+            summary: 'Claude wants to run Bash.',
           },
         },
       ],
@@ -480,6 +799,66 @@ describe('buildActivityCardsFromSeed', () => {
     });
 
     expect(cards).toEqual([]);
+  });
+
+  it('suppresses codex native terminal approval cards so they do not block real agent popups', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'agent-1',
+          alias: 'codex3',
+          kind: 'agent',
+          tool: 'Codex',
+          context: {
+            projectName: 'xiaok-cli',
+          },
+        },
+      ],
+      workStates: [],
+      events: [
+        {
+          id: 5521,
+          type: 'request_approval',
+          taskId: 'task-codex-native-noise',
+          payload: {
+            approvalId: 'codex-native-call_approval-noise',
+            participantId: 'agent-1',
+            delivery: {
+              semantic: 'actionable',
+              source: 'codex-native-approval',
+            },
+            nativeCodexApproval: {
+              callId: 'call_approval-noise',
+            },
+            body: {
+              summary: 'Do you want to let me stop the stalled npm smoke-test install so I can rerun it against the official npm registry?',
+              detailText: 'Mirrored from the live Codex terminal approval prompt.',
+            },
+          },
+        },
+        {
+          id: 5522,
+          type: 'ask_clarification',
+          payload: {
+            participantId: 'agent-1',
+            summary: 'Which target should I use?',
+            selectionMode: 'single-select',
+            options: [
+              { value: 'compact', label: 'Compact' },
+              { value: 'expanded', label: 'Expanded' },
+            ],
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({
+      kind: 'question',
+      cardId: 'question:5522',
+    });
   });
 
   it('suppresses pending approval items that are codex test noise by summary', () => {
