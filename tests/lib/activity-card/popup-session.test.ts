@@ -53,7 +53,7 @@ function makeEventScopedQuestion(): ActivityCardProjection {
   };
 }
 
-function makeCompletion(): ActivityCardProjection {
+function makeCompletion(overrides: Partial<Extract<ActivityCardProjection, { kind: 'completion' }>> = {}): ActivityCardProjection {
   return {
     cardId: 'completion:301',
     resolutionKey: 'completion:301',
@@ -63,6 +63,7 @@ function makeCompletion(): ActivityCardProjection {
     stage: 'completed',
     taskId: 'task-1',
     threadId: 'thread-1',
+    ...overrides,
   };
 }
 
@@ -130,6 +131,38 @@ describe('reconcilePopupSession', () => {
     expect(result.visibilityIntent).toBe('keep');
     expect(result.allowPreemption).toBe(true);
     expect(result.cardsForStore.map((card) => card.kind)).toEqual(['completion', 'approval']);
+  });
+
+  it('replaces a visible completion when a newer completion for the same task and thread arrives', () => {
+    const olderCompletion = makeCompletion({
+      cardId: 'completion:older',
+      resolutionKey: 'completion:older',
+      summary: 'Older completion',
+      taskId: 'shared-task',
+      threadId: 'shared-thread',
+    });
+    const newerCompletion = makeCompletion({
+      cardId: 'completion:newer',
+      resolutionKey: 'completion:newer',
+      summary: 'Newer completion',
+      taskId: 'shared-task',
+      threadId: 'shared-thread',
+    });
+
+    const result = reconcilePopupSession({
+      session: {
+        visibility: 'visible',
+        activeCard: olderCompletion,
+        pendingLocalResolutionKey: null,
+      },
+      nextCards: [newerCompletion],
+      seed: { health: { ok: true }, participants: [], workStates: [], events: [], approvals: [] },
+      nowMs: 1_000,
+    });
+
+    expect(result.visibilityIntent).toBe('keep');
+    expect(result.cardsForStore.map((card) => card.cardId)).toEqual(['completion:newer']);
+    expect(result.session.activeCard?.cardId).toBe('completion:newer');
   });
 
   it('does not resolve a visible question from an unrelated answer on the same task when ids differ', () => {

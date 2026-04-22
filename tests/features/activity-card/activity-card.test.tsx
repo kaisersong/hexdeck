@@ -1264,6 +1264,9 @@ describe('activity-card window routing', () => {
     await waitFor(() => {
       expect(screen.getByRole('heading', { name: /Dismiss should still close the live popup/ })).toBeInTheDocument();
     });
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+    });
 
     invokeMock.mockClear();
     hideWindowMock.mockClear();
@@ -2237,7 +2240,7 @@ describe('activity-card window routing', () => {
     expect(screen.queryByText('Completion without createdAt')).not.toBeInTheDocument();
   });
 
-  it('shows a recent completion that arrived before the activity-card child window finished booting', async () => {
+  it('shows a fresh completion that arrived before the activity-card child window finished booting', async () => {
     brokerClientInstance = {
       loadServiceSeed: vi.fn().mockResolvedValue({
         health: { ok: true },
@@ -2247,7 +2250,7 @@ describe('activity-card window routing', () => {
           {
             id: 401,
             type: 'report_progress',
-            createdAt: new Date(Date.now() - 120_000).toISOString(),
+            createdAt: new Date(Date.now() - 30_000).toISOString(),
             taskId: 'completion-task',
             threadId: 'completion-thread',
             payload: {

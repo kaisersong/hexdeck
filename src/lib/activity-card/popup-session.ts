@@ -1,4 +1,5 @@
 import type { ProjectSeed } from '../broker/types';
+import { getPopupCompletionGroupKey } from './popup-candidates';
 import type { ActivityCardProjection } from './types';
 
 export type PopupVisibilityState = 'hidden' | 'visible' | 'pending_local_resolution';
@@ -23,6 +24,26 @@ export interface ReconcilePopupSessionResult {
   cardsForStore: ActivityCardProjection[];
   visibilityIntent: PopupVisibilityIntent;
   allowPreemption: boolean;
+}
+
+function findSupersedingCompletion(
+  activeCard: ActivityCardProjection | null,
+  nextCards: ActivityCardProjection[],
+): ActivityCardProjection | null {
+  if (!activeCard || activeCard.kind !== 'completion') {
+    return null;
+  }
+
+  const activeGroupKey = getPopupCompletionGroupKey(activeCard);
+  if (!activeGroupKey) {
+    return null;
+  }
+
+  return nextCards.find((card) => (
+    card.kind === 'completion'
+      && card.cardId !== activeCard.cardId
+      && getPopupCompletionGroupKey(card) === activeGroupKey
+  )) ?? null;
 }
 
 function getTaskThreadResolutionKey(value: { taskId?: string; threadId?: string }): string | null {
@@ -170,6 +191,20 @@ export function reconcilePopupSession(input: ReconcilePopupSessionInput): Reconc
         : createHiddenPopupSession(),
       cardsForStore: nextCards,
       visibilityIntent: nextCards[0] ? 'show' : 'hide',
+      allowPreemption: true,
+    };
+  }
+
+  const supersedingCompletion = findSupersedingCompletion(activeCard, nextCards);
+  if (supersedingCompletion) {
+    return {
+      session: {
+        visibility: 'visible',
+        activeCard: supersedingCompletion,
+        pendingLocalResolutionKey: null,
+      },
+      cardsForStore: nextCards,
+      visibilityIntent: 'keep',
       allowPreemption: true,
     };
   }

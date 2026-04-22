@@ -15,6 +15,7 @@ import type {
 } from '../lib/broker/types';
 import type { JumpTarget } from '../lib/jump/types';
 import { buildActivityCardsFromSeed } from '../lib/activity-card/projections';
+import { selectPopupSessionCards } from '../lib/activity-card/popup-candidates';
 import {
   createHiddenPopupSession,
   markPopupSessionLocalAction,
@@ -183,35 +184,6 @@ function isPanelStartupActivityCardVisible(card: ActivityCardProjection, nowMs: 
   return nowMs - card.createdAtMs <= BOOTSTRAP_EPHEMERAL_CARD_FRESHNESS_MS[card.kind];
 }
 
-const ACTIVITY_CARD_PRIORITY_ORDER: Record<ActivityCardProjection['priority'], number> = {
-  critical: 0,
-  attention: 1,
-  ambient: 2,
-};
-
-function orderPopupSessionCards(cards: ActivityCardProjection[]): ActivityCardProjection[] {
-  return cards
-    .map((card, index) => ({
-      card,
-      index,
-      recencyKey: typeof card.createdAtMs === 'number' ? card.createdAtMs : index,
-    }))
-    .sort((a, b) => {
-      const priorityDelta = ACTIVITY_CARD_PRIORITY_ORDER[a.card.priority] - ACTIVITY_CARD_PRIORITY_ORDER[b.card.priority];
-      if (priorityDelta !== 0) {
-        return priorityDelta;
-      }
-
-      const recencyDelta = b.recencyKey - a.recencyKey;
-      if (recencyDelta !== 0) {
-        return recencyDelta;
-      }
-
-      return a.index - b.index;
-    })
-    .map(({ card }) => card);
-}
-
 export type AppActivityApprovalAction = {
   kind: 'approval';
   approvalId: string;
@@ -338,7 +310,7 @@ export function App() {
         return;
       }
 
-      const orderedCards = orderPopupSessionCards(cards);
+      const orderedCards = selectPopupSessionCards(cards, nowMs);
       const bootstrapCandidates = orderedCards.filter((card) => isBootstrapActivityCardFresh(card, nowMs));
       const staleCards = cards.filter((card) => !bootstrapCandidates.some((candidate) => candidate.cardId === card.cardId));
 
@@ -377,7 +349,7 @@ export function App() {
 
     if (windowMode === 'activity-card') {
       const previousActiveCardId = store.getState().activityCards.activeCard?.cardId ?? null;
-      const orderedCards = orderPopupSessionCards(cards);
+      const orderedCards = selectPopupSessionCards(cards, nowMs);
       const result = reconcilePopupSession({
         session: popupSessionRef.current,
         nextCards: orderedCards,
@@ -726,6 +698,31 @@ export function App() {
     document.addEventListener('mousedown', handlePointerDown);
     return () => {
       document.removeEventListener('mousedown', handlePointerDown);
+    };
+  }, [windowMode]);
+
+  useEffect(() => {
+    if (windowMode !== 'panel') {
+      return;
+    }
+
+    let dispose: (() => void) | undefined;
+
+    void import('@tauri-apps/api/window')
+      .then(({ getCurrentWindow }) => getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+        if (focused) {
+          return;
+        }
+
+        void Promise.resolve(getCurrentWindow().hide()).catch(() => undefined);
+      }))
+      .then((unlisten) => {
+        dispose = unlisten;
+      })
+      .catch(() => undefined);
+
+    return () => {
+      dispose?.();
     };
   }, [windowMode]);
 
