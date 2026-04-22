@@ -758,20 +758,21 @@ export function App() {
     setActivityCardRenderKey((value) => value + 1);
 
     if (windowMode === 'activity-card') {
+      const nextActiveCard = store.getState().activityCards.activeCard;
+      popupSessionRef.current = nextActiveCard
+        ? {
+            visibility: 'visible',
+            activeCard: nextActiveCard,
+            pendingLocalResolutionKey: null,
+          }
+        : createHiddenPopupSession();
+      setActivityCardWindowIntent(nextActiveCard ? 'keep' : 'hide');
+
       try {
         const [{ emit }] = await Promise.all([
           import('@tauri-apps/api/event'),
         ]);
         await emit('activity-card-dismissed', activeCardId);
-        const nextActiveCard = store.getState().activityCards.activeCard;
-        popupSessionRef.current = nextActiveCard
-          ? {
-              visibility: 'visible',
-              activeCard: nextActiveCard,
-              pendingLocalResolutionKey: null,
-            }
-          : createHiddenPopupSession();
-        setActivityCardWindowIntent(nextActiveCard ? 'keep' : 'hide');
       } catch {
         // Ignore when not running in Tauri.
       }

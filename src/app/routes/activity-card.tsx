@@ -217,19 +217,6 @@ function getPreviewCard(): ActivityCardProjection | null {
   };
 }
 
-function getActivityCardDebugMode(): boolean {
-  if (typeof window === 'undefined') {
-    return false;
-  }
-
-  const params = new URLSearchParams(window.location.search);
-  return params.has('debugLive')
-    || params.get('debug') === 'activity-card'
-    || window.location.href.includes('debugLive')
-    || window.location.href.includes('debug=activity-card')
-    || (Boolean((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV) && params.get('view') === 'activity-card');
-}
-
 async function debugLogActivityCardFrontend(message: string): Promise<void> {
   if (typeof window === 'undefined') {
     return;
@@ -334,9 +321,8 @@ export function ActivityCardRoute({
 }: ActivityCardRouteProps) {
   const shellRef = useRef<HTMLElement | null>(null);
   const previewCard = useMemo(() => getPreviewCard(), []);
-  const showDebugMetrics = useMemo(() => Boolean(previewCard) || getActivityCardDebugMode(), [previewCard]);
+  const showDebugMetrics = useMemo(() => Boolean(previewCard), [previewCard]);
   const displayCard = previewCard ?? card;
-  const compactDebugMetrics = !previewCard && showDebugMetrics;
   const hasHiddenActivityCardWindowRef = useRef(false);
   const hasShownActivityCardWindowRef = useRef(false);
   const [measurement, setMeasurement] = useState<ActivityCardMeasurement | null>(null);
@@ -348,6 +334,32 @@ export function ActivityCardRoute({
       document.body.classList.remove('activity-card-window');
     };
   }, []);
+
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+
+    void import('@tauri-apps/api/window')
+      .then(({ getCurrentWindow }) => {
+        const currentWindow = getCurrentWindow();
+        return currentWindow.onCloseRequested(async (event) => {
+          event.preventDefault();
+          if (onDismiss) {
+            onDismiss();
+            return;
+          }
+
+          await currentWindow.hide().catch(() => undefined);
+        });
+      })
+      .then((unlisten) => {
+        dispose = unlisten;
+      })
+      .catch(() => undefined);
+
+    return () => {
+      dispose?.();
+    };
+  }, [onDismiss]);
 
   useEffect(() => {
     if (!previewCard) {
@@ -376,11 +388,9 @@ export function ActivityCardRoute({
     );
     void Promise.all([
       import('@tauri-apps/api/core'),
-      import('@tauri-apps/api/window'),
     ])
-      .then(async ([{ invoke }, { getCurrentWindow }]) => {
+      .then(async ([{ invoke }]) => {
         await Promise.resolve(invoke('hide_activity_card_window')).catch(() => undefined);
-        await getCurrentWindow().hide().catch(() => undefined);
       })
       .catch(() => undefined);
   }, [previewCard, windowVisibility]);
@@ -542,7 +552,7 @@ export function ActivityCardRoute({
         onHoverChange={onHoverChange}
       />
       {showDebugMetrics ? (
-        <DebugMetrics measurement={measurement} debugInfo={debugInfo} compact={compactDebugMetrics} />
+        <DebugMetrics measurement={measurement} debugInfo={debugInfo} />
       ) : null}
     </main>
   );

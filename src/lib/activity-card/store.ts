@@ -59,7 +59,7 @@ function compareCards(
     return priorityDelta;
   }
 
-  return a.order - b.order;
+  return b.order - a.order;
 }
 
 export function createActivityCardStore(): ActivityCardStore {
@@ -76,14 +76,7 @@ export function createActivityCardStore(): ActivityCardStore {
     pausedRemainingMs: null,
   };
 
-  const ensureCardOrder = (identity: string) => {
-    const existing = cardOrderByIdentity.get(identity);
-    if (typeof existing === 'number') {
-      return existing;
-    }
-
-    const order = nextOrder;
-    nextOrder += 1;
+  const setCardOrder = (identity: string, order: number) => {
     cardOrderByIdentity.set(identity, order);
     return order;
   };
@@ -95,7 +88,7 @@ export function createActivityCardStore(): ActivityCardStore {
       .map(([identity, card]) => ({
         identity,
         card,
-        order: ensureCardOrder(identity),
+        order: cardOrderByIdentity.get(identity) ?? 0,
       }))
       .sort(compareCards);
 
@@ -139,8 +132,9 @@ export function createActivityCardStore(): ActivityCardStore {
   const buildLatestQueue = (cards: ActivityCardProjection[]) => {
     const nextQueue = new Map<string, ActivityCardProjection>();
     const seenIncomingIdentities = new Set<string>();
+    const batchBase = nextOrder;
 
-    for (const card of cards) {
+    for (const [index, card] of cards.entries()) {
       const identity = getCardIdentity(card);
 
       if (seenIncomingIdentities.has(identity)) {
@@ -153,10 +147,11 @@ export function createActivityCardStore(): ActivityCardStore {
         continue;
       }
 
-      ensureCardOrder(identity);
+      setCardOrder(identity, batchBase + (cards.length - index));
       nextQueue.set(identity, card);
     }
 
+    nextOrder += cards.length;
     return nextQueue;
   };
 
@@ -181,7 +176,7 @@ export function createActivityCardStore(): ActivityCardStore {
         const strongestCandidate = sortedEntries[0]?.card ?? null;
         const shouldKeepActive = !options.allowPreemption
           || !strongestCandidate
-          || PRIORITY_ORDER[strongestCandidate.priority] >= PRIORITY_ORDER[activeCard.priority]
+          || PRIORITY_ORDER[strongestCandidate.priority] > PRIORITY_ORDER[activeCard.priority]
           || getCardIdentity(strongestCandidate) === activeIdentity;
 
         if (shouldKeepActive) {

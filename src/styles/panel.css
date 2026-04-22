@@ -1230,6 +1230,12 @@
   cursor: pointer;
 }
 
+.floating-card__content--interactive:focus-visible {
+  outline: 2px solid rgba(255, 219, 173, 0.72);
+  outline-offset: 4px;
+  border-radius: 10px;
+}
+
 .floating-card__summary {
   margin: 0;
   font-size: 1.04rem;
@@ -1244,22 +1250,21 @@
 
 .floating-card__body {
   margin: 0;
-  color: rgba(183, 178, 170, 0.9);
+  color: rgba(239, 235, 228, 0.97);
   font-size: 0.88rem;
   line-height: 1.42;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
 .floating-card__body--approval {
-  color: rgba(243, 164, 77, 0.98);
+  color: rgba(250, 204, 142, 0.99);
   font-size: 0.92rem;
   font-weight: 700;
 }
 
 .floating-card__section-label {
   margin: 0;
-  color: rgba(245, 165, 84, 0.98);
+  color: rgba(252, 208, 149, 0.99);
   font-size: 0.84rem;
   font-weight: 800;
 }
@@ -1293,7 +1298,7 @@
 
 .floating-card__command-secondary {
   margin-top: 6px;
-  color: rgba(140, 122, 103, 0.96);
+  color: rgba(207, 196, 181, 0.9);
   font-size: 0.76rem;
   font-style: italic;
   line-height: 1.35;
@@ -1371,7 +1376,7 @@
   display: block;
   width: 100%;
   margin-top: 3px;
-  color: rgba(214, 208, 199, 0.84);
+  color: rgba(234, 228, 219, 0.92);
   font-size: 0.72rem;
   font-weight: 500;
   line-height: 1.35;
@@ -1379,10 +1384,76 @@
 
 .floating-card__body--question-detail {
   margin-top: 8px;
-  color: rgba(222, 215, 204, 0.88);
+  color: rgba(241, 236, 228, 0.95);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.floating-card__markdown {
+  display: grid;
+  gap: 8px;
+}
+
+.floating-card__markdown > * {
+  margin: 0;
+}
+
+.floating-card__markdown p,
+.floating-card__markdown li,
+.floating-card__markdown blockquote {
+  overflow-wrap: anywhere;
+}
+
+.floating-card__markdown-list {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding-left: 20px;
+}
+
+.floating-card__markdown-inline-code {
+  padding: 0.08rem 0.34rem;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(251, 247, 240, 0.98);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.86em;
+}
+
+.floating-card__markdown-code-block {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.24);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  overflow-x: auto;
+}
+
+.floating-card__markdown-code {
+  display: block;
+  color: rgba(246, 241, 234, 0.98);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.8rem;
   line-height: 1.45;
   white-space: pre-wrap;
+}
+
+.floating-card__markdown-link {
+  color: rgba(255, 226, 183, 0.98);
+  text-decoration: underline;
+  text-decoration-color: rgba(255, 226, 183, 0.48);
+  text-underline-offset: 2px;
+}
+
+.floating-card__markdown-quote {
+  padding-left: 12px;
+  border-left: 2px solid rgba(255, 255, 255, 0.18);
+  color: rgba(232, 226, 217, 0.92);
+}
+
+.floating-card__body--approval .floating-card__markdown-inline-code,
+.floating-card__body--approval .floating-card__markdown-link {
+  color: rgba(255, 240, 214, 0.99);
 }
 
 .action-button:disabled {

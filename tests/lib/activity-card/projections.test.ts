@@ -157,6 +157,82 @@ describe('buildActivityCardsFromSeed', () => {
     ]);
   });
 
+  it('builds a question card from a real xiaok broker event with selection data nested under payload.body', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'xiaok-code-session-019da8e2',
+          alias: 'xiaok3',
+          kind: 'agent',
+          tool: 'xiaok',
+          metadata: {
+            terminalApp: 'Ghostty',
+            terminalSessionID: 'ghostty-xiaok',
+            projectPath: '/Users/song/projects/xiaok-cli',
+          },
+          context: {
+            projectName: 'xiaok-cli',
+          },
+        },
+      ],
+      workStates: [],
+      events: [
+        {
+          id: 16370,
+          type: 'ask_clarification',
+          taskId: 'hexdeck-live-xiaok-q-20260421',
+          threadId: 'hexdeck-live-xiaok-q-20260421',
+          fromParticipantId: 'xiaok-code-session-019da8e2',
+          payload: {
+            participantId: 'xiaok-code-session-019da8e2',
+            body: {
+              summary: 'HexDeck live xiaok question',
+              prompt: 'Continue Stop',
+              selectionMode: 'single-select',
+              options: [
+                {
+                  value: 'continue',
+                  label: '继续',
+                  description: '继续执行当前计划',
+                },
+                {
+                  value: 'pause',
+                  label: '先停一下',
+                  description: '先不要继续执行',
+                },
+              ],
+            },
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards).toMatchObject([
+      {
+        kind: 'question',
+        cardId: 'question:16370',
+        questionId: 'question:16370',
+        summary: 'HexDeck live xiaok question',
+        prompt: 'Continue Stop',
+        actorLabel: '@xiaok3',
+        projectLabel: 'xiaok-cli',
+        toolLabel: 'xiaok',
+        terminalLabel: 'Ghostty',
+        taskId: 'hexdeck-live-xiaok-q-20260421',
+        threadId: 'hexdeck-live-xiaok-q-20260421',
+      },
+    ]);
+    expect(cards[0]).toMatchObject({
+      kind: 'question',
+      options: [
+        { value: 'continue', label: '继续', description: '继续执行当前计划' },
+        { value: 'pause', label: '先停一下', description: '先不要继续执行' },
+      ],
+    });
+  });
+
   it('preserves broker event timestamps on replay-derived ephemeral cards', () => {
     const cards = buildActivityCardsFromSeed({
       health: { ok: true },

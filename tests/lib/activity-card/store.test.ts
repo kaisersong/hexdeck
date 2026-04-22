@@ -233,6 +233,30 @@ describe('createActivityCardStore', () => {
     expect(store.getState().queue.map((card) => card.cardId)).toEqual(['completion:1']);
   });
 
+  it('preempts a visible approval when the next snapshot orders a newer same-priority approval first', () => {
+    const store = createActivityCardStore();
+
+    store.replaceQueue([makeApproval('approval:1', 'approval-1')], 0, { allowPreemption: true });
+    expect(store.getState().activeCard?.cardId).toBe('approval:1');
+
+    store.replaceQueue(
+      [
+        makeApproval('approval:2', 'approval-2'),
+        makeApproval('approval:1', 'approval-1'),
+      ],
+      1_000,
+      { allowPreemption: true }
+    );
+
+    const activeCard = store.getState().activeCard;
+    if (!activeCard || activeCard.kind !== 'approval') {
+      throw new Error(`expected approval card, got ${activeCard?.kind ?? 'null'}`);
+    }
+
+    expect(activeCard.approvalId).toBe('approval-2');
+    expect(store.getState().queue.map((card) => card.cardId)).toEqual(['approval:1']);
+  });
+
   it('does not merge distinct completion cards that only share the same summary', () => {
     const store = createActivityCardStore();
 

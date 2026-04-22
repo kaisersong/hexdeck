@@ -6,6 +6,7 @@ import type {
 } from '../../lib/activity-card/types';
 import type { BrokerApprovalDecisionMode } from '../../lib/broker/types';
 import type { JumpTarget } from '../../lib/jump/types';
+import { ActivityCardMarkdown } from './ActivityCardMarkdown';
 
 export interface FloatingActivityCardProps {
   card: ActivityCardProjection;
@@ -57,7 +58,10 @@ function renderApprovalBody(card: ActivityCardApprovalProjection, supportingText
   return (
     <>
       {normalizedSupportingText ? (
-        <p className="floating-card__body floating-card__body--approval">{normalizedSupportingText}</p>
+        <ActivityCardMarkdown
+          className="floating-card__body floating-card__body--approval"
+          markdown={normalizedSupportingText}
+        />
       ) : null}
       {card.commandTitle ? (
         <p className="floating-card__section-label">{card.commandTitle}</p>
@@ -77,9 +81,12 @@ function renderQuestionBody(card: ActivityCardQuestionProjection, supportingText
   const normalizedDetailText = normalizeCardText(card.detailText);
   return (
     <>
-      <p className="floating-card__body">{normalizedSupportingText}</p>
+      <ActivityCardMarkdown className="floating-card__body" markdown={normalizedSupportingText} />
       {normalizedDetailText ? (
-        <p className="floating-card__body floating-card__body--question-detail">{normalizedDetailText}</p>
+        <ActivityCardMarkdown
+          className="floating-card__body floating-card__body--question-detail"
+          markdown={normalizedDetailText}
+        />
       ) : null}
     </>
   );
@@ -94,7 +101,7 @@ function renderCardBody(card: ActivityCardProjection, supportingText: string) {
     return renderQuestionBody(card, supportingText);
   }
 
-  return <p className="floating-card__body">{supportingText}</p>;
+  return <ActivityCardMarkdown className="floating-card__body" markdown={supportingText} />;
 }
 
 function ApprovalActions({
@@ -198,15 +205,22 @@ export function FloatingActivityCard({
       </div>
 
       {canJump ? (
-        <button
-          type="button"
+        <div
           className="floating-card__content floating-card__content--interactive"
+          role="button"
+          tabIndex={0}
           aria-label={getJumpLabel(card)}
           onClick={() => onJump?.(card.jumpTarget!)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              onJump?.(card.jumpTarget!);
+            }
+          }}
         >
           {renderCardBody(card, supportingText)}
           {sourceLine ? <p className="floating-card__source">{sourceLine}</p> : null}
-        </button>
+        </div>
       ) : (
         <div className="floating-card__content">
           {renderCardBody(card, supportingText)}

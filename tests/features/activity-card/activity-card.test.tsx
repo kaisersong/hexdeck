@@ -20,6 +20,7 @@ const {
   loadLocalSettingsMock,
   ensureBrokerReadyMock,
   hideWindowMock,
+  onCloseRequestedMock,
   showWindowMock,
   setSizeMock,
   scaleFactorMock,
@@ -37,6 +38,7 @@ const {
   loadLocalSettingsMock: vi.fn(),
   ensureBrokerReadyMock: vi.fn(),
   hideWindowMock: vi.fn(),
+  onCloseRequestedMock: vi.fn(),
   showWindowMock: vi.fn(),
   setSizeMock: vi.fn(),
   scaleFactorMock: vi.fn(),
@@ -253,7 +255,12 @@ beforeEach(() => {
   listenMock.mockResolvedValue(() => undefined);
   setSizeMock.mockReset();
   hideWindowMock.mockReset();
+  onCloseRequestedMock.mockReset();
+  onCloseRequestedMock.mockResolvedValue(() => undefined);
   showWindowMock.mockReset();
+  hideWindowMock.mockResolvedValue(undefined);
+  showWindowMock.mockResolvedValue(undefined);
+  setSizeMock.mockResolvedValue(undefined);
   scaleFactorMock.mockReset();
   scaleFactorMock.mockResolvedValue(1);
   innerSizeMock.mockReset();
@@ -264,6 +271,7 @@ beforeEach(() => {
   getCurrentWindowMock.mockReturnValue({
     hide: hideWindowMock,
     innerSize: innerSizeMock,
+    onCloseRequested: onCloseRequestedMock,
     outerSize: outerSizeMock,
     scaleFactor: scaleFactorMock,
     show: showWindowMock,
@@ -583,6 +591,27 @@ describe('FloatingActivityCard', () => {
     expect(screen.queryByText('需要你立即确认这个 agent 意图')).not.toBeInTheDocument();
   });
 
+  it('renders approval markdown in the content body without treating command previews as markdown', () => {
+    const { container } = render(
+      <FloatingActivityCard
+        card={{
+          ...makeApprovalCard(),
+          detailText: '请确认以下步骤：\n\n- **删除旧索引**\n- `npm run build`',
+          commandTitle: 'Bash',
+          commandLine: '$ echo "**literal**"',
+        }}
+      />
+    );
+
+    const body = container.querySelector('.floating-card__body--approval');
+    const commandBlock = container.querySelector('.floating-card__command');
+    expect(body?.querySelector('ul')).toBeTruthy();
+    expect(body?.querySelector('strong')?.textContent).toBe('删除旧索引');
+    expect(body?.querySelector('code')?.textContent).toBe('npm run build');
+    expect(commandBlock?.querySelector('strong')).toBeNull();
+    expect(screen.getByText('$ echo "**literal**"')).toBeInTheDocument();
+  });
+
   it('submits question options immediately on click', () => {
     const onQuestionSelect = vi.fn();
 
@@ -610,6 +639,22 @@ describe('FloatingActivityCard', () => {
     expect(screen.getByText('Staging is safer for verification before rollout.')).toBeInTheDocument();
     expect(screen.getByText('Use the staging workspace first')).toBeInTheDocument();
     expect(screen.getByText('Apply the change immediately to prod')).toBeInTheDocument();
+  });
+
+  it('renders question prompt and detail markdown in the content area', () => {
+    const { container } = render(
+      <FloatingActivityCard
+        card={{
+          ...makeQuestionCard(),
+          prompt: 'Choose **one** target',
+          detailText: 'Review the [runbook](https://example.com/runbook).\n\n> Prefer staging first.',
+        }}
+      />
+    );
+
+    expect(container.querySelector('.floating-card__body strong')?.textContent).toBe('one');
+    expect(screen.getByRole('link', { name: 'runbook' })).toHaveAttribute('href', 'https://example.com/runbook');
+    expect(container.querySelector('.floating-card__body--question-detail blockquote')?.textContent).toContain('Prefer staging first.');
   });
 
   it('reports hover state changes so timers can pause and resume', () => {
@@ -703,6 +748,21 @@ describe('FloatingActivityCard', () => {
     expect(onJump).toHaveBeenCalledWith(completionCard.jumpTarget);
     expect(screen.queryByRole('button', { name: 'Jump' })).not.toBeInTheDocument();
   });
+
+  it('renders completion markdown details including fenced code blocks', () => {
+    const { container } = render(
+      <FloatingActivityCard
+        card={{
+          ...makeCompletionCard(),
+          jumpTarget: null,
+          detailText: 'Deployment finished.\n\n```bash\nnpm run build\n```',
+        }}
+      />
+    );
+
+    expect(screen.getByText('Deployment finished.')).toBeInTheDocument();
+    expect(container.querySelector('.floating-card__body pre code')?.textContent).toContain('npm run build');
+  });
 });
 
 describe('ActivityCardRoute', () => {
@@ -777,6 +837,36 @@ describe('ActivityCardRoute', () => {
     expect(onDismiss).toHaveBeenCalledTimes(1);
   });
 
+  it('maps native close requests to dismiss actions instead of closing the window', async () => {
+    const onDismiss = vi.fn();
+    let closeRequestHandler:
+      | ((event: { preventDefault: () => void }) => void | Promise<void>)
+      | undefined;
+
+    onCloseRequestedMock.mockImplementation(async (handler) => {
+      closeRequestHandler = handler;
+      return () => undefined;
+    });
+
+    render(
+      <ActivityCardRoute
+        card={makeApprovalCard()}
+        onDismiss={onDismiss}
+      />
+    );
+
+    await waitFor(() => {
+      expect(onCloseRequestedMock).toHaveBeenCalledTimes(1);
+    });
+
+    const preventDefault = vi.fn();
+    await closeRequestHandler?.({ preventDefault });
+
+    expect(preventDefault).toHaveBeenCalledTimes(1);
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    expect(hideWindowMock).not.toHaveBeenCalled();
+  });
+
   it('does not render an empty card when the live route has no active card', async () => {
     const onDismiss = vi.fn();
 
@@ -793,9 +883,6 @@ describe('ActivityCardRoute', () => {
 
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
-    });
-    await waitFor(() => {
-      expect(hideWindowMock).toHaveBeenCalled();
     });
   });
 
@@ -958,7 +1045,7 @@ describe('ActivityCardRoute', () => {
     }
   });
 
-  it('renders live debug activity card measurement diagnostics', async () => {
+  it('does not render live debug activity card measurement diagnostics', async () => {
     window.history.pushState({}, '', '/?view=activity-card&debugLive=1');
     invokeMock.mockImplementation((command: string) => {
       if (command === 'resize_activity_card_window') {
@@ -988,14 +1075,9 @@ describe('ActivityCardRoute', () => {
       render(<ActivityCardRoute card={makeApprovalCard()} />);
 
       await waitFor(() => {
-        const metrics = screen.getByLabelText('activity card debug measurements');
-        expect(metrics).toHaveTextContent('card 224px');
-        expect(metrics).toHaveTextContent('inner 226px');
-        expect(metrics).toHaveTextContent('outer 226px');
-        expect(metrics).not.toHaveTextContent('shell');
-        expect(metrics).not.toHaveTextContent('target');
-        expect(metrics).not.toHaveTextContent('scale');
+        expect(invokeMock).toHaveBeenCalledWith('resize_activity_card_window', { width: 680, height: 226 });
       });
+      expect(screen.queryByLabelText('activity card debug measurements')).not.toBeInTheDocument();
     } finally {
       scrollHeightSpy.mockRestore();
       rectSpy.mockRestore();
@@ -1146,6 +1228,52 @@ describe('activity-card window routing', () => {
       expect(hideWindowMock).toHaveBeenCalledTimes(1);
     });
     expect(invokeMock).not.toHaveBeenCalledWith('hide_activity_card_window');
+  });
+
+  it('still hides the live activity-card window when dismiss bridge emit fails', async () => {
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue({
+        health: { ok: true },
+        participants: [makeProjectParticipant()],
+        workStates: [],
+        events: [],
+        approvals: [
+          {
+            approvalId: 'approval-dismiss-failure',
+            taskId: 'task-dismiss-failure',
+            summary: 'Dismiss should still close the live popup',
+            decision: 'pending',
+            participantId: 'codex.main',
+          },
+        ],
+      }),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+    emitMock.mockRejectedValueOnce(new Error('bridge unavailable'));
+
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    const { App } = await import('../../../src/app/App');
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /Dismiss should still close the live popup/ })).toBeInTheDocument();
+    });
+
+    invokeMock.mockClear();
+    hideWindowMock.mockClear();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close activity card' }));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    });
+    expect(screen.queryByRole('heading', { name: /Dismiss should still close the live popup/ })).not.toBeInTheDocument();
   });
 
   it('keeps passive startup backlog hidden for the floating activity-card window', async () => {
@@ -1633,6 +1761,119 @@ describe('activity-card window routing', () => {
     expect(hideWindowMock).not.toHaveBeenCalled();
   });
 
+  it('replaces a visible approval with a newer approval without hide-show churn', async () => {
+    const firstSeed = {
+      health: { ok: true },
+      participants: [
+        makeProjectParticipant(),
+        {
+          participantId: 'claude.other',
+          alias: 'claude7',
+          kind: 'agent',
+          tool: 'claude',
+          metadata: {
+            terminalApp: 'Ghostty',
+            terminalSessionID: 'ghostty-7',
+            projectPath: '/Users/song/projects',
+          },
+          context: { projectName: 'projects' },
+        },
+      ],
+      workStates: [],
+      events: [
+        {
+          id: 410,
+          type: 'request_approval',
+          createdAt: '2026-04-21T04:10:00.000Z',
+          taskId: 'claude-approval-task',
+          threadId: 'claude-approval-thread',
+          payload: {
+            approvalId: 'claude-approval',
+            participantId: 'claude.other',
+            body: {
+              summary: 'Claude approval already visible',
+            },
+          },
+        },
+      ],
+      approvals: [],
+    };
+    const secondSeed = {
+      ...firstSeed,
+      participants: [
+        ...firstSeed.participants,
+        {
+          participantId: 'xiaok.session',
+          alias: 'xiaok4',
+          kind: 'agent',
+          tool: 'xiaok',
+          metadata: {
+            terminalApp: 'Ghostty',
+            terminalSessionID: 'ghostty-xiaok',
+            projectPath: '/Users/song/projects/xiaok-cli',
+          },
+          context: { projectName: 'xiaok-cli' },
+        },
+      ],
+      events: [
+        ...firstSeed.events,
+        {
+          id: 411,
+          type: 'request_approval',
+          createdAt: '2026-04-21T04:10:10.000Z',
+          taskId: 'xiaok-approval-task',
+          threadId: 'xiaok-approval-thread',
+          payload: {
+            approvalId: 'xiaok-approval',
+            participantId: 'xiaok.session',
+            body: {
+              summary: 'Xiaok newer approval',
+            },
+          },
+        },
+      ],
+    };
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn()
+        .mockResolvedValueOnce(firstSeed)
+        .mockResolvedValueOnce(secondSeed),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: '@claude7 · Claude approval already visible' })).toBeInTheDocument();
+    });
+
+    invokeMock.mockClear();
+    hideWindowMock.mockClear();
+
+    await waitFor(
+      () => {
+        expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(2);
+      },
+      { timeout: 1_500 }
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: '@xiaok4 · Xiaok newer approval' })).toBeInTheDocument();
+    });
+
+    expect(invokeMock).not.toHaveBeenCalledWith('hide_activity_card_window');
+    expect(invokeMock).not.toHaveBeenCalledWith('show_activity_card_window');
+    expect(hideWindowMock).not.toHaveBeenCalled();
+  });
+
   it('does not open broker realtime in the live activity-card window', async () => {
     const approvalSeed = {
       health: { ok: true },
@@ -1935,9 +2176,6 @@ describe('activity-card window routing', () => {
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
     });
-    await waitFor(() => {
-      expect(hideWindowMock).toHaveBeenCalled();
-    });
 
     expect(screen.queryByText('Old question')).not.toBeInTheDocument();
     expect(screen.queryByText('Old completion')).not.toBeInTheDocument();
@@ -1994,9 +2232,6 @@ describe('activity-card window routing', () => {
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
     });
-    await waitFor(() => {
-      expect(hideWindowMock).toHaveBeenCalled();
-    });
 
     expect(screen.queryByText('Question without createdAt')).not.toBeInTheDocument();
     expect(screen.queryByText('Completion without createdAt')).not.toBeInTheDocument();
@@ -2043,6 +2278,90 @@ describe('activity-card window routing', () => {
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
     });
+  });
+
+  it('opens the live activity-card window when a real xiaok question arrives after boot even without createdAt', async () => {
+    const initialSeed = {
+      health: { ok: true },
+      participants: [makeProjectParticipant()],
+      workStates: [],
+      events: [],
+      approvals: [],
+    };
+    const xiaokSeed = {
+      health: { ok: true },
+      participants: [
+        makeProjectParticipant(),
+        {
+          participantId: 'xiaok-code-session-019da8e2',
+          alias: 'xiaok3',
+          kind: 'agent',
+          tool: 'xiaok',
+          metadata: {
+            terminalApp: 'Ghostty',
+            terminalSessionID: 'ghostty-xiaok',
+            projectPath: '/Users/song/projects/xiaok-cli',
+          },
+          context: { projectName: 'xiaok-cli' },
+        },
+      ],
+      workStates: [],
+      events: [
+        {
+          id: 16370,
+          type: 'ask_clarification',
+          taskId: 'hexdeck-live-xiaok-q-20260421',
+          threadId: 'hexdeck-live-xiaok-q-20260421',
+          fromParticipantId: 'xiaok-code-session-019da8e2',
+          payload: {
+            participantId: 'xiaok-code-session-019da8e2',
+            body: {
+              summary: 'HexDeck live xiaok question',
+              prompt: 'Continue Stop',
+              selectionMode: 'single-select',
+              options: [
+                { value: 'continue', label: '继续', description: '继续执行当前计划' },
+                { value: 'pause', label: '先停一下', description: '先不要继续执行' },
+              ],
+            },
+          },
+        },
+      ],
+      approvals: [],
+    };
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn()
+        .mockResolvedValueOnce(initialSeed)
+        .mockResolvedValue(xiaokSeed),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    });
+
+    invokeMock.mockClear();
+    showWindowMock.mockClear();
+
+    await waitFor(
+      () => {
+        expect(screen.getByRole('heading', { name: '@xiaok3 · HexDeck live xiaok question' })).toBeInTheDocument();
+      },
+      { timeout: 1_500 }
+    );
+
+    expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
   });
 
   it.each([
@@ -2325,9 +2644,6 @@ describe('activity-card window routing', () => {
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
     });
-    await waitFor(() => {
-      expect(hideWindowMock).toHaveBeenCalled();
-    });
   });
 
   it('hides the floating activity-card window after answering the last live question', async () => {
@@ -2389,9 +2705,6 @@ describe('activity-card window routing', () => {
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
     });
-    await waitFor(() => {
-      expect(hideWindowMock).toHaveBeenCalled();
-    });
   });
 
   it('hides the floating activity-card window instead of leaving an empty shell when an answered question lingers in the next seed refresh', async () => {
@@ -2449,9 +2762,6 @@ describe('activity-card window routing', () => {
     });
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
-    });
-    await waitFor(() => {
-      expect(hideWindowMock).toHaveBeenCalled();
     });
 
     expect(screen.queryByRole('button', { name: 'Ship it' })).not.toBeInTheDocument();

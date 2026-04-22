@@ -1,5 +1,18 @@
 # HexDeck 发布设置指南
 
+## 当前发布版本
+
+- App version: `0.2.0`
+- Tag: `v0.2.0`
+
+## 0.2.0 发布要点
+
+- 真实 native `activity-card` 已按三类结构化消息验证：`request_approval`、单选 `ask_clarification`、`report_progress(stage="completed")`
+- 弹窗是否出现只取决于消息类型，不取决于 `project`
+- live popup 首次弹出默认应保持被动，不抢宿主终端键盘输入
+- activity-card 正文支持安全 Markdown 子集渲染
+- 当前 `AskUserQuestion.questions[]` 仍只会落成第一条可投影的单选题，完整多题/多步卡片 UI 尚未实现
+
 ## GitHub Secrets 配置
 
 在 GitHub 仓库 Settings -> Secrets and variables -> Actions 中添加以下 secrets:
