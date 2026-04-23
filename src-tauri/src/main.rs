@@ -2,6 +2,7 @@
 
 mod commands;
 
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -9,16 +10,25 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::Command;
 use tauri::{
+    image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    utils::config::BackgroundThrottlingPolicy, Manager, PhysicalPosition, WebviewUrl,
-    WebviewWindow, WebviewWindowBuilder,
+    utils::config::BackgroundThrottlingPolicy,
+    Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 use tauri_plugin_positioner::{Position, WindowExt};
 
 const TRAY_MENU_OPEN_ID: &str = "hexdeck-tray-open";
 const TRAY_MENU_SETTINGS_ID: &str = "hexdeck-tray-settings";
 const TRAY_MENU_QUIT_ID: &str = "hexdeck-tray-quit";
+const ACTIVITY_CARD_REFRESH_EVENT: &str = "activity-card-refresh-requested";
+const ACTIVITY_CARD_LOCAL_APPROVAL_EVENT: &str = "activity-card-local-approval-requested";
+const ACTIVITY_CARD_BROKER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const ACTIVITY_CARD_LOCAL_APPROVAL_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(100);
+const ACTIVITY_CARD_DIAGNOSTICS_LOG_NAME: &str = "hexdeck-activity-card-diagnostics.log";
+#[cfg(target_os = "macos")]
+const MACOS_TRAY_ICON_PNG: &[u8] = include_bytes!("../../public/hexdeck-menu-tray.png");
 
 // ============================================================================
 // CLI Subcommand Definitions
@@ -203,6 +213,10 @@ fn activity_card_window_focusable() -> bool {
     activity_card_window_focusable_for(activity_card_preview_mode().as_deref())
 }
 
+fn activity_card_window_accepts_first_mouse() -> bool {
+    true
+}
+
 fn log_activity_card_window_state(stage: &str, window: &WebviewWindow) {
     if activity_card_preview_mode().is_none() {
         return;
@@ -217,6 +231,40 @@ fn log_activity_card_window_state(stage: &str, window: &WebviewWindow) {
     );
 }
 
+fn activity_card_diagnostics_log_path() -> std::path::PathBuf {
+    env::temp_dir().join(ACTIVITY_CARD_DIAGNOSTICS_LOG_NAME)
+}
+
+fn append_activity_card_diagnostics_log(message: &str) {
+    let log_path = activity_card_diagnostics_log_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = writeln!(
+            file,
+            "{} pid={} {}",
+            Utc::now().to_rfc3339(),
+            std::process::id(),
+            message
+        );
+    }
+}
+
+fn truncate_diagnostic_message(value: Option<&str>) -> String {
+    let value = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-");
+    let truncated = value.chars().take(160).collect::<String>();
+    if value.chars().count() > 160 {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
 fn activity_card_preview_mode() -> Option<String> {
     let preview = env::var("HEXDECK_ACTIVITY_CARD_PREVIEW").ok()?;
     let trimmed = preview.trim();
@@ -229,8 +277,12 @@ fn activity_card_preview_mode() -> Option<String> {
 
 fn activity_card_window_location_for(preview: Option<&str>) -> String {
     match preview {
-        Some(value) if value.trim().starts_with('&') => format!("index.html?view=activity-card{}", value.trim()),
-        Some(value) if !value.trim().is_empty() => format!("index.html?view=activity-card&preview={}", value.trim()),
+        Some(value) if value.trim().starts_with('&') => {
+            format!("index.html?view=activity-card{}", value.trim())
+        }
+        Some(value) if !value.trim().is_empty() => {
+            format!("index.html?view=activity-card&preview={}", value.trim())
+        }
         _ => "index.html?view=activity-card".to_string(),
     }
 }
@@ -252,15 +304,37 @@ fn tray_click_action(button: MouseButton, state: MouseButtonState) -> TrayClickA
 }
 
 fn tray_menu_item_ids() -> [&'static str; 3] {
-    [
-        TRAY_MENU_OPEN_ID,
-        TRAY_MENU_SETTINGS_ID,
-        TRAY_MENU_QUIT_ID,
-    ]
+    [TRAY_MENU_OPEN_ID, TRAY_MENU_SETTINGS_ID, TRAY_MENU_QUIT_ID]
 }
 
 fn desktop_shell_uses_accessory_activation_policy() -> bool {
     true
+}
+
+fn tray_icon_uses_template_image() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn load_tray_icon_pixels() -> Option<(Vec<u8>, u32, u32)> {
+    let image = image::load_from_memory(MACOS_TRAY_ICON_PNG)
+        .ok()?
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    Some((image.into_raw(), width, height))
+}
+
+fn load_tray_icon_image() -> Option<Image<'static>> {
+    #[cfg(target_os = "macos")]
+    {
+        let (pixels, width, height) = load_tray_icon_pixels()?;
+        return Some(Image::new_owned(pixels, width, height));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 fn activity_card_window_position(
@@ -275,8 +349,10 @@ fn activity_card_window_position(
         1.0
     };
     let window_width_physical = (window_width * safe_scale_factor).round() as i32;
-    let top_margin_physical = (activity_card_window_top_margin() as f64 * safe_scale_factor).round() as i32;
-    let centered_x = work_area_position.x + ((work_area_width as i32 - window_width_physical).max(0) / 2);
+    let top_margin_physical =
+        (activity_card_window_top_margin() as f64 * safe_scale_factor).round() as i32;
+    let centered_x =
+        work_area_position.x + ((work_area_width as i32 - window_width_physical).max(0) / 2);
     let top_y = work_area_position.y + top_margin_physical;
 
     PhysicalPosition::new(centered_x, top_y)
@@ -327,8 +403,10 @@ fn activity_card_target_monitor(
         .map(|monitor| monitor.work_area().position)
         .collect::<Vec<_>>();
 
-    Ok(activity_card_target_monitor_index(&work_area_positions, primary_index)
-        .and_then(|index| monitors.into_iter().nth(index)))
+    Ok(
+        activity_card_target_monitor_index(&work_area_positions, primary_index)
+            .and_then(|index| monitors.into_iter().nth(index)),
+    )
 }
 
 fn expanded_window_size() -> (f64, f64) {
@@ -410,30 +488,27 @@ fn ensure_activity_card_window(app: &tauri::AppHandle) -> tauri::Result<WebviewW
     if activity_card_preview_mode().is_some() {
         eprintln!("[activity-card-preview] location: {location}");
     }
-    WebviewWindowBuilder::new(
-        app,
-        "activity-card",
-        WebviewUrl::App(location.into()),
-    )
-    .title("HexDeck Activity Card")
-    .inner_size(width, height)
-    .resizable(activity_card_window_resizable())
-    .visible(false)
-    .focusable(activity_card_window_focusable())
-    .always_on_top(true)
-    .visible_on_all_workspaces(true)
-    .decorations(false)
-    .skip_taskbar(true)
-    .background_throttling(BackgroundThrottlingPolicy::Disabled)
-    .build()
-    .inspect(|window| {
-        if activity_card_preview_mode().is_some() {
-            log_activity_card_window_state("created", window);
-            window.on_window_event(|event| {
-                eprintln!("[activity-card-preview] window-event: {event:?}");
-            });
-        }
-    })
+    WebviewWindowBuilder::new(app, "activity-card", WebviewUrl::App(location.into()))
+        .title("HexDeck Activity Card")
+        .inner_size(width, height)
+        .resizable(activity_card_window_resizable())
+        .visible(false)
+        .accept_first_mouse(activity_card_window_accepts_first_mouse())
+        .focusable(activity_card_window_focusable())
+        .always_on_top(true)
+        .visible_on_all_workspaces(true)
+        .decorations(false)
+        .skip_taskbar(true)
+        .background_throttling(BackgroundThrottlingPolicy::Disabled)
+        .build()
+        .inspect(|window| {
+            if activity_card_preview_mode().is_some() {
+                log_activity_card_window_state("created", window);
+                window.on_window_event(|event| {
+                    eprintln!("[activity-card-preview] window-event: {event:?}");
+                });
+            }
+        })
 }
 
 fn position_activity_card_window(
@@ -546,11 +621,42 @@ fn prepare_activity_card_window(app: tauri::AppHandle) -> Result<(), String> {
     prepare_activity_card_window_for_app(&app).map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 fn should_prepare_activity_card_window(
     window_visible: bool,
     prepare_event_id: Option<u64>,
 ) -> bool {
     prepare_event_id.is_some() && !window_visible
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityCardWatcherWindowAction {
+    None,
+    Prepare,
+}
+
+fn should_emit_activity_card_refresh(prepare_event_id: Option<u64>) -> bool {
+    prepare_event_id.is_some()
+}
+
+fn activity_card_watcher_window_action(
+    window_visible: bool,
+    prepare_event_id: Option<u64>,
+    prepare_local_approval_id: Option<&str>,
+) -> ActivityCardWatcherWindowAction {
+    if window_visible {
+        return ActivityCardWatcherWindowAction::None;
+    }
+
+    if prepare_local_approval_id.is_some() {
+        return ActivityCardWatcherWindowAction::Prepare;
+    }
+
+    if prepare_event_id.is_some() {
+        return ActivityCardWatcherWindowAction::Prepare;
+    }
+
+    ActivityCardWatcherWindowAction::None
 }
 
 fn prepare_activity_card_window_for_app(app: &tauri::AppHandle) -> tauri::Result<()> {
@@ -565,10 +671,6 @@ fn prepare_activity_card_window_for_app(app: &tauri::AppHandle) -> tauri::Result
     window.set_focusable(activity_card_window_focusable())?;
     window.set_always_on_top(true)?;
     window.set_visible_on_all_workspaces(true)
-}
-
-fn prepare_activity_card_window_for_app_silent(app: &tauri::AppHandle) {
-    let _ = prepare_activity_card_window_for_app(app);
 }
 
 #[tauri::command]
@@ -613,6 +715,7 @@ fn hide_activity_card_window(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn debug_log_activity_card_frontend(message: String) -> Result<(), String> {
+    append_activity_card_diagnostics_log(&format!("[frontend] {message}"));
     if activity_card_preview_mode().is_some() {
         eprintln!("[activity-card-frontend] {message}");
     }
@@ -634,6 +737,43 @@ fn broker_event_kind(value: &serde_json::Value) -> Option<&str> {
         .or_else(|| value.get("type").and_then(serde_json::Value::as_str))
 }
 
+fn local_host_approval_id(value: &serde_json::Value) -> Option<&str> {
+    value.get("approvalId").and_then(serde_json::Value::as_str)
+}
+
+fn describe_local_host_approval(value: Option<&serde_json::Value>) -> String {
+    let Some(value) = value else {
+        return "none".to_string();
+    };
+
+    let approval_id = local_host_approval_id(value).unwrap_or("-");
+    let participant_id = value
+        .get("participantId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    let created_at = value
+        .get("createdAt")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    let command_line = value
+        .get("commandLine")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .get("body")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|body| body.get("commandLine"))
+                .and_then(serde_json::Value::as_str)
+        });
+    format!(
+        "approvalId={} participantId={} createdAt={} commandLine={}",
+        approval_id,
+        participant_id,
+        created_at,
+        truncate_diagnostic_message(command_line)
+    )
+}
+
 fn broker_event_payload(value: &serde_json::Value) -> Option<&serde_json::Value> {
     value.get("payload").filter(|payload| payload.is_object())
 }
@@ -651,12 +791,20 @@ fn broker_payload_summary(payload: &serde_json::Value) -> Option<&str> {
 fn is_suppressed_activity_card_event(value: &serde_json::Value) -> bool {
     let task_id = value.get("taskId").and_then(serde_json::Value::as_str);
     let payload = broker_event_payload(value);
-    let approval_id = payload
-        .and_then(|payload| payload.get("approvalId").and_then(serde_json::Value::as_str));
+    let approval_id = payload.and_then(|payload| {
+        payload
+            .get("approvalId")
+            .and_then(serde_json::Value::as_str)
+    });
     let summary = payload.and_then(broker_payload_summary);
 
     summary
-        .map(|summary| summary.trim().to_ascii_lowercase().starts_with("codex needs approval"))
+        .map(|summary| {
+            summary
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("codex needs approval")
+        })
         .unwrap_or(false)
         || approval_id
             .map(|approval_id| approval_id.starts_with("preview-approval-"))
@@ -673,9 +821,11 @@ fn is_popup_activity_card_event(value: &serde_json::Value) -> bool {
 
     match broker_event_kind(value) {
         Some("request_approval") | Some("ask_clarification") => true,
-        Some("report_progress") => broker_event_payload(value)
-            .and_then(|payload| payload.get("stage").and_then(serde_json::Value::as_str))
-            == Some("completed"),
+        Some("report_progress") => {
+            broker_event_payload(value)
+                .and_then(|payload| payload.get("stage").and_then(serde_json::Value::as_str))
+                == Some("completed")
+        }
         _ => false,
     }
 }
@@ -696,6 +846,9 @@ struct ActivityCardBrokerWatcher {
     initialized: bool,
     after: u64,
     last_prepared_popup_event_id: Option<u64>,
+    last_prepared_local_approval_id: Option<String>,
+    last_prepared_local_approval_at: Option<tokio::time::Instant>,
+    last_observed_local_approval_id: Option<String>,
     consecutive_error_count: u32,
 }
 
@@ -705,6 +858,9 @@ impl ActivityCardBrokerWatcher {
             initialized: initial_after.is_some(),
             after: initial_after.unwrap_or(0),
             last_prepared_popup_event_id: None,
+            last_prepared_local_approval_id: None,
+            last_prepared_local_approval_at: None,
+            last_observed_local_approval_id: None,
             consecutive_error_count: 0,
         }
     }
@@ -751,54 +907,201 @@ impl ActivityCardBrokerWatcher {
             _ => None,
         }
     }
+
+    fn take_prepare_local_approval_id(
+        &mut self,
+        approval_id: Option<&str>,
+        now: tokio::time::Instant,
+    ) -> Option<String> {
+        match approval_id {
+            Some(approval_id)
+                if self.last_prepared_local_approval_id.as_deref() != Some(approval_id) =>
+            {
+                let approval_id = approval_id.to_string();
+                self.last_prepared_local_approval_id = Some(approval_id.clone());
+                self.last_prepared_local_approval_at = Some(now);
+                Some(approval_id)
+            }
+            Some(approval_id) => {
+                let should_retry = self
+                    .last_prepared_local_approval_at
+                    .map(|last_at| {
+                        now.duration_since(last_at) >= ACTIVITY_CARD_BROKER_POLL_INTERVAL
+                    })
+                    .unwrap_or(true);
+                if should_retry {
+                    self.last_prepared_local_approval_at = Some(now);
+                    return Some(approval_id.to_string());
+                }
+                None
+            }
+            None => {
+                self.last_prepared_local_approval_id = None;
+                self.last_prepared_local_approval_at = None;
+                None
+            }
+        }
+    }
+
+    fn note_local_approval_observation(
+        &mut self,
+        approval_item: Option<&serde_json::Value>,
+        window_visible: bool,
+    ) {
+        let next_id = approval_item
+            .and_then(local_host_approval_id)
+            .map(str::to_string);
+        if next_id != self.last_observed_local_approval_id {
+            append_activity_card_diagnostics_log(&format!(
+                "[watcher/local-observed] windowVisible={} {}",
+                window_visible,
+                describe_local_host_approval(approval_item)
+            ));
+            self.last_observed_local_approval_id = next_id;
+        }
+    }
 }
 
 async fn poll_activity_card_events(app: tauri::AppHandle) {
     let broker_url = "http://127.0.0.1:4318".to_string();
     let initial_after = load_latest_broker_event_id(&broker_url).await.ok();
     let mut watcher = ActivityCardBrokerWatcher::new(initial_after);
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut interval = tokio::time::interval(ACTIVITY_CARD_LOCAL_APPROVAL_POLL_INTERVAL);
+    let mut next_broker_poll_at = tokio::time::Instant::now();
 
     loop {
         interval.tick().await;
 
-        let payload = match commands::broker::broker_get_json(
-            &broker_url,
-            &format!("/events/replay?after={}", watcher.after),
-        )
-        .await
-        {
-            Ok(payload) => payload,
-            Err(_) => {
-                watcher.note_poll_error();
-                let backoff = watcher.error_backoff_duration();
-                if !backoff.is_zero() {
-                    tokio::time::sleep(backoff).await;
-                }
-                continue;
-            }
-        };
-
-        watcher.note_poll_success();
-        let events = commands::broker::value_items(payload, "items");
-        let page = events.as_array().cloned().unwrap_or_default();
-        let prepare_event_id = watcher.take_prepare_event_id(&page);
+        let now = tokio::time::Instant::now();
         let window_visible = app
             .get_webview_window("activity-card")
             .and_then(|window| window.is_visible().ok())
             .unwrap_or(false);
+        let local_approval_item = commands::broker::latest_local_host_approval_item_value();
+        watcher.note_local_approval_observation(local_approval_item.as_ref(), window_visible);
+        let prepare_local_approval_id = watcher.take_prepare_local_approval_id(
+            local_approval_item
+                .as_ref()
+                .and_then(local_host_approval_id),
+            now,
+        );
+        let mut prepare_event_id = None;
 
-        if should_prepare_activity_card_window(window_visible, prepare_event_id) {
+        if now >= next_broker_poll_at {
+            match commands::broker::broker_get_json(
+                &broker_url,
+                &format!("/events/replay?after={}", watcher.after),
+            )
+            .await
+            {
+                Ok(payload) => {
+                    watcher.note_poll_success();
+                    let events = commands::broker::value_items(payload, "items");
+                    let page = events.as_array().cloned().unwrap_or_default();
+                    prepare_event_id = watcher.take_prepare_event_id(&page);
+                    next_broker_poll_at = now + ACTIVITY_CARD_BROKER_POLL_INTERVAL;
+                }
+                Err(_) => {
+                    watcher.note_poll_error();
+                    let backoff = watcher.error_backoff_duration();
+                    next_broker_poll_at = now
+                        + if backoff.is_zero() {
+                            ACTIVITY_CARD_BROKER_POLL_INTERVAL
+                        } else {
+                            backoff
+                        };
+                }
+            }
+        }
+        let window_action = activity_card_watcher_window_action(
+            window_visible,
+            prepare_event_id,
+            prepare_local_approval_id.as_deref(),
+        );
+        let should_emit_refresh = should_emit_activity_card_refresh(prepare_event_id);
+
+        if window_action != ActivityCardWatcherWindowAction::None
+            || should_emit_refresh
+            || prepare_local_approval_id.is_some()
+        {
+            append_activity_card_diagnostics_log(&format!(
+                "[watcher/dispatch] windowVisible={} action={:?} emitRefresh={} popupEventId={} localRetryId={} {}",
+                window_visible,
+                window_action,
+                should_emit_refresh,
+                prepare_event_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                prepare_local_approval_id.as_deref().unwrap_or("-"),
+                describe_local_host_approval(local_approval_item.as_ref())
+            ));
             let app_for_thread = app.clone();
-            let app_for_prepare = app.clone();
+            let app_for_window_action = app.clone();
+            let refresh_payload = prepare_event_id.map(|event_id| event_id.to_string());
+            let local_approval_payload = if prepare_local_approval_id.is_some() {
+                local_approval_item.clone()
+            } else {
+                None
+            };
             let _ = app_for_thread.run_on_main_thread(move || {
-                prepare_activity_card_window_for_app_silent(&app_for_prepare);
+                let mut prepare_result = "skipped".to_string();
+                let show_result = "skipped".to_string();
+                match window_action {
+                    ActivityCardWatcherWindowAction::Prepare => {
+                        match prepare_activity_card_window_for_app(&app_for_window_action) {
+                            Ok(()) => prepare_result = "ok".to_string(),
+                            Err(error) => prepare_result = format!("error:{error}"),
+                        }
+                    }
+                    ActivityCardWatcherWindowAction::None => {}
+                }
+                let mut emit_local_result = "skipped".to_string();
+                if let Some(payload) = local_approval_payload.clone() {
+                    emit_local_result = match app_for_window_action.emit_to(
+                        "activity-card",
+                        ACTIVITY_CARD_LOCAL_APPROVAL_EVENT,
+                        payload,
+                    ) {
+                        Ok(()) => "ok".to_string(),
+                        Err(error) => format!("error:{error}"),
+                    };
+                }
+                let mut emit_refresh_result = "skipped".to_string();
+                if should_emit_refresh {
+                    emit_refresh_result = match app_for_window_action.emit_to(
+                        "activity-card",
+                        ACTIVITY_CARD_REFRESH_EVENT,
+                        refresh_payload.clone(),
+                    ) {
+                        Ok(()) => "ok".to_string(),
+                        Err(error) => format!("error:{error}"),
+                    };
+                }
+                let window_visible_after = app_for_window_action
+                    .get_webview_window("activity-card")
+                    .and_then(|window| window.is_visible().ok())
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                append_activity_card_diagnostics_log(&format!(
+                    "[watcher/main-thread] action={:?} prepare={} show={} emitLocal={} emitRefresh={} windowVisibleAfter={} {}",
+                    window_action,
+                    prepare_result,
+                    show_result,
+                    emit_local_result,
+                    emit_refresh_result,
+                    window_visible_after,
+                    describe_local_host_approval(local_approval_payload.as_ref())
+                ));
             });
         }
     }
 }
 
 fn start_activity_card_event_watcher(app: tauri::AppHandle) {
+    append_activity_card_diagnostics_log(&format!(
+        "[watcher/start] logPath={}",
+        activity_card_diagnostics_log_path().display()
+    ));
     tauri::async_runtime::spawn(async move {
         poll_activity_card_events(app).await;
     });
@@ -811,10 +1114,7 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let separator = PredefinedMenuItem::separator(app)?;
     let quit_item = MenuItem::with_id(app, quit_id, "Quit HexDeck", true, None::<&str>)?;
 
-    Menu::with_items(
-        app,
-        &[&open_item, &settings_item, &separator, &quit_item],
-    )
+    Menu::with_items(app, &[&open_item, &settings_item, &separator, &quit_item])
 }
 
 fn handle_tray_menu_event(app: &tauri::AppHandle, menu_id: &str) {
@@ -865,7 +1165,11 @@ fn setup_tray_icon(app: &tauri::AppHandle) -> tauri::Result<()> {
             handle_tray_icon_event(tray.app_handle(), event);
         });
 
-    if let Some(icon) = app.default_window_icon().cloned() {
+    if let Some(icon) = load_tray_icon_image() {
+        tray = tray
+            .icon(icon)
+            .icon_as_template(tray_icon_uses_template_image());
+    } else if let Some(icon) = app.default_window_icon().cloned() {
         tray = tray.icon(icon).icon_as_template(cfg!(target_os = "macos"));
     }
 
@@ -1352,8 +1656,10 @@ fn main() {
             commands::load_broker_service_seed,
             commands::load_broker_project_seed,
             commands::load_broker_pending_approvals,
+            commands::load_latest_local_host_approval_item,
             commands::register_broker_ui_participant,
             commands::respond_to_broker_approval,
+            commands::respond_to_local_host_approval,
             commands::get_broker_runtime_status,
             commands::ensure_broker_running,
             commands::restart_broker_runtime,
@@ -1372,6 +1678,8 @@ fn main() {
 
             if setup_creates_panel_window(preview.as_deref()) {
                 let _panel = ensure_panel_window(app.handle())?;
+                let _activity_card = ensure_activity_card_window(app.handle())?;
+                prepare_activity_card_window_for_app(app.handle())?;
                 start_activity_card_event_watcher(app.handle().clone());
             } else {
                 let _activity_card = ensure_activity_card_window(app.handle())?;
@@ -1418,7 +1726,10 @@ mod tests {
     #[test]
     fn tray_left_mouse_up_toggles_panel() {
         assert_eq!(
-            tray_click_action(tauri::tray::MouseButton::Left, tauri::tray::MouseButtonState::Up),
+            tray_click_action(
+                tauri::tray::MouseButton::Left,
+                tauri::tray::MouseButtonState::Up
+            ),
             TrayClickAction::TogglePanel
         );
     }
@@ -1426,11 +1737,17 @@ mod tests {
     #[test]
     fn tray_non_primary_clicks_do_not_toggle_panel() {
         assert_eq!(
-            tray_click_action(tauri::tray::MouseButton::Right, tauri::tray::MouseButtonState::Up),
+            tray_click_action(
+                tauri::tray::MouseButton::Right,
+                tauri::tray::MouseButtonState::Up
+            ),
             TrayClickAction::Ignore
         );
         assert_eq!(
-            tray_click_action(tauri::tray::MouseButton::Left, tauri::tray::MouseButtonState::Down),
+            tray_click_action(
+                tauri::tray::MouseButton::Left,
+                tauri::tray::MouseButtonState::Down
+            ),
             TrayClickAction::Ignore
         );
     }
@@ -1476,12 +1793,12 @@ mod tests {
 
     #[test]
     fn activity_card_target_monitor_prefers_origin_work_area_for_notch_display() {
-        let positions = [
-            PhysicalPosition::new(1512, 0),
-            PhysicalPosition::new(0, 0),
-        ];
+        let positions = [PhysicalPosition::new(1512, 0), PhysicalPosition::new(0, 0)];
 
-        assert_eq!(activity_card_target_monitor_index(&positions, Some(0)), Some(1));
+        assert_eq!(
+            activity_card_target_monitor_index(&positions, Some(0)),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1491,7 +1808,10 @@ mod tests {
             PhysicalPosition::new(3432, 0),
         ];
 
-        assert_eq!(activity_card_target_monitor_index(&positions, Some(0)), Some(0));
+        assert_eq!(
+            activity_card_target_monitor_index(&positions, Some(0)),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1508,9 +1828,20 @@ mod tests {
 
     #[test]
     fn live_debug_activity_card_window_starts_hidden_and_does_not_focus() {
-        assert!(!activity_card_window_starts_visible_for(Some("&debugLive=1&project=hexdeck")));
-        assert!(!activity_card_window_focuses_on_show_for(Some("&debugLive=1&project=hexdeck")));
-        assert!(!activity_card_window_focusable_for(Some("&debugLive=1&project=hexdeck")));
+        assert!(!activity_card_window_starts_visible_for(Some(
+            "&debugLive=1&project=hexdeck"
+        )));
+        assert!(!activity_card_window_focuses_on_show_for(Some(
+            "&debugLive=1&project=hexdeck"
+        )));
+        assert!(!activity_card_window_focusable_for(Some(
+            "&debugLive=1&project=hexdeck"
+        )));
+    }
+
+    #[test]
+    fn activity_card_window_accepts_first_mouse_for_passive_popup_clicks() {
+        assert!(activity_card_window_accepts_first_mouse());
     }
 
     #[test]
@@ -1627,6 +1958,36 @@ mod tests {
     }
 
     #[test]
+    fn activity_card_broker_watcher_prepares_for_new_local_host_approval_ids() {
+        let mut watcher = ActivityCardBrokerWatcher::new(Some(100));
+        let first = tokio::time::Instant::now();
+        let second = first + std::time::Duration::from_millis(1);
+        let third = second + std::time::Duration::from_millis(1);
+
+        assert_eq!(
+            watcher.take_prepare_local_approval_id(
+                Some("hexdeck-local-codex-host-codex-session-019db354-call_1"),
+                first
+            ),
+            Some("hexdeck-local-codex-host-codex-session-019db354-call_1".to_string())
+        );
+        assert_eq!(
+            watcher.take_prepare_local_approval_id(
+                Some("hexdeck-local-codex-host-codex-session-019db354-call_1"),
+                second
+            ),
+            None
+        );
+        assert_eq!(
+            watcher.take_prepare_local_approval_id(
+                Some("hexdeck-local-codex-host-codex-session-019db354-call_2"),
+                third
+            ),
+            Some("hexdeck-local-codex-host-codex-session-019db354-call_2".to_string())
+        );
+    }
+
+    #[test]
     fn activity_card_broker_watcher_advances_cursor_for_non_popup_pages_without_prepare() {
         let mut watcher = ActivityCardBrokerWatcher::new(Some(200));
         let page = vec![
@@ -1676,8 +2037,102 @@ mod tests {
     }
 
     #[test]
+    fn activity_card_broker_watcher_prepares_hidden_window_for_broker_events() {
+        assert_eq!(
+            activity_card_watcher_window_action(false, Some(501), None),
+            ActivityCardWatcherWindowAction::Prepare
+        );
+    }
+
+    #[test]
+    fn activity_card_broker_watcher_prepares_hidden_window_for_local_host_approvals() {
+        assert_eq!(
+            activity_card_watcher_window_action(
+                false,
+                None,
+                Some("hexdeck-local-codex-host-codex-session-019db354-call_1")
+            ),
+            ActivityCardWatcherWindowAction::Prepare
+        );
+    }
+
+    #[test]
+    fn activity_card_broker_watcher_keeps_window_action_idle_for_visible_local_host_approval() {
+        assert_eq!(
+            activity_card_watcher_window_action(
+                true,
+                None,
+                Some("hexdeck-local-codex-host-codex-session-019db354-call_1")
+            ),
+            ActivityCardWatcherWindowAction::None
+        );
+    }
+
+    #[test]
+    fn activity_card_broker_watcher_does_not_emit_refresh_without_popup_signals() {
+        assert!(!should_emit_activity_card_refresh(None));
+    }
+
+    #[test]
+    fn activity_card_broker_watcher_emits_refresh_for_broker_popup_events() {
+        assert!(should_emit_activity_card_refresh(Some(501)));
+    }
+
+    #[test]
+    fn activity_card_broker_watcher_retries_same_local_host_approval_while_window_hidden() {
+        let mut watcher = ActivityCardBrokerWatcher::new(Some(0));
+        let approval_id = "hexdeck-local-codex-host-codex-session-019db354-call_1";
+        let first = tokio::time::Instant::now();
+        let second =
+            first + ACTIVITY_CARD_BROKER_POLL_INTERVAL + std::time::Duration::from_millis(1);
+
+        assert_eq!(
+            watcher.take_prepare_local_approval_id(Some(approval_id), first),
+            Some(approval_id.to_string())
+        );
+        assert_eq!(
+            watcher.take_prepare_local_approval_id(Some(approval_id), second),
+            Some(approval_id.to_string())
+        );
+    }
+
+    #[test]
+    fn activity_card_broker_watcher_retries_same_local_host_approval_while_window_visible() {
+        let mut watcher = ActivityCardBrokerWatcher::new(Some(0));
+        let approval_id = "hexdeck-local-codex-host-codex-session-019db354-call_1";
+        let first = tokio::time::Instant::now();
+        let second =
+            first + ACTIVITY_CARD_BROKER_POLL_INTERVAL + std::time::Duration::from_millis(1);
+
+        assert_eq!(
+            watcher.take_prepare_local_approval_id(Some(approval_id), first),
+            Some(approval_id.to_string())
+        );
+        assert_eq!(
+            watcher.take_prepare_local_approval_id(Some(approval_id), second),
+            Some(approval_id.to_string())
+        );
+    }
+
+    #[test]
+    fn activity_card_broker_watcher_prefers_prepare_for_local_host_approval_when_both_signals_exist(
+    ) {
+        assert_eq!(
+            activity_card_watcher_window_action(
+                false,
+                Some(501),
+                Some("hexdeck-local-codex-host-codex-session-019db354-call_1")
+            ),
+            ActivityCardWatcherWindowAction::Prepare
+        );
+    }
+
+    #[test]
     fn activity_card_window_location_defaults_to_live_route() {
-        assert_eq!(activity_card_window_location_for(None), "index.html?view=activity-card");
+        assert_eq!(
+            activity_card_window_location_for(None),
+            "index.html?view=activity-card"
+        );
     }
 
     #[test]
@@ -1716,6 +2171,69 @@ mod tests {
     fn preview_mode_skips_hidden_panel_window() {
         assert!(setup_creates_panel_window(None));
         assert!(!setup_creates_panel_window(Some("approval")));
+    }
+
+    #[test]
+    fn macos_tray_has_dedicated_icon_asset() {
+        #[cfg(target_os = "macos")]
+        {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("src-tauri has parent")
+                .join("public")
+                .join("hexdeck-menu-tray.png");
+            assert!(path.exists());
+        }
+    }
+
+    #[test]
+    fn macos_tray_normalizes_white_icon_configuration() {
+        #[cfg(target_os = "macos")]
+        {
+            assert!(!tray_icon_uses_template_image());
+            let (pixels, width, height) =
+                load_tray_icon_pixels().expect("macOS tray icon should load");
+            assert_eq!(width, 36);
+            assert_eq!(height, 36);
+            assert_eq!(pixels.len(), (width * height * 4) as usize);
+            assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] == 0));
+            assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] == 255));
+            assert!(pixels
+                .chunks_exact(4)
+                .filter(|pixel| pixel[3] > 0)
+                .all(|pixel| pixel[0] == 255 && pixel[1] == 255 && pixel[2] == 255));
+        }
+    }
+
+    #[test]
+    fn macos_tray_icon_has_visible_transparent_padding() {
+        #[cfg(target_os = "macos")]
+        {
+            let (pixels, width, height) =
+                load_tray_icon_pixels().expect("macOS tray icon should load");
+            let mut min_x = width;
+            let mut min_y = height;
+            let mut max_x = 0;
+            let mut max_y = 0;
+
+            for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+                if pixel[3] == 0 {
+                    continue;
+                }
+
+                let x = (index as u32) % width;
+                let y = (index as u32) / width;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+
+            assert!(min_x > 0);
+            assert!(min_y > 0);
+            assert!(max_x < width - 1);
+            assert!(max_y < height - 1);
+        }
     }
 
     #[test]
