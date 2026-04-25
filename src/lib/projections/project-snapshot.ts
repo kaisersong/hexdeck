@@ -8,7 +8,25 @@ import type {
   ProjectSnapshotProjection
 } from './types';
 
-function derivePendingApprovals(seed: ProjectSeed): ProjectSeed['approvals'] {
+function resolveApprovalEventParticipantId(
+  event: ProjectSeed['events'][number],
+  payload: Record<string, unknown>
+): string | null {
+  if (typeof payload.participantId === 'string' && payload.participantId.trim()) {
+    return payload.participantId.trim();
+  }
+
+  if (typeof event.fromParticipantId === 'string' && event.fromParticipantId.trim()) {
+    return event.fromParticipantId.trim();
+  }
+
+  return null;
+}
+
+function derivePendingApprovals(
+  seed: ProjectSeed,
+  participantIds: ReadonlySet<string>
+): ProjectSeed['approvals'] {
   const pendingById = new Map<string, ProjectSeed['approvals'][number]>();
 
   for (const approval of seed.approvals) {
@@ -26,7 +44,14 @@ function derivePendingApprovals(seed: ProjectSeed): ProjectSeed['approvals'] {
     if (event.type === 'request_approval') {
       const approvalId = typeof payload.approvalId === 'string' ? payload.approvalId : null;
       const taskId = typeof event.taskId === 'string' ? event.taskId : null;
-      if (!approvalId || !taskId || pendingById.has(approvalId)) {
+      const participantId = resolveApprovalEventParticipantId(event, payload);
+      if (
+        !approvalId
+        || !taskId
+        || pendingById.has(approvalId)
+        || !participantId
+        || !participantIds.has(participantId)
+      ) {
         continue;
       }
 
@@ -46,7 +71,7 @@ function derivePendingApprovals(seed: ProjectSeed): ProjectSeed['approvals'] {
         createdAt: typeof event.createdAt === 'string' ? event.createdAt : undefined,
         summary,
         decision: 'pending',
-        participantId: typeof payload.participantId === 'string' ? payload.participantId : undefined,
+        participantId,
         body: body ?? payload,
       });
       continue;
@@ -64,6 +89,7 @@ function derivePendingApprovals(seed: ProjectSeed): ProjectSeed['approvals'] {
 }
 
 export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjection {
+  const participantIds = new Set(seed.participants.map((participant) => participant.participantId));
   const workStateParticipantIds = new Set(seed.workStates.map((workState) => workState.participantId));
   const dedupedParticipants = dedupeActivelyPresentParticipants(seed.participants, workStateParticipantIds);
   const byParticipant = new Map(dedupedParticipants.map((participant) => [participant.participantId, participant]));
@@ -118,7 +144,7 @@ export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjecti
     });
 
   const attention: AttentionItemProjection[] = [];
-  const pendingApprovals = derivePendingApprovals(seed);
+  const pendingApprovals = derivePendingApprovals(seed, participantIds);
   for (const workState of seed.workStates) {
     if (byParticipant.has(workState.participantId) && !agentParticipantIds.has(workState.participantId)) {
       continue;

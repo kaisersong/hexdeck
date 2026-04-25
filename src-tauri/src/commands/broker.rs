@@ -8,6 +8,8 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex};
@@ -19,8 +21,7 @@ const REPLAY_PAGE_SIZE: usize = 100;
 const INTENT_BROKER_REPO: &str = "kaisersong/intent-broker";
 const LOCAL_CODEX_HOST_APPROVAL_PREFIX: &str = "hexdeck-local-codex-host-";
 const LOCAL_CODEX_APPROVAL_DIAGNOSTICS_LOG_NAME: &str = "hexdeck-activity-card-diagnostics.log";
-const LOCAL_CODEX_APPROVAL_DIAGNOSTICS_JSONL_NAME: &str =
-    "hexdeck-activity-card-diagnostics.jsonl";
+const LOCAL_CODEX_APPROVAL_DIAGNOSTICS_JSONL_NAME: &str = "hexdeck-activity-card-diagnostics.jsonl";
 const LOCAL_CODEX_TRANSCRIPT_TAIL_BYTES: u64 = 1_048_576;
 const LOCAL_CODEX_APPROVAL_DETAIL_TEXT: &str = "";
 const LOCAL_CODEX_APPROVAL_MAX_AGE_MS: i64 = 30 * 60 * 1000;
@@ -28,11 +29,61 @@ const LOCAL_CODEX_LOG_LOOKBACK_SECS: i64 = 10 * 60;
 // Give transcript/log reconciliation enough time to observe that a local
 // approval was handled before surfacing the same prompt again.
 const LOCAL_CODEX_RESOLUTION_SUPPRESSION_TTL_MS: i64 = 60_000;
+#[cfg(target_os = "windows")]
+const LOCAL_CODEX_WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 static RECENT_LOCAL_CODEX_APPROVAL_RESOLUTIONS: LazyLock<Mutex<HashMap<String, i64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static LAST_LOCAL_CODEX_APPROVAL_LOAD_DIAGNOSTIC: LazyLock<Mutex<Option<String>>> =
     LazyLock::new(|| Mutex::new(None));
+static BROKER_START_GUARD: LazyLock<Mutex<BrokerStartGuardState>> =
+    LazyLock::new(|| Mutex::new(BrokerStartGuardState::default()));
+
+#[derive(Debug, Default)]
+struct BrokerStartGuardState {
+    in_progress: bool,
+}
+
+fn try_acquire_broker_start_guard(state: &mut BrokerStartGuardState) -> bool {
+    if state.in_progress {
+        false
+    } else {
+        state.in_progress = true;
+        true
+    }
+}
+
+fn release_broker_start_guard(state: &mut BrokerStartGuardState) {
+    state.in_progress = false;
+}
+
+fn broker_start_guard_in_progress() -> bool {
+    BROKER_START_GUARD
+        .lock()
+        .map(|state| state.in_progress)
+        .unwrap_or(false)
+}
+
+struct BrokerStartLease;
+
+impl Drop for BrokerStartLease {
+    fn drop(&mut self) {
+        if let Ok(mut state) = BROKER_START_GUARD.lock() {
+            release_broker_start_guard(&mut state);
+        }
+    }
+}
+
+fn try_acquire_broker_start_lease() -> Option<BrokerStartLease> {
+    let Ok(mut state) = BROKER_START_GUARD.lock() else {
+        return None;
+    };
+    if try_acquire_broker_start_guard(&mut state) {
+        Some(BrokerStartLease)
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BrokerVersionInfo {
@@ -98,6 +149,15 @@ struct LocalCodexRuntimeState {
     #[serde(alias = "terminalSessionID")]
     terminal_session_id: Option<String>,
     updated_at: Option<String>,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalCodexBridgeState {
+    pid: Option<u32>,
+    parent_pid: Option<u32>,
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -310,7 +370,10 @@ fn build_local_codex_approval_event(
     object.insert("stage".to_string(), json!(stage));
 
     if let Some(approval) = approval {
-        object.insert("approvalId".to_string(), json!(approval.approval_id.clone()));
+        object.insert(
+            "approvalId".to_string(),
+            json!(approval.approval_id.clone()),
+        );
         object.insert(
             "participantId".to_string(),
             json!(approval.participant_id.clone()),
@@ -324,11 +387,15 @@ fn build_local_codex_approval_event(
         if let Some(project_path) = approval.project_path.as_deref() {
             object.insert("projectPath".to_string(), json!(project_path));
         }
-        if let Some(project_name) = project_name_from_project_path(approval.project_path.as_deref()) {
+        if let Some(project_name) = project_name_from_project_path(approval.project_path.as_deref())
+        {
             object.insert("projectName".to_string(), json!(project_name));
         }
         object.insert("command".to_string(), json!(approval.command_line.clone()));
-        object.insert("workdir".to_string(), json!(approval.command_preview.clone()));
+        object.insert(
+            "workdir".to_string(),
+            json!(approval.command_preview.clone()),
+        );
         object.insert("transport".to_string(), json!("local-host"));
     }
 
@@ -337,7 +404,10 @@ fn build_local_codex_approval_event(
             "responseApprovalId".to_string(),
             json!(response.approval_id.clone()),
         );
-        object.insert("responseTaskId".to_string(), json!(response.task_id.clone()));
+        object.insert(
+            "responseTaskId".to_string(),
+            json!(response.task_id.clone()),
+        );
         object.insert(
             "fromParticipantId".to_string(),
             json!(response.from_participant_id.clone()),
@@ -402,65 +472,122 @@ fn maybe_log(log_path: Option<&Path>, message: &str) {
     }
 }
 
-fn resolve_node_binary() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
+fn path_dedupe_key(path: &Path) -> String {
+    let rendered = path.to_string_lossy().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        rendered.to_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        rendered
+    }
+}
 
-    if let Ok(node_binary) = env::var("NODE_BINARY") {
-        candidates.push(PathBuf::from(node_binary));
+fn append_unique_path(paths: &mut Vec<PathBuf>, seen: &mut HashSet<String>, path: PathBuf) {
+    let key = path_dedupe_key(&path);
+    if seen.insert(key) {
+        paths.push(path);
+    }
+}
+
+fn broker_binary_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(current_path) = env::var_os("PATH") {
+        for path in env::split_paths(&current_path) {
+            append_unique_path(&mut dirs, &mut seen, path);
+        }
     }
 
-    candidates.extend([
-        PathBuf::from("/opt/homebrew/bin/node"),
-        PathBuf::from("/opt/homebrew/opt/node/bin/node"),
-        PathBuf::from("/usr/local/bin/node"),
-        PathBuf::from("/usr/bin/node"),
-    ]);
+    #[cfg(target_os = "windows")]
+    {
+        for env_name in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(root) = env::var_os(env_name) {
+                append_unique_path(&mut dirs, &mut seen, PathBuf::from(root).join("nodejs"));
+            }
+        }
 
-    candidates.into_iter().find(|path| path.exists())
+        if let Some(local_app_data) = env::var_os("LocalAppData") {
+            append_unique_path(
+                &mut dirs,
+                &mut seen,
+                PathBuf::from(local_app_data)
+                    .join("Programs")
+                    .join("nodejs"),
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        for candidate in [
+            "/opt/homebrew/bin",
+            "/opt/homebrew/opt/node/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+        ] {
+            append_unique_path(&mut dirs, &mut seen, PathBuf::from(candidate));
+        }
+    }
+
+    dirs
+}
+
+fn find_binary_in_search_dirs(names: &[&str]) -> Option<PathBuf> {
+    for dir in broker_binary_search_dirs() {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn resolve_node_binary() -> Option<PathBuf> {
+    if let Ok(node_binary) = env::var("NODE_BINARY") {
+        let path = PathBuf::from(node_binary);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    let candidates = ["node.exe", "node.cmd", "node.bat", "node"];
+    #[cfg(not(target_os = "windows"))]
+    let candidates = ["node"];
+
+    find_binary_in_search_dirs(&candidates)
 }
 
 fn resolve_npm_binary() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-
     if let Ok(npm_binary) = env::var("NPM_BINARY") {
-        candidates.push(PathBuf::from(npm_binary));
+        let path = PathBuf::from(npm_binary);
+        if path.exists() {
+            return Some(path);
+        }
     }
 
-    candidates.extend([
-        PathBuf::from("/opt/homebrew/bin/npm"),
-        PathBuf::from("/opt/homebrew/opt/node/bin/npm"),
-        PathBuf::from("/usr/local/bin/npm"),
-        PathBuf::from("/usr/bin/npm"),
-    ]);
+    #[cfg(target_os = "windows")]
+    let candidates = ["npm.cmd", "npm.exe", "npm.bat", "npm"];
+    #[cfg(not(target_os = "windows"))]
+    let candidates = ["npm"];
 
-    candidates.into_iter().find(|path| path.exists())
+    find_binary_in_search_dirs(&candidates)
 }
 
 fn build_node_path_env() -> String {
-    let mut segments = Vec::new();
+    let search_dirs = broker_binary_search_dirs();
 
-    if let Ok(current_path) = env::var("PATH") {
-        if !current_path.is_empty() {
-            segments.push(current_path);
-        }
+    match env::join_paths(search_dirs) {
+        Ok(path) => path.to_string_lossy().to_string(),
+        Err(_) => env::var("PATH").unwrap_or_default(),
     }
-
-    for candidate in [
-        "/opt/homebrew/bin",
-        "/opt/homebrew/opt/node/bin",
-        "/usr/local/bin",
-        "/usr/bin",
-        "/bin",
-    ] {
-        if !segments
-            .iter()
-            .any(|segment| segment.split(':').any(|part| part == candidate))
-        {
-            segments.push(candidate.to_string());
-        }
-    }
-
-    segments.join(":")
 }
 
 fn failed_start_result(
@@ -480,6 +607,39 @@ fn failed_start_result(
         node_path: resolve_node_binary().map(|path| path.to_string_lossy().to_string()),
         last_error: Some(last_error),
     }
+}
+
+fn healthy_broker_start_result(log_path: &Path, pid: Option<u32>) -> BrokerStartResult {
+    BrokerStartResult {
+        already_running: true,
+        ready: true,
+        pid,
+        installed_path: String::new(),
+        heartbeat_path: String::new(),
+        stdout_path: String::new(),
+        stderr_path: String::new(),
+        log_path: log_path.to_string_lossy().to_string(),
+        node_path: resolve_node_binary().map(|path| path.to_string_lossy().to_string()),
+        last_error: None,
+    }
+}
+
+async fn wait_for_parallel_broker_start(broker_url: &str, timeout_ms: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+    loop {
+        if broker_health_ok(broker_url).await {
+            return true;
+        }
+
+        if !broker_start_guard_in_progress() || std::time::Instant::now() >= deadline {
+            break;
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    broker_health_ok(broker_url).await
 }
 
 async fn broker_health_ok(broker_url: &str) -> bool {
@@ -541,8 +701,85 @@ fn safe_identifier(value: &str) -> String {
         .collect()
 }
 
+fn home_dir_from_sources(
+    home: Option<std::ffi::OsString>,
+    user_profile: Option<std::ffi::OsString>,
+    home_drive: Option<std::ffi::OsString>,
+    home_path: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    home.filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            user_profile
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            let drive = home_drive.filter(|value| !value.is_empty())?;
+            let path = home_path.filter(|value| !value.is_empty())?;
+            Some(PathBuf::from(format!(
+                "{}{}",
+                PathBuf::from(drive).display(),
+                PathBuf::from(path).display()
+            )))
+        })
+}
+
 fn home_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from)
+    home_dir_from_sources(
+        env::var_os("HOME"),
+        env::var_os("USERPROFILE"),
+        env::var_os("HOMEDRIVE"),
+        env::var_os("HOMEPATH"),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_local_codex_bridge_state_path(participant_id: &str) -> Option<PathBuf> {
+    home_dir().map(|home| {
+        home.join(".intent-broker")
+            .join("codex")
+            .join(format!("{participant_id}.bridge.json"))
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn load_local_codex_bridge_state(participant_id: &str) -> Result<LocalCodexBridgeState, String> {
+    let path = resolve_local_codex_bridge_state_path(participant_id)
+        .ok_or_else(|| "missing_home_dir_for_local_codex_bridge".to_string())?;
+    let content = fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "failed_to_read_local_codex_bridge_state {}: {error}",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&content).map_err(|error| {
+        format!(
+            "failed_to_parse_local_codex_bridge_state {}: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_local_codex_console_target_pid(approval: &LocalHostApprovalPrompt) -> Result<u32, String> {
+    let bridge = load_local_codex_bridge_state(&approval.participant_id)?;
+    if let Some(session_id) = bridge.session_id.as_deref() {
+        let expected = approval.session_id.trim();
+        if !expected.is_empty() && session_id.trim() != expected {
+            return Err(format!(
+                "local_codex_bridge_session_mismatch expected={} actual={}",
+                expected,
+                session_id.trim()
+            ));
+        }
+    }
+
+    bridge
+        .parent_pid
+        .or(bridge.pid)
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| "missing_local_codex_bridge_parent_pid".to_string())
 }
 
 fn parse_rfc3339_timestamp_ms(value: Option<&str>) -> Option<i64> {
@@ -643,16 +880,6 @@ fn is_supported_local_codex_runtime(runtime: &LocalCodexRuntimeState) -> bool {
             .as_deref()
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false)
-        && runtime
-            .terminal_app
-            .as_deref()
-            .map(|value| value.to_ascii_lowercase().contains("ghostty"))
-            .unwrap_or(false)
-        && runtime
-            .terminal_session_id
-            .as_deref()
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false)
 }
 
 fn parse_pending_local_codex_approval_call(
@@ -664,9 +891,11 @@ fn parse_pending_local_codex_approval_call(
     if entry.get("type").and_then(Value::as_str) != Some("response_item") {
         return None;
     }
-    if payload.get("type").and_then(Value::as_str) != Some("function_call")
-        || payload.get("name").and_then(Value::as_str) != Some("exec_command")
-    {
+    if payload.get("type").and_then(Value::as_str) != Some("function_call") {
+        return None;
+    }
+    let tool_name = payload.get("name").and_then(Value::as_str)?;
+    if tool_name != "exec_command" && tool_name != "shell_command" {
         return None;
     }
 
@@ -680,6 +909,7 @@ fn parse_pending_local_codex_approval_call(
         call_id: payload.get("call_id").and_then(Value::as_str)?.to_string(),
         command: args
             .get("cmd")
+            .or_else(|| args.get("command"))
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
@@ -709,8 +939,10 @@ fn parse_local_codex_approval_log_entry(
     _session_id: &str,
     body: &str,
 ) -> Option<PendingLocalCodexApprovalLogEntry> {
-    let marker = "ToolCall: exec_command ";
-    let start = body.find(marker)? + marker.len();
+    let marker = ["ToolCall: exec_command ", "ToolCall: shell_command "]
+        .into_iter()
+        .find_map(|marker| body.find(marker).map(|start| (marker, start)))?;
+    let start = marker.1 + marker.0.len();
     let end = body.rfind(" thread_id=").unwrap_or(body.len());
     let raw_json = body.get(start..end)?.trim();
     let payload: Value = serde_json::from_str(raw_json).ok()?;
@@ -723,6 +955,7 @@ fn parse_local_codex_approval_log_entry(
         log_id,
         command: payload
             .get("cmd")
+            .or_else(|| payload.get("command"))
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
@@ -1025,10 +1258,8 @@ fn load_local_host_approvals() -> Vec<LocalHostApprovalPrompt> {
         approvals.extend(merged_log_approvals);
     }
 
-    let approvals = suppress_recently_resolved_local_host_approvals(
-        approvals,
-        &recent_resolution_fingerprints,
-    );
+    let approvals =
+        suppress_recently_resolved_local_host_approvals(approvals, &recent_resolution_fingerprints);
     let approvals = filter_and_sort_local_host_approvals(approvals, Utc::now().timestamp_millis());
     let top_approval = approvals
         .first()
@@ -1126,7 +1357,10 @@ fn load_recent_local_codex_approval_log_entries(
         WHERE thread_id = ?1
           AND feedback_log_body IS NOT NULL
           AND ts >= ?2
-          AND feedback_log_body LIKE '%ToolCall: exec_command %'
+          AND (
+            feedback_log_body LIKE '%ToolCall: exec_command %'
+            OR feedback_log_body LIKE '%ToolCall: shell_command %'
+          )
         ORDER BY id DESC
         LIMIT 64
         ",
@@ -1376,6 +1610,7 @@ fn find_matching_codex_hook_approvals(
 }
 
 fn local_host_approval_to_json(approval: &LocalHostApprovalPrompt) -> Value {
+    let unsupported_reason = local_host_approval_transport_unavailable_reason(approval);
     let mut body = json!({
         "summary": approval.summary.clone(),
         "commandTitle": approval.command_title.clone(),
@@ -1399,7 +1634,12 @@ fn local_host_approval_to_json(approval: &LocalHostApprovalPrompt) -> Value {
     if !approval.detail_text.trim().is_empty() {
         body["detailText"] = json!(approval.detail_text.clone());
     }
-    if let Some(runtime_source) = approval.runtime_source.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(runtime_source) = approval
+        .runtime_source
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         body["localHostApproval"]["runtimeSource"] = json!(runtime_source);
     }
 
@@ -1413,8 +1653,18 @@ fn local_host_approval_to_json(approval: &LocalHostApprovalPrompt) -> Value {
         "decision": "pending",
         "participantId": approval.participant_id.clone(),
         "actions": [
-            { "label": "Allow once", "decisionMode": "yes" },
-            { "label": "Reject", "decisionMode": "no" }
+            {
+                "label": "Allow once",
+                "decisionMode": "yes",
+                "disabled": unsupported_reason.is_some(),
+                "unsupportedReason": unsupported_reason.clone()
+            },
+            {
+                "label": "Reject",
+                "decisionMode": "no",
+                "disabled": unsupported_reason.is_some(),
+                "unsupportedReason": unsupported_reason.clone()
+            }
         ],
         "commandTitle": approval.command_title.clone(),
         "commandLine": approval.command_line.clone(),
@@ -1439,6 +1689,43 @@ pub fn load_latest_local_host_approval_item() -> Result<Option<Value>, String> {
     Ok(latest_local_host_approval_item_value())
 }
 
+#[cfg(target_os = "windows")]
+fn local_host_approval_transport_unavailable_reason(
+    _approval: &LocalHostApprovalPrompt,
+) -> Option<String> {
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn local_host_approval_transport_unavailable_reason(
+    approval: &LocalHostApprovalPrompt,
+) -> Option<String> {
+    if !approval
+        .terminal_app
+        .to_ascii_lowercase()
+        .contains("ghostty")
+    {
+        let terminal = approval.terminal_app.trim();
+        return Some(if terminal.is_empty() {
+            "HexDeck can only confirm local Codex approvals through Ghostty right now.".to_string()
+        } else {
+            format!(
+                "HexDeck can only confirm local Codex approvals through Ghostty right now (current terminal: {}).",
+                terminal
+            )
+        });
+    }
+
+    if approval.terminal_session_id.trim().is_empty() {
+        return Some(
+            "HexDeck needs a Ghostty terminal session id before it can confirm this local Codex approval."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
 fn filter_and_sort_local_host_approvals(
     approvals: Vec<LocalHostApprovalPrompt>,
     now_ms: i64,
@@ -1457,10 +1744,12 @@ fn filter_and_sort_local_host_approvals(
     approvals
 }
 
+#[cfg(not(target_os = "windows"))]
 fn escape_applescript(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+#[cfg(not(target_os = "windows"))]
 fn execute_osascript(script: &str) -> Result<String, String> {
     let output = Command::new("osascript")
         .arg("-e")
@@ -1480,6 +1769,24 @@ fn execute_osascript(script: &str) -> Result<String, String> {
     }
 }
 
+fn local_codex_host_approval_shortcut(
+    decision: &str,
+    decision_mode: Option<&str>,
+) -> Result<&'static str, String> {
+    match decision {
+        "denied" | "cancelled" => Ok("escape"),
+        "approved" => {
+            if decision_mode == Some("always") {
+                Ok("p")
+            } else {
+                Ok("y")
+            }
+        }
+        other => Err(format!("unsupported_local_host_approval_decision {other}")),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
 fn local_codex_host_terminal_command(
     decision: &str,
     decision_mode: Option<&str>,
@@ -1495,95 +1802,400 @@ fn local_codex_host_terminal_command(
         )
     }
 
-    fn ghostty_confirm_command() -> String {
-        "input text linefeed to targetTerminal".to_string()
+    let shortcut = local_codex_host_approval_shortcut(decision, decision_mode)?;
+    Ok(ghostty_keypress_command(shortcut))
+}
+
+#[cfg(target_os = "windows")]
+fn escape_powershell_single_quoted(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+#[cfg(target_os = "windows")]
+fn execute_hidden_powershell(script: &str) -> Result<String, String> {
+    let output = Command::new("powershell.exe")
+        .creation_flags(LOCAL_CODEX_WINDOWS_CREATE_NO_WINDOW)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .output()
+        .map_err(|error| format!("failed_to_launch_powershell: {error}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            "powershell_failed".to_string()
+        } else {
+            stderr
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn build_windows_codex_console_input_script(target_pid: u32, shortcut: &str) -> Result<String, String> {
+    let (virtual_key_code, unicode_char_code, shortcut_label) = match shortcut {
+        "y" => (0x59_u16, 0x0079_u16, "y"),
+        "p" => (0x50_u16, 0x0070_u16, "p"),
+        "escape" => (0x1B_u16, 0x0000_u16, "escape"),
+        other => return Err(format!("unsupported_local_codex_console_shortcut {other}")),
+    };
+
+    Ok(
+        r#"
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class HexdeckNativeConsole {
+    [StructLayout(LayoutKind.Explicit, CharSet = CharSet.Unicode)]
+    public struct INPUT_RECORD {
+        [FieldOffset(0)] public ushort EventType;
+        [FieldOffset(4)] public KEY_EVENT_RECORD KeyEvent;
     }
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct KEY_EVENT_RECORD {
+        [MarshalAs(UnmanagedType.Bool)] public bool bKeyDown;
+        public ushort wRepeatCount;
+        public ushort wVirtualKeyCode;
+        public ushort wVirtualScanCode;
+        public char UnicodeChar;
+        public uint dwControlKeyState;
+    }
+
+    public const ushort KEY_EVENT = 0x0001;
+    public const uint ATTACH_PARENT_PROCESS = 0xFFFFFFFF;
+    public const uint GENERIC_READ_WRITE = 0xC0000000;
+    public const uint FILE_SHARE_READ_WRITE = 0x00000003;
+    public const uint OPEN_EXISTING = 3;
+    public const uint NO_FILE_FLAGS = 0;
+    public static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool FreeConsole();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool AttachConsole(uint dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern IntPtr CreateFileW(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile
+    );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool WriteConsoleInputW(
+        IntPtr hConsoleInput,
+        INPUT_RECORD[] lpBuffer,
+        int nLength,
+        out int lpNumberOfEventsWritten
+    );
+}
+"@
+
+$targetPid = [uint32]__TARGET_PID__
+$virtualKeyCode = [uint16]__VKEY__
+$unicodeCharCode = [uint16]__UNICODE__
+$shortcutLabel = '__SHORTCUT_LABEL__'
+[void][HexdeckNativeConsole]::FreeConsole()
+if (-not [HexdeckNativeConsole]::AttachConsole($targetPid)) {
+    throw ('failed_to_attach_console:' + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+}
+$inputHandle = [IntPtr]::Zero
+$inputHandle = [HexdeckNativeConsole]::CreateFileW(
+    'CONIN$',
+    [HexdeckNativeConsole]::GENERIC_READ_WRITE,
+    [HexdeckNativeConsole]::FILE_SHARE_READ_WRITE,
+    [IntPtr]::Zero,
+    [HexdeckNativeConsole]::OPEN_EXISTING,
+    [HexdeckNativeConsole]::NO_FILE_FLAGS,
+    [IntPtr]::Zero
+)
+if ($inputHandle -eq [IntPtr]::Zero -or $inputHandle -eq [HexdeckNativeConsole]::INVALID_HANDLE_VALUE) {
+    throw ('failed_to_open_console_input:' + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+}
+try {
+    $records = New-Object 'HexdeckNativeConsole+INPUT_RECORD[]' 2
+    $records[0].EventType = [HexdeckNativeConsole]::KEY_EVENT
+    $records[0].KeyEvent.bKeyDown = $true
+    $records[0].KeyEvent.wRepeatCount = 1
+    $records[0].KeyEvent.wVirtualKeyCode = $virtualKeyCode
+    $records[0].KeyEvent.wVirtualScanCode = 0
+    $records[0].KeyEvent.UnicodeChar = [char]$unicodeCharCode
+    $records[0].KeyEvent.dwControlKeyState = 0
+    $records[1] = $records[0]
+    $records[1].KeyEvent.bKeyDown = $false
+
+    $written = 0
+    if (-not [HexdeckNativeConsole]::WriteConsoleInputW($inputHandle, $records, $records.Length, [ref]$written)) {
+        throw ('failed_to_write_console_input:' + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+    }
+    Write-Output ('sent:' + $shortcutLabel + ':' + $targetPid + ':' + $written)
+} finally {
+    if ($inputHandle -ne [IntPtr]::Zero -and $inputHandle -ne [HexdeckNativeConsole]::INVALID_HANDLE_VALUE) {
+        [HexdeckNativeConsole]::CloseHandle($inputHandle) | Out-Null
+    }
+    [void][HexdeckNativeConsole]::FreeConsole()
+}
+"#
+        .replace("__TARGET_PID__", &target_pid.to_string())
+        .replace("__VKEY__", &virtual_key_code.to_string())
+        .replace("__UNICODE__", &unicode_char_code.to_string())
+        .replace("__SHORTCUT_LABEL__", shortcut_label),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn send_windows_codex_console_approval_decision(
+    approval: &LocalHostApprovalPrompt,
+    target_pid: u32,
+    decision: &str,
+    decision_mode: Option<&str>,
+) -> Result<(), String> {
+    let shortcut = local_codex_host_approval_shortcut(decision, decision_mode)?;
+    let script = build_windows_codex_console_input_script(target_pid, shortcut)?;
+    let result = execute_hidden_powershell(&script)?;
+    append_activity_card_diagnostics_log(&format!(
+        "[local-approval/respond-result] approvalId={} result={}",
+        truncate_local_codex_diagnostic(&approval.approval_id, 120),
+        truncate_local_codex_diagnostic(&result, 80)
+    ));
+    append_local_codex_approval_event(
+        "windows_console_input_sent",
+        Some(approval),
+        None,
+        Some(json!({
+            "transport": "windows-console",
+            "transportResult": result,
+            "targetPid": target_pid
+        })),
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn build_windows_codex_desktop_approval_script(button_names: &[&str]) -> String {
+    let button_name_literals = button_names
+        .iter()
+        .map(|label| format!("'{}'", escape_powershell_single_quoted(label)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$target = Get-Process Codex -ErrorAction SilentlyContinue |
+    Where-Object {{ -not [string]::IsNullOrWhiteSpace($_.MainWindowTitle) }} |
+    Sort-Object StartTime |
+    Select-Object -First 1
+if ($null -eq $target) {{ throw 'missing_codex_window' }}
+$ws = New-Object -ComObject WScript.Shell
+if (-not $ws.AppActivate([int]$target.Id)) {{ throw 'failed_to_activate_codex_window' }}
+Start-Sleep -Milliseconds 150
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($target.MainWindowHandle)
+if ($null -eq $root) {{ throw 'missing_codex_automation_root' }}
+$buttonNames = @({button_name_literals})
+$buttonCondition = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::Button
+)
+$windowRect = $root.Current.BoundingRectangle
+$windowCenterX = $windowRect.X + ($windowRect.Width / 2.0)
+$windowCenterY = $windowRect.Y + ($windowRect.Height / 2.0)
+$deadline = (Get-Date).AddSeconds(2)
+$match = $null
+do {{
+    $buttons = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition)
+    $candidates = New-Object System.Collections.Generic.List[object]
+    for ($i = 0; $i -lt $buttons.Count; $i++) {{
+        $button = $buttons.Item($i)
+        $rawName = $button.Current.Name
+        if ($null -eq $rawName) {{
+            $name = ''
+        }} else {{
+            $name = [string]$rawName
+        }}
+        if ([string]::IsNullOrWhiteSpace($name)) {{ continue }}
+        $labelIndex = [Array]::IndexOf($buttonNames, $name)
+        if ($labelIndex -lt 0) {{ continue }}
+        if (-not $button.Current.IsEnabled -or $button.Current.IsOffscreen) {{ continue }}
+        $rect = $button.Current.BoundingRectangle
+        if ($rect.Width -le 0 -or $rect.Height -le 0) {{ continue }}
+        $centerX = $rect.X + ($rect.Width / 2.0)
+        $centerY = $rect.Y + ($rect.Height / 2.0)
+        $distance = [Math]::Abs($centerX - $windowCenterX) + [Math]::Abs($centerY - $windowCenterY)
+        $candidates.Add([PSCustomObject]@{{
+            Element = $button
+            Name = $name
+            LabelIndex = $labelIndex
+            Distance = $distance
+            X = $rect.X
+            Y = $rect.Y
+        }}) | Out-Null
+    }}
+    $match = $candidates |
+        Sort-Object LabelIndex, Distance, Y, X |
+        Select-Object -First 1
+    if ($null -eq $match) {{
+        Start-Sleep -Milliseconds 100
+    }}
+}} while ($null -eq $match -and (Get-Date) -lt $deadline)
+if ($null -eq $match) {{ throw ('missing_approval_button:' + ($buttonNames -join '|')) }}
+$invokePattern = $match.Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+if ($null -eq $invokePattern) {{ throw ('missing_invoke_pattern:' + $match.Name) }}
+([System.Windows.Automation.InvokePattern]$invokePattern).Invoke()
+Write-Output ('clicked:' + $match.Name + ':' + $target.Id)
+"#
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn local_codex_host_windows_approval_button_names(
+    decision: &str,
+    decision_mode: Option<&str>,
+) -> Result<&'static [&'static str], String> {
     match decision {
-        "denied" => Ok(ghostty_keypress_command("n")),
-        "approved" => {
-            let _ = decision_mode;
-            Ok(ghostty_confirm_command())
-        }
+        "approved" if decision_mode == Some("always") => Ok(&[
+            "Always",
+            "Allow for session",
+            "Allow this session",
+            "Always allow",
+            "始终允许",
+            "始终允许本次会话",
+            "始终允许此会话",
+        ]),
+        "approved" => Ok(&[
+            "Allow once",
+            "Allow",
+            "Approve",
+            "Yes",
+            "允许一次",
+            "允许",
+            "批准",
+            "是",
+        ]),
+        "denied" if decision_mode == Some("no") => Ok(&[
+            "Decline",
+            "Deny",
+            "Reject",
+            "No",
+            "拒绝",
+            "不允许",
+            "否",
+            "取消",
+        ]),
+        "denied" | "cancelled" => Ok(&[
+            "Cancel",
+            "Decline",
+            "Reject",
+            "Deny",
+            "No",
+            "取消",
+            "拒绝",
+            "不允许",
+            "否",
+        ]),
         other => Err(format!("unsupported_local_host_approval_decision {other}")),
     }
 }
 
-fn send_local_codex_host_approval_decision(
+#[cfg(target_os = "windows")]
+fn send_windows_codex_desktop_approval_decision(
     approval: &LocalHostApprovalPrompt,
     decision: &str,
     decision_mode: Option<&str>,
 ) -> Result<(), String> {
+    match resolve_local_codex_console_target_pid(approval) {
+        Ok(target_pid) => {
+            if let Err(error) = send_windows_codex_console_approval_decision(
+                approval,
+                target_pid,
+                decision,
+                decision_mode,
+            ) {
+                append_local_codex_approval_event(
+                    "windows_console_transport_failed",
+                    Some(approval),
+                    None,
+                    Some(json!({
+                        "transport": "windows-console",
+                        "targetPid": target_pid,
+                        "error": error
+                    })),
+                );
+                return Err(error);
+            }
+            return Ok(());
+        }
+        Err(_) => {}
+    }
+
+    let button_names = local_codex_host_windows_approval_button_names(decision, decision_mode)?;
+    let script = build_windows_codex_desktop_approval_script(button_names);
+    let result = execute_hidden_powershell(&script)?;
     append_activity_card_diagnostics_log(&format!(
-        "[local-approval/respond] approvalId={} participantId={} decision={} decisionMode={} terminalSessionId={}",
+        "[local-approval/respond-result] approvalId={} result={}",
         truncate_local_codex_diagnostic(&approval.approval_id, 120),
-        truncate_local_codex_diagnostic(&approval.participant_id, 80),
-        decision,
-        decision_mode.unwrap_or("-"),
-        truncate_local_codex_diagnostic(&approval.terminal_session_id, 80)
+        truncate_local_codex_diagnostic(&result, 80)
     ));
     append_local_codex_approval_event(
-        "approval_transport_started",
+        "windows_uia_button_invoked",
         Some(approval),
         None,
         Some(json!({
-            "decision": decision,
-            "decisionMode": decision_mode,
-            "terminalApp": approval.terminal_app.clone(),
-            "terminalSessionId": approval.terminal_session_id.clone(),
-            "transport": "ghostty"
+            "transport": "windows-uia",
+            "transportResult": result
         })),
     );
+    Ok(())
+}
 
+#[cfg(not(target_os = "windows"))]
+fn send_windows_codex_desktop_approval_decision(
+    _approval: &LocalHostApprovalPrompt,
+    _decision: &str,
+    _decision_mode: Option<&str>,
+) -> Result<(), String> {
+    Err("windows_uia_transport_unavailable".to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn send_ghostty_local_codex_host_approval_decision(
+    approval: &LocalHostApprovalPrompt,
+    decision: &str,
+    decision_mode: Option<&str>,
+) -> Result<(), String> {
     if !approval
         .terminal_app
         .to_ascii_lowercase()
         .contains("ghostty")
     {
-        let error = format!(
+        return Err(format!(
             "unsupported_local_host_approval_terminal {}",
             approval.terminal_app
-        );
-        append_local_codex_approval_event(
-            "approval_failed",
-            Some(approval),
-            None,
-            Some(json!({
-                "error": error,
-                "failureStage": "approval_transport_started"
-            })),
-        );
-        return Err(error);
+        ));
     }
     if approval.terminal_session_id.trim().is_empty() {
-        let error = "missing_local_host_approval_terminal_session_id".to_string();
-        append_local_codex_approval_event(
-            "approval_failed",
-            Some(approval),
-            None,
-            Some(json!({
-                "error": error,
-                "failureStage": "approval_transport_started"
-            })),
-        );
-        return Err(error);
+        return Err("missing_local_host_approval_terminal_session_id".to_string());
     }
 
-    let approve_command = match local_codex_host_terminal_command(decision, decision_mode) {
-        Ok(command) => command,
-        Err(error) => {
-            append_local_codex_approval_event(
-                "approval_failed",
-                Some(approval),
-                None,
-                Some(json!({
-                    "error": error,
-                    "failureStage": "approval_transport_command"
-                })),
-            );
-            return Err(error);
-        }
-    };
+    let approve_command = local_codex_host_terminal_command(decision, decision_mode)?;
     let terminal_id = escape_applescript(&approval.terminal_session_id);
     let project_path = escape_applescript(approval.project_path.as_deref().unwrap_or(""));
     let script = format!(
@@ -1647,21 +2259,7 @@ end tell
 "#
     );
 
-    let result = match execute_osascript(&script) {
-        Ok(result) => result,
-        Err(error) => {
-            append_local_codex_approval_event(
-                "approval_failed",
-                Some(approval),
-                None,
-                Some(json!({
-                    "error": error,
-                    "failureStage": "approval_transport_osascript"
-                })),
-            );
-            return Err(error);
-        }
-    };
+    let result = execute_osascript(&script)?;
     append_activity_card_diagnostics_log(&format!(
         "[local-approval/respond-result] approvalId={} result={}",
         truncate_local_codex_diagnostic(&approval.approval_id, 120),
@@ -1704,6 +2302,81 @@ end tell
     }
 
     Ok(())
+}
+
+fn send_local_codex_host_approval_decision(
+    approval: &LocalHostApprovalPrompt,
+    decision: &str,
+    decision_mode: Option<&str>,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let transport = if resolve_local_codex_console_target_pid(approval).is_ok() {
+        "windows-console"
+    } else {
+        "windows-uia"
+    };
+    #[cfg(not(target_os = "windows"))]
+    let transport = "ghostty";
+
+    append_activity_card_diagnostics_log(&format!(
+        "[local-approval/respond] approvalId={} participantId={} decision={} decisionMode={} terminalSessionId={} transport={}",
+        truncate_local_codex_diagnostic(&approval.approval_id, 120),
+        truncate_local_codex_diagnostic(&approval.participant_id, 80),
+        decision,
+        decision_mode.unwrap_or("-"),
+        truncate_local_codex_diagnostic(&approval.terminal_session_id, 80),
+        transport
+    ));
+    append_local_codex_approval_event(
+        "approval_transport_started",
+        Some(approval),
+        None,
+        Some(json!({
+            "decision": decision,
+            "decisionMode": decision_mode,
+            "terminalApp": approval.terminal_app.clone(),
+            "terminalSessionId": approval.terminal_session_id.clone(),
+            "transport": transport
+        })),
+    );
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(error) =
+            send_windows_codex_desktop_approval_decision(approval, decision, decision_mode)
+        {
+            append_local_codex_approval_event(
+                "approval_failed",
+                Some(approval),
+                None,
+                Some(json!({
+                    "error": error,
+                    "failureStage": "approval_transport_windows"
+                })),
+            );
+            return Err(error);
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Err(error) =
+            send_ghostty_local_codex_host_approval_decision(approval, decision, decision_mode)
+        {
+            append_local_codex_approval_event(
+                "approval_failed",
+                Some(approval),
+                None,
+                Some(json!({
+                    "error": error,
+                    "failureStage": "approval_transport_ghostty"
+                })),
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
 }
 
 async fn post_broker_approval_response(
@@ -2235,7 +2908,25 @@ pub async fn respond_to_local_host_approval(
     };
     append_local_codex_approval_event("approval_loaded", Some(&approval), Some(&input), None);
 
-    send_local_codex_host_approval_decision(&approval, &input.decision, input.decision_mode.as_deref())?;
+    if let Some(reason) = local_host_approval_transport_unavailable_reason(&approval) {
+        append_local_codex_approval_event(
+            "approval_failed",
+            Some(&approval),
+            Some(&input),
+            Some(json!({
+                "error": reason,
+                "failureStage": "approval_transport_unavailable",
+                "transport": "local-host"
+            })),
+        );
+        return Err(reason);
+    }
+
+    send_local_codex_host_approval_decision(
+        &approval,
+        &input.decision,
+        input.decision_mode.as_deref(),
+    )?;
     remember_recent_local_codex_resolution(&approval);
     append_local_codex_approval_event(
         "approval_response_delivered",
@@ -2247,7 +2938,8 @@ pub async fn respond_to_local_host_approval(
     );
 
     let broker_url = broker_url.unwrap_or_else(|| "http://127.0.0.1:4318".to_string());
-    if let Err(error) = resolve_matching_codex_hook_approvals(&broker_url, &approval, &input).await {
+    if let Err(error) = resolve_matching_codex_hook_approvals(&broker_url, &approval, &input).await
+    {
         append_local_codex_approval_event(
             "approval_failed",
             Some(&approval),
@@ -2273,11 +2965,20 @@ async fn stop_running_broker(
             Some(log_path),
             &format!("restart_broker_runtime: sending TERM to pid={}", pid),
         );
+
+        #[cfg(unix)]
         let status = Command::new("kill")
             .arg("-TERM")
             .arg(pid.to_string())
             .status()
             .map_err(|e| format!("failed_to_stop_broker: {}", e))?;
+
+        #[cfg(target_os = "windows")]
+        let status = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status()
+            .map_err(|e| format!("failed_to_stop_broker: {}", e))?;
+
         if !status.success() {
             return Err(format!("failed_to_stop_broker_pid_{}", pid));
         }
@@ -2929,6 +3630,51 @@ pub async fn ensure_broker_ready(
         ),
     );
 
+    if broker_health_ok(&broker_url).await {
+        append_bootstrap_log(
+            log_path.as_path(),
+            "ensure_broker_ready: external broker already healthy, skipping install/start",
+        );
+
+        return Ok(healthy_broker_start_result(log_path.as_path(), None));
+    }
+
+    let _start_lease = match try_acquire_broker_start_lease() {
+        Some(lease) => lease,
+        None => {
+            append_bootstrap_log(
+                log_path.as_path(),
+                "ensure_broker_ready: another broker start is already in progress; waiting",
+            );
+
+            if wait_for_parallel_broker_start(&broker_url, timeout_ms).await {
+                append_bootstrap_log(
+                    log_path.as_path(),
+                    "ensure_broker_ready: existing broker start completed successfully",
+                );
+                return Ok(healthy_broker_start_result(log_path.as_path(), None));
+            }
+
+            append_bootstrap_log(
+                log_path.as_path(),
+                "ensure_broker_ready: existing broker start finished without a healthy runtime",
+            );
+            return Ok(failed_start_result(
+                log_path.as_path(),
+                String::new(),
+                "broker_not_ready_after_waiting_for_existing_start".to_string(),
+            ));
+        }
+    };
+
+    if broker_health_ok(&broker_url).await {
+        append_bootstrap_log(
+            log_path.as_path(),
+            "ensure_broker_ready: broker became healthy before this start attempt began",
+        );
+        return Ok(healthy_broker_start_result(log_path.as_path(), None));
+    }
+
     let manifest = match read_broker_manifest(&app).await {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -3339,11 +4085,15 @@ mod tests {
     }
 
     #[test]
-    fn collect_pending_local_codex_approval_calls_keeps_only_unresolved_require_escalated_calls() {
+    fn collect_pending_local_codex_approval_calls_keeps_unresolved_exec_and_shell_require_escalated_calls(
+    ) {
         let tail = r#"
 {"timestamp":"2026-04-22T06:46:03.464Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\",\"workdir\":\"/Users/song/projects/hexdeck/src-tauri\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Allow Cargo to run tests?\"}","call_id":"call_pending"}}
 {"timestamp":"2026-04-22T06:46:04.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"npm test\",\"workdir\":\"/Users/song/projects/hexdeck\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Allow npm to run tests?\"}","call_id":"call_resolved"}}
 {"timestamp":"2026-04-22T06:46:05.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_resolved","output":"ok"}}
+{"timestamp":"2026-04-25T06:22:26.450Z","type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{\"command\":\"whoami\",\"workdir\":\"D:\\\\projects\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Allow whoami approval check?\"}","call_id":"call_shell_pending"}}
+{"timestamp":"2026-04-25T06:02:50.001Z","type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{\"command\":\"hostname\",\"workdir\":\"D:\\\\projects\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Allow hostname approval check?\"}","call_id":"call_shell_resolved"}}
+{"timestamp":"2026-04-25T06:21:35.584Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_shell_resolved","output":"Wall time: 1125.6 seconds\naborted by user"}}
 "#;
 
         let approvals = collect_pending_local_codex_approval_calls(
@@ -3351,7 +4101,7 @@ mod tests {
             Some("/Users/song/projects/hexdeck"),
         );
 
-        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals.len(), 2);
         assert_eq!(approvals[0].call_id, "call_pending");
         assert_eq!(approvals[0].command, "cargo test");
         assert_eq!(
@@ -3359,6 +4109,10 @@ mod tests {
             "/Users/song/projects/hexdeck/src-tauri"
         );
         assert_eq!(approvals[0].justification, "Allow Cargo to run tests?");
+        assert_eq!(approvals[1].call_id, "call_shell_pending");
+        assert_eq!(approvals[1].command, "whoami");
+        assert_eq!(approvals[1].workdir, "D:\\projects");
+        assert_eq!(approvals[1].justification, "Allow whoami approval check?");
     }
 
     #[test]
@@ -3494,8 +4248,18 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                json!({ "label": "Allow once", "decisionMode": "yes" }),
-                json!({ "label": "Reject", "decisionMode": "no" }),
+                json!({
+                    "label": "Allow once",
+                    "decisionMode": "yes",
+                    "disabled": false,
+                    "unsupportedReason": null
+                }),
+                json!({
+                    "label": "Reject",
+                    "decisionMode": "no",
+                    "disabled": false,
+                    "unsupportedReason": null
+                }),
             ]
         );
         assert_eq!(
@@ -3512,6 +4276,86 @@ mod tests {
             .and_then(Value::as_object)
             .and_then(|body| body.get("detailText"))
             .is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn local_host_approval_transport_reason_allows_windows_uia_transport() {
+        let approval = LocalHostApprovalPrompt {
+            approval_id: "hexdeck-local-codex-host-codex-session-1-call_1".to_string(),
+            task_id: "local-host-approval-codex-session-1-call_1".to_string(),
+            thread_id: "local-host-approval-codex-session-1".to_string(),
+            participant_id: "codex-session-1".to_string(),
+            session_id: "session-1".to_string(),
+            summary: "Do you want to allow this command?".to_string(),
+            detail_text: "".to_string(),
+            command_title: "Codex".to_string(),
+            command_line: "whoami".to_string(),
+            command_preview: "D:\\projects\\hexdeck".to_string(),
+            terminal_app: "unknown".to_string(),
+            terminal_session_id: "".to_string(),
+            runtime_source: Some("queued-context".to_string()),
+            project_path: Some("D:\\projects\\hexdeck".to_string()),
+            transcript_path: PathBuf::from("C:\\tmp\\codex-session.jsonl"),
+            call_id: "call_1".to_string(),
+            sort_key_ms: 1,
+        };
+
+        assert_eq!(local_host_approval_transport_unavailable_reason(&approval), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn local_codex_host_windows_approval_button_names_cover_localized_allow_and_reject_labels() {
+        assert_eq!(
+            local_codex_host_windows_approval_button_names("approved", Some("yes")),
+            Ok(&["Allow once", "Allow", "Approve", "Yes", "允许一次", "允许", "批准", "是"][..])
+        );
+        assert_eq!(
+            local_codex_host_windows_approval_button_names("approved", Some("always")),
+            Ok(&[
+                "Always",
+                "Allow for session",
+                "Allow this session",
+                "Always allow",
+                "始终允许",
+                "始终允许本次会话",
+                "始终允许此会话",
+            ][..])
+        );
+        assert_eq!(
+            local_codex_host_windows_approval_button_names("denied", Some("no")),
+            Ok(&["Decline", "Deny", "Reject", "No", "拒绝", "不允许", "否", "取消"][..])
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn build_windows_codex_desktop_approval_script_is_powershell5_compatible() {
+        let script = build_windows_codex_desktop_approval_script(&["Allow once", "允许一次"]);
+
+        assert!(script.contains("$rawName = $button.Current.Name"));
+        assert!(script.contains("$name = [string]$rawName"));
+        assert!(script.contains("'Allow once'"));
+        assert!(script.contains("'允许一次'"));
+        assert!(!script.contains("??"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn build_windows_codex_console_input_script_targets_attached_console() {
+        let script =
+            build_windows_codex_console_input_script(33860, "y").expect("expected console script");
+
+        assert!(script.contains("AttachConsole($targetPid)"));
+        assert!(script.contains("WriteConsoleInputW"));
+        assert!(script.contains("$targetPid = [uint32]33860"));
+        assert!(script.contains("[HexdeckNativeConsole]::GENERIC_READ_WRITE"));
+        assert!(script.contains("[HexdeckNativeConsole]::FILE_SHARE_READ_WRITE"));
+        assert!(script.contains("$inputHandle = [IntPtr]::Zero"));
+        assert!(script.contains("$inputHandle -ne [IntPtr]::Zero"));
+        assert!(script.contains("$shortcutLabel = 'y'"));
+        assert!(!script.contains("??"));
     }
 
     #[test]
@@ -3586,6 +4430,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_local_codex_approval_log_entry_extracts_require_escalated_shell_command() {
+        let body = concat!(
+            "session_loop{thread_id=019dabe2-fef6-72a0-8a64-f35602d94c2f}: ",
+            "ToolCall: shell_command ",
+            "{\"command\":\"whoami\",",
+            "\"workdir\":\"D:\\\\projects\",",
+            "\"sandbox_permissions\":\"require_escalated\",",
+            "\"justification\":\"Allow whoami approval check?\"}",
+            " thread_id=019dabe2-fef6-72a0-8a64-f35602d94c2f"
+        );
+
+        let entry = parse_local_codex_approval_log_entry(
+            52,
+            1_777_098_146,
+            "019dabe2-fef6-72a0-8a64-f35602d94c2f",
+            body,
+        )
+        .expect("expected shell-command log-backed approval entry");
+
+        assert_eq!(entry.log_id, 52);
+        assert_eq!(entry.command, "whoami");
+        assert_eq!(entry.workdir, "D:\\projects");
+        assert_eq!(entry.justification, "Allow whoami approval check?");
+        assert_eq!(entry.created_at_ms, 1_777_098_146_000);
+    }
+
+    #[test]
     fn local_codex_runtime_state_accepts_terminal_session_id_alias() {
         let runtime: LocalCodexRuntimeState = serde_json::from_str(
             r#"{
@@ -3604,6 +4475,54 @@ mod tests {
             Some("DFCFDE26-762E-4742-9E9C-5DBC2CEACA5C")
         );
         assert!(is_supported_local_codex_runtime(&runtime));
+    }
+
+    #[test]
+    fn local_codex_runtime_state_accepts_windows_desktop_runtime_without_terminal_session() {
+        let runtime: LocalCodexRuntimeState = serde_json::from_str(
+            r#"{
+  "status": "running",
+                "sessionId": "019dabe2-fef6-72a0-8a64-f35602d94c2f",
+                "terminalApp": "unknown",
+                "projectPath": "D:\\projects\\hexdeck",
+                "updatedAt": "2026-04-25T06:22:49.894Z"
+            }"#,
+        )
+        .expect("expected windows runtime json to deserialize");
+
+        assert!(is_supported_local_codex_runtime(&runtime));
+    }
+
+    #[test]
+    fn home_dir_from_sources_prefers_home() {
+        let home = home_dir_from_sources(
+            Some("/Users/song".into()),
+            Some("C:\\Users\\song".into()),
+            Some("C:".into()),
+            Some("\\Users\\song".into()),
+        );
+
+        assert_eq!(home, Some(PathBuf::from("/Users/song")));
+    }
+
+    #[test]
+    fn home_dir_from_sources_falls_back_to_userprofile() {
+        let home = home_dir_from_sources(
+            None,
+            Some("C:\\Users\\song".into()),
+            Some("C:".into()),
+            Some("\\Users\\song".into()),
+        );
+
+        assert_eq!(home, Some(PathBuf::from("C:\\Users\\song")));
+    }
+
+    #[test]
+    fn home_dir_from_sources_falls_back_to_homedrive_and_homepath() {
+        let home =
+            home_dir_from_sources(None, None, Some("C:".into()), Some("\\Users\\song".into()));
+
+        assert_eq!(home, Some(PathBuf::from("C:\\Users\\song")));
     }
 
     #[test]
@@ -3723,7 +4642,8 @@ mod tests {
     }
 
     #[test]
-    fn merge_log_backed_local_host_approvals_matches_resolved_transcript_when_log_workdir_is_empty() {
+    fn merge_log_backed_local_host_approvals_matches_resolved_transcript_when_log_workdir_is_empty()
+    {
         let runtime = LocalCodexRuntimeState {
             source: Some("user-prompt-submit".to_string()),
             status: Some("running".to_string()),
@@ -3792,8 +4712,7 @@ mod tests {
             .expect("expected approval fingerprint"),
         );
 
-        let approvals =
-            suppress_recently_resolved_local_host_approvals(vec![approval], &recent);
+        let approvals = suppress_recently_resolved_local_host_approvals(vec![approval], &recent);
 
         assert!(approvals.is_empty());
     }
@@ -3888,19 +4807,48 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn local_codex_host_terminal_command_uses_verified_codex_shortcuts() {
         assert_eq!(
             local_codex_host_terminal_command("approved", Some("always")).unwrap(),
-            "input text linefeed to targetTerminal"
+            "send key \"p\" action press to targetTerminal\n    delay 0.02\n    send key \"p\" action release to targetTerminal"
         );
         assert_eq!(
             local_codex_host_terminal_command("approved", Some("yes")).unwrap(),
-            "input text linefeed to targetTerminal"
+            "send key \"y\" action press to targetTerminal\n    delay 0.02\n    send key \"y\" action release to targetTerminal"
         );
         assert_eq!(
             local_codex_host_terminal_command("denied", None).unwrap(),
-            "send key \"n\" action press to targetTerminal\n    delay 0.02\n    send key \"n\" action release to targetTerminal"
+            "send key \"escape\" action press to targetTerminal\n    delay 0.02\n    send key \"escape\" action release to targetTerminal"
         );
+    }
+
+    #[test]
+    fn local_codex_host_approval_shortcut_matches_codex_desktop_choices() {
+        assert_eq!(
+            local_codex_host_approval_shortcut("approved", Some("always")).unwrap(),
+            "p"
+        );
+        assert_eq!(
+            local_codex_host_approval_shortcut("approved", Some("yes")).unwrap(),
+            "y"
+        );
+        assert_eq!(
+            local_codex_host_approval_shortcut("cancelled", None).unwrap(),
+            "escape"
+        );
+    }
+
+    #[test]
+    fn broker_start_guard_allows_only_one_active_lease() {
+        let mut state = BrokerStartGuardState::default();
+
+        assert!(try_acquire_broker_start_guard(&mut state));
+        assert!(!try_acquire_broker_start_guard(&mut state));
+
+        release_broker_start_guard(&mut state);
+
+        assert!(try_acquire_broker_start_guard(&mut state));
     }
 }

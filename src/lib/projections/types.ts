@@ -30,7 +30,7 @@ export interface AttentionItemProjection {
   jumpTarget?: JumpTarget | null;
   approvalId?: string;
   taskId?: string;
-  approvalDecision?: 'approved' | 'denied' | 'pending';
+  approvalDecision?: 'approved' | 'denied' | 'cancelled' | 'pending';
 }
 
 export interface RecentItemProjection {

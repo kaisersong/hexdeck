@@ -2,16 +2,16 @@
 
 ## 当前发布版本
 
-- App version: `0.2.0`
-- Tag: `v0.2.0`
+- App version: `0.2.3`
+- Tag: `v0.2.3`
 
-## 0.2.0 发布要点
+## 0.2.3 发布要点
 
-- 真实 native `activity-card` 已按三类结构化消息验证：`request_approval`、单选 `ask_clarification`、`report_progress(stage="completed")`
-- 弹窗是否出现只取决于消息类型，不取决于 `project`
-- live popup 首次弹出默认应保持被动，不抢宿主终端键盘输入
-- activity-card 正文支持安全 Markdown 子集渲染
-- 当前 `AskUserQuestion.questions[]` 仍只会落成第一条可投影的单选题，完整多题/多步卡片 UI 尚未实现
+- 修复本地 broker bootstrap 并发启动，避免多个窗口重复拉起 broker / app-server
+- 修复旧 replay 审批事件被误投影成可点击假卡片
+- 修复 broker 审批投影只看前 100 条事件导致新审批不弹出的问题
+- Windows 下 `Codex CLI` 本地审批改为优先写入目标 console，不再把 `y` 误发到 `Codex Desktop` 输入框
+- macOS Ghostty 本地审批链路保留，未被这次 Windows 修复破坏
 
 ## GitHub Secrets 配置
 
@@ -60,8 +60,8 @@ git push
 1. 更新版本号
 2. 创建 tag 并推送:
    ```bash
-   git tag v0.2.0
-   git push origin v0.2.0
+   git tag v0.2.3
+   git push origin v0.2.3
    ```
 
 3. GitHub Actions 会自动:

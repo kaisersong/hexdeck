@@ -212,7 +212,14 @@ describe('buildProjectSnapshot', () => {
   it('derives pending approvals from replay events when approvals array is empty', () => {
     const snapshot = buildProjectSnapshot({
       health: { ok: true },
-      participants: [],
+      participants: [
+        {
+          participantId: 'agent-1',
+          alias: 'codex4',
+          kind: 'agent',
+          context: { projectName: 'intent-broker' },
+        },
+      ],
       workStates: [],
       events: [
         {
@@ -223,7 +230,7 @@ describe('buildProjectSnapshot', () => {
           createdAt: '2026-04-24T04:00:00.000Z',
           payload: {
             approvalId: 'approval-from-event',
-            participantId: 'codex-session-1',
+            participantId: 'agent-1',
             body: {
               summary: 'Approval from event stream',
             },
@@ -242,7 +249,14 @@ describe('buildProjectSnapshot', () => {
   it('drops event-derived pending approvals after a respond_approval event arrives', () => {
     const snapshot = buildProjectSnapshot({
       health: { ok: true },
-      participants: [],
+      participants: [
+        {
+          participantId: 'agent-1',
+          alias: 'codex4',
+          kind: 'agent',
+          context: { projectName: 'intent-broker' },
+        },
+      ],
       workStates: [],
       events: [
         {
@@ -251,6 +265,7 @@ describe('buildProjectSnapshot', () => {
           taskId: 'task-from-event',
           payload: {
             approvalId: 'approval-from-event',
+            participantId: 'agent-1',
             body: {
               summary: 'Approval from event stream',
             },
@@ -263,6 +278,39 @@ describe('buildProjectSnapshot', () => {
           payload: {
             approvalId: 'approval-from-event',
             decision: 'approved',
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(snapshot.overview.pendingApprovalCount).toBe(0);
+    expect(snapshot.attention).toEqual([]);
+  });
+
+  it('ignores event-derived pending approvals when the requesting participant is no longer present', () => {
+    const snapshot = buildProjectSnapshot({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'agent-live',
+          alias: 'codex4',
+          kind: 'agent',
+          context: { projectName: 'intent-broker' },
+        },
+      ],
+      workStates: [],
+      events: [
+        {
+          id: 100,
+          type: 'request_approval',
+          taskId: 'task-from-event',
+          payload: {
+            approvalId: 'approval-from-event',
+            participantId: 'agent-gone',
+            body: {
+              summary: 'Approval from stale event stream',
+            },
           },
         },
       ],

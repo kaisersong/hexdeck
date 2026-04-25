@@ -2,14 +2,19 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
 
-const { getCurrentWindowMock, hideWindowMock, onFocusChangedMock } = vi.hoisted(() => ({
+const { getCurrentWindowMock, hideWindowMock, onFocusChangedMock, invokeMock } = vi.hoisted(() => ({
   getCurrentWindowMock: vi.fn(),
   hideWindowMock: vi.fn(),
   onFocusChangedMock: vi.fn(),
+  invokeMock: vi.fn(),
 }));
 
 vi.mock('@tauri-apps/api/window', () => ({
   getCurrentWindow: getCurrentWindowMock,
+}));
+
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: invokeMock,
 }));
 
 describe('App shell', () => {
@@ -18,11 +23,13 @@ describe('App shell', () => {
     hideWindowMock.mockReset();
     getCurrentWindowMock.mockReset();
     onFocusChangedMock.mockReset();
+    invokeMock.mockReset();
     getCurrentWindowMock.mockReturnValue({
       hide: hideWindowMock,
       onFocusChanged: onFocusChangedMock,
     });
     onFocusChangedMock.mockResolvedValue(() => undefined);
+    invokeMock.mockResolvedValue(undefined);
   });
 
   it('renders the compact dropdown shell without the removed main-panel CTA', () => {
@@ -70,5 +77,22 @@ describe('App shell', () => {
     await waitFor(() => {
       expect(hideWindowMock).toHaveBeenCalledTimes(1);
     });
+  });
+
+  it('falls back to the expanded settings route in the current window when opening the settings window fails', async () => {
+    invokeMock.mockRejectedValue(new Error('open failed'));
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Broker Runtime')).toBeInTheDocument();
+      expect(window.location.search).toContain('view=expanded');
+      expect(window.location.search).toContain('section=settings');
+    });
+
+    expect(screen.getByText('HexDeck Shortcut')).toBeInTheDocument();
+    expect(hideWindowMock).not.toHaveBeenCalled();
   });
 });

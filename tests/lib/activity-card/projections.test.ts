@@ -512,7 +512,16 @@ describe('buildActivityCardsFromSeed', () => {
 
     const cards = buildActivityCardsFromSeed({
       health: { ok: true },
-      participants: [],
+      participants: [
+        {
+          participantId: 'agent-1',
+          alias: 'codex4',
+          kind: 'agent',
+          context: {
+            projectName: 'HexDeck',
+          },
+        },
+      ],
       workStates: [],
       events: [
         {
@@ -521,6 +530,7 @@ describe('buildActivityCardsFromSeed', () => {
           taskId: 'task-long-approval',
           payload: {
             approvalId: 'approval-long-body',
+            participantId: 'agent-1',
             body: {
               summary: longSummary,
             },
@@ -793,7 +803,16 @@ describe('buildActivityCardsFromSeed', () => {
   it('uses approval action labels provided by the agent payload', () => {
     const cards = buildActivityCardsFromSeed({
       health: { ok: true },
-      participants: [],
+      participants: [
+        {
+          participantId: 'agent-1',
+          alias: 'codex4',
+          kind: 'agent',
+          context: {
+            projectName: 'HexDeck',
+          },
+        },
+      ],
       workStates: [],
       events: [
         {
@@ -802,6 +821,7 @@ describe('buildActivityCardsFromSeed', () => {
           taskId: 'task-approval-3',
           payload: {
             approvalId: 'approval-event-3',
+            participantId: 'agent-1',
             actions: [
               { label: 'Run Bash', decisionMode: 'yes' },
               { label: 'Always allow Bash', decisionMode: 'always' },
@@ -1278,7 +1298,16 @@ describe('buildActivityCardsFromSeed', () => {
   it('extracts optional approval detail and command preview fields from the payload body', () => {
     const cards = buildActivityCardsFromSeed({
       health: { ok: true },
-      participants: [],
+      participants: [
+        {
+          participantId: 'agent-1',
+          alias: 'codex4',
+          kind: 'agent',
+          context: {
+            projectName: 'HexDeck',
+          },
+        },
+      ],
       workStates: [],
       events: [
         {
@@ -1287,6 +1316,7 @@ describe('buildActivityCardsFromSeed', () => {
           taskId: 'task-approval-4',
           payload: {
             approvalId: 'approval-event-4',
+            participantId: 'agent-1',
             approvalScope: 'run_command',
             body: {
               summary: 'Claude wants to run Bash.',
@@ -1312,7 +1342,16 @@ describe('buildActivityCardsFromSeed', () => {
   it('drops derived approval cards after a respond_approval event arrives', () => {
     const cards = buildActivityCardsFromSeed({
       health: { ok: true },
-      participants: [],
+      participants: [
+        {
+          participantId: 'agent-1',
+          alias: 'codex4',
+          kind: 'agent',
+          context: {
+            projectName: 'HexDeck',
+          },
+        },
+      ],
       workStates: [],
       events: [
         {
@@ -1321,6 +1360,7 @@ describe('buildActivityCardsFromSeed', () => {
           taskId: 'task-approval-2',
           payload: {
             approvalId: 'approval-event-2',
+            participantId: 'agent-1',
             body: {
               summary: 'Approve deploy?',
             },
@@ -1333,6 +1373,40 @@ describe('buildActivityCardsFromSeed', () => {
           payload: {
             approvalId: 'approval-event-2',
             decision: 'approved',
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards.find((card) => card.kind === 'approval')).toBeUndefined();
+  });
+
+  it('ignores request_approval replay events when the participant is no longer in the current roster', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'agent-live',
+          alias: 'codex4',
+          kind: 'agent',
+          context: {
+            projectName: 'HexDeck',
+          },
+        },
+      ],
+      workStates: [],
+      events: [
+        {
+          id: 603,
+          type: 'request_approval',
+          taskId: 'task-stale-approval',
+          payload: {
+            approvalId: 'approval-stale',
+            participantId: 'agent-gone',
+            body: {
+              summary: 'Stale approval should not reappear',
+            },
           },
         },
       ],

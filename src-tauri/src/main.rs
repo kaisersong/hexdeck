@@ -271,7 +271,10 @@ fn append_activity_card_diagnostics_event(event: &serde_json::Value) {
             object
         }
     };
-    object.insert("timestamp".to_string(), serde_json::json!(Utc::now().to_rfc3339()));
+    object.insert(
+        "timestamp".to_string(),
+        serde_json::json!(Utc::now().to_rfc3339()),
+    );
     object.insert("pid".to_string(), serde_json::json!(std::process::id()));
 
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
@@ -283,7 +286,11 @@ fn project_name_from_project_path(project_path: Option<&str>) -> Option<String> 
     project_path
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .and_then(|value| std::path::Path::new(value).file_name().and_then(|name| name.to_str()))
+        .and_then(|value| {
+            std::path::Path::new(value)
+                .file_name()
+                .and_then(|name| name.to_str())
+        })
         .map(str::to_string)
 }
 
@@ -818,12 +825,10 @@ fn approval_item_string(value: Option<&serde_json::Value>, key: &str) -> Option<
         .map(str::to_string)
 }
 
-fn local_host_approval_meta_string(
-    value: Option<&serde_json::Value>,
-    key: &str,
-) -> Option<String> {
+fn local_host_approval_meta_string(value: Option<&serde_json::Value>, key: &str) -> Option<String> {
     value.and_then(|value| {
-        value.get("body")
+        value
+            .get("body")
             .and_then(serde_json::Value::as_object)
             .and_then(|body| body.get("localHostApproval"))
             .and_then(serde_json::Value::as_object)
@@ -839,14 +844,20 @@ fn build_local_host_approval_event(
     extra: Option<serde_json::Value>,
 ) -> serde_json::Value {
     let mut object = serde_json::Map::new();
-    object.insert("kind".to_string(), serde_json::json!("activity_card_watcher"));
+    object.insert(
+        "kind".to_string(),
+        serde_json::json!("activity_card_watcher"),
+    );
     object.insert("stage".to_string(), serde_json::json!(stage));
 
     if let Some(approval_id) = approval_item.and_then(local_host_approval_id) {
         object.insert("approvalId".to_string(), serde_json::json!(approval_id));
     }
     if let Some(participant_id) = approval_item_string(approval_item, "participantId") {
-        object.insert("participantId".to_string(), serde_json::json!(participant_id));
+        object.insert(
+            "participantId".to_string(),
+            serde_json::json!(participant_id),
+        );
     }
     if let Some(task_id) = approval_item_string(approval_item, "taskId") {
         object.insert("taskId".to_string(), serde_json::json!(task_id));
@@ -983,8 +994,6 @@ struct ActivityCardBrokerWatcher {
     last_prepared_popup_event_id: Option<u64>,
     #[allow(dead_code)]
     last_prepared_local_approval_id: Option<String>,
-    #[allow(dead_code)]
-    last_prepared_local_approval_at: Option<tokio::time::Instant>,
     consecutive_error_count: u32,
 }
 
@@ -995,7 +1004,6 @@ impl ActivityCardBrokerWatcher {
             after: initial_after.unwrap_or(0),
             last_prepared_popup_event_id: None,
             last_prepared_local_approval_id: None,
-            last_prepared_local_approval_at: None,
             consecutive_error_count: 0,
         }
     }
@@ -1044,41 +1052,34 @@ impl ActivityCardBrokerWatcher {
     }
 
     #[allow(dead_code)]
-    fn take_prepare_local_approval_id(
-        &mut self,
-        approval_id: Option<&str>,
-        now: tokio::time::Instant,
-    ) -> Option<String> {
+    fn take_prepare_local_approval_id(&mut self, approval_id: Option<&str>) -> Option<String> {
         match approval_id {
             Some(approval_id)
                 if self.last_prepared_local_approval_id.as_deref() != Some(approval_id) =>
             {
                 let approval_id = approval_id.to_string();
                 self.last_prepared_local_approval_id = Some(approval_id.clone());
-                self.last_prepared_local_approval_at = Some(now);
                 Some(approval_id)
             }
-            Some(approval_id) => {
-                let should_retry = self
-                    .last_prepared_local_approval_at
-                    .map(|last_at| {
-                        now.duration_since(last_at) >= ACTIVITY_CARD_BROKER_POLL_INTERVAL
-                    })
-                    .unwrap_or(true);
-                if should_retry {
-                    self.last_prepared_local_approval_at = Some(now);
-                    return Some(approval_id.to_string());
-                }
-                None
-            }
+            Some(_) => None,
             None => {
                 self.last_prepared_local_approval_id = None;
-                self.last_prepared_local_approval_at = None;
                 None
             }
         }
     }
+}
 
+fn select_local_host_approval_dispatch(
+    watcher: &mut ActivityCardBrokerWatcher,
+    local_approval_item: Option<serde_json::Value>,
+) -> (Option<serde_json::Value>, Option<String>) {
+    let prepare_local_approval_id = watcher.take_prepare_local_approval_id(
+        local_approval_item
+            .as_ref()
+            .and_then(local_host_approval_id),
+    );
+    (local_approval_item, prepare_local_approval_id)
 }
 
 async fn poll_activity_card_events(app: tauri::AppHandle) {
@@ -1096,8 +1097,10 @@ async fn poll_activity_card_events(app: tauri::AppHandle) {
             .get_webview_window("activity-card")
             .and_then(|window| window.is_visible().ok())
             .unwrap_or(false);
-        let local_approval_item: Option<serde_json::Value> = None;
-        let prepare_local_approval_id: Option<String> = None;
+        let (local_approval_item, prepare_local_approval_id) = select_local_host_approval_dispatch(
+            &mut watcher,
+            commands::broker::latest_local_host_approval_item_value(),
+        );
         let mut prepare_event_id = None;
 
         if now >= next_broker_poll_at {
@@ -1501,6 +1504,7 @@ fn detect_terminal() -> Option<String> {
 }
 
 /// Get the tty device by walking up the process chain to find a process with a tty.
+#[cfg(unix)]
 fn get_parent_tty() -> Result<String, String> {
     let mut pid = std::os::unix::process::parent_id();
 
@@ -1541,6 +1545,11 @@ fn get_parent_tty() -> Result<String, String> {
     }
 
     Err("no_tty_found_in_process_chain".to_string())
+}
+
+#[cfg(not(unix))]
+fn get_parent_tty() -> Result<String, String> {
+    Err("parent_tty_lookup_unsupported_on_this_platform".to_string())
 }
 
 /// Get the current terminal window title by querying the terminal process.
@@ -2084,30 +2093,65 @@ mod tests {
     #[test]
     fn activity_card_broker_watcher_prepares_for_new_local_host_approval_ids() {
         let mut watcher = ActivityCardBrokerWatcher::new(Some(100));
-        let first = tokio::time::Instant::now();
-        let second = first + std::time::Duration::from_millis(1);
-        let third = second + std::time::Duration::from_millis(1);
 
         assert_eq!(
-            watcher.take_prepare_local_approval_id(
-                Some("hexdeck-local-codex-host-codex-session-019db354-call_1"),
-                first
-            ),
+            watcher.take_prepare_local_approval_id(Some(
+                "hexdeck-local-codex-host-codex-session-019db354-call_1",
+            )),
             Some("hexdeck-local-codex-host-codex-session-019db354-call_1".to_string())
         );
         assert_eq!(
-            watcher.take_prepare_local_approval_id(
-                Some("hexdeck-local-codex-host-codex-session-019db354-call_1"),
-                second
-            ),
+            watcher.take_prepare_local_approval_id(Some(
+                "hexdeck-local-codex-host-codex-session-019db354-call_1",
+            )),
             None
         );
         assert_eq!(
-            watcher.take_prepare_local_approval_id(
-                Some("hexdeck-local-codex-host-codex-session-019db354-call_2"),
-                third
-            ),
+            watcher.take_prepare_local_approval_id(Some(
+                "hexdeck-local-codex-host-codex-session-019db354-call_2",
+            )),
             Some("hexdeck-local-codex-host-codex-session-019db354-call_2".to_string())
+        );
+    }
+
+    #[test]
+    fn select_local_host_approval_dispatch_preserves_payload_and_prepare_id() {
+        let mut watcher = ActivityCardBrokerWatcher::new(Some(100));
+        let approval = serde_json::json!({
+            "approvalId": "hexdeck-local-codex-host-codex-session-019db354-call_1",
+            "taskId": "local-host-approval-codex-session-019db354-call_1",
+            "participantId": "codex.main"
+        });
+
+        let (payload, prepare_id) =
+            select_local_host_approval_dispatch(&mut watcher, Some(approval.clone()));
+
+        assert_eq!(payload, Some(approval));
+        assert_eq!(
+            prepare_id,
+            Some("hexdeck-local-codex-host-codex-session-019db354-call_1".to_string())
+        );
+    }
+
+    #[test]
+    fn select_local_host_approval_dispatch_rearms_after_payload_disappears() {
+        let mut watcher = ActivityCardBrokerWatcher::new(Some(100));
+        let approval = serde_json::json!({
+            "approvalId": "hexdeck-local-codex-host-codex-session-019db354-call_1",
+            "taskId": "local-host-approval-codex-session-019db354-call_1"
+        });
+
+        assert_eq!(
+            select_local_host_approval_dispatch(&mut watcher, Some(approval.clone())).1,
+            Some("hexdeck-local-codex-host-codex-session-019db354-call_1".to_string())
+        );
+        assert_eq!(
+            select_local_host_approval_dispatch(&mut watcher, None).1,
+            None
+        );
+        assert_eq!(
+            select_local_host_approval_dispatch(&mut watcher, Some(approval)).1,
+            Some("hexdeck-local-codex-host-codex-session-019db354-call_1".to_string())
         );
     }
 
@@ -2203,38 +2247,32 @@ mod tests {
     }
 
     #[test]
-    fn activity_card_broker_watcher_retries_same_local_host_approval_while_window_hidden() {
+    fn activity_card_broker_watcher_does_not_retry_same_local_host_approval_while_window_hidden() {
         let mut watcher = ActivityCardBrokerWatcher::new(Some(0));
         let approval_id = "hexdeck-local-codex-host-codex-session-019db354-call_1";
-        let first = tokio::time::Instant::now();
-        let second =
-            first + ACTIVITY_CARD_BROKER_POLL_INTERVAL + std::time::Duration::from_millis(1);
 
         assert_eq!(
-            watcher.take_prepare_local_approval_id(Some(approval_id), first),
+            watcher.take_prepare_local_approval_id(Some(approval_id)),
             Some(approval_id.to_string())
         );
         assert_eq!(
-            watcher.take_prepare_local_approval_id(Some(approval_id), second),
-            Some(approval_id.to_string())
+            watcher.take_prepare_local_approval_id(Some(approval_id)),
+            None
         );
     }
 
     #[test]
-    fn activity_card_broker_watcher_retries_same_local_host_approval_while_window_visible() {
+    fn activity_card_broker_watcher_does_not_retry_same_local_host_approval_while_window_visible() {
         let mut watcher = ActivityCardBrokerWatcher::new(Some(0));
         let approval_id = "hexdeck-local-codex-host-codex-session-019db354-call_1";
-        let first = tokio::time::Instant::now();
-        let second =
-            first + ACTIVITY_CARD_BROKER_POLL_INTERVAL + std::time::Duration::from_millis(1);
 
         assert_eq!(
-            watcher.take_prepare_local_approval_id(Some(approval_id), first),
+            watcher.take_prepare_local_approval_id(Some(approval_id)),
             Some(approval_id.to_string())
         );
         assert_eq!(
-            watcher.take_prepare_local_approval_id(Some(approval_id), second),
-            Some(approval_id.to_string())
+            watcher.take_prepare_local_approval_id(Some(approval_id)),
+            None
         );
     }
 

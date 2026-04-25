@@ -20,6 +20,7 @@ interface BrokerClientOptions {
 type BrokerEventListener = (event: BrokerEvent) => void;
 const REPLAY_PAGE_SIZE = 100;
 const BROKER_UI_PARTICIPANT_ID = 'human.local';
+const LOCAL_CODEX_HOST_APPROVAL_PREFIX = 'hexdeck-local-codex-host-';
 const BROKER_UI_PARTICIPANT = {
   participantId: BROKER_UI_PARTICIPANT_ID,
   alias: 'human',
@@ -181,6 +182,86 @@ function normalizeProjectSeed(seed: ProjectSeed): ProjectSeed {
   };
 }
 
+function normalizeBrokerApprovalItem(value: unknown): BrokerApprovalItem | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return null;
+  }
+
+  const candidate = value as Partial<BrokerApprovalItem>;
+  if (typeof candidate.approvalId !== 'string' || typeof candidate.taskId !== 'string') {
+    return null;
+  }
+
+  const approval: BrokerApprovalItem = {
+    approvalId: candidate.approvalId,
+    taskId: candidate.taskId,
+  };
+
+  if (typeof candidate.threadId === 'string') approval.threadId = candidate.threadId;
+  if (typeof candidate.createdAt === 'string') approval.createdAt = candidate.createdAt;
+  if (typeof candidate.summary === 'string') approval.summary = candidate.summary;
+  if (
+    candidate.decision === 'approved'
+    || candidate.decision === 'denied'
+    || candidate.decision === 'cancelled'
+    || candidate.decision === 'pending'
+  ) {
+    approval.decision = candidate.decision;
+  }
+  if (typeof candidate.participantId === 'string') approval.participantId = candidate.participantId;
+  if (typeof candidate.detailText === 'string') approval.detailText = candidate.detailText;
+  if (typeof candidate.commandTitle === 'string') approval.commandTitle = candidate.commandTitle;
+  if (typeof candidate.commandLine === 'string') approval.commandLine = candidate.commandLine;
+  if (typeof candidate.commandPreview === 'string') approval.commandPreview = candidate.commandPreview;
+  if (candidate.body && typeof candidate.body === 'object' && !Array.isArray(candidate.body)) {
+    approval.body = candidate.body as Record<string, unknown>;
+  }
+  if (Array.isArray(candidate.actions)) {
+    approval.actions = candidate.actions
+      .filter((action): action is NonNullable<BrokerApprovalItem['actions']>[number] => (
+        typeof action === 'object' && action !== null && !Array.isArray(action)
+      ))
+      .map((action) => ({
+        key: typeof action.key === 'string' ? action.key : undefined,
+        label: typeof action.label === 'string' ? action.label : undefined,
+        decisionMode:
+          action.decisionMode === 'yes'
+          || action.decisionMode === 'always'
+          || action.decisionMode === 'no'
+          || action.decisionMode === 'cancel'
+            ? action.decisionMode
+            : undefined,
+        nativeDecision: action.nativeDecision,
+        disabled: typeof action.disabled === 'boolean' ? action.disabled : undefined,
+        unsupportedReason:
+          typeof action.unsupportedReason === 'string' || action.unsupportedReason === null
+            ? action.unsupportedReason
+            : undefined,
+      }));
+  }
+
+  return approval;
+}
+
+function mergeLocalHostApprovalIntoSeed(seed: ProjectSeed, localApproval: unknown): ProjectSeed {
+  const normalized = normalizeBrokerApprovalItem(localApproval);
+  if (!normalized) {
+    return seed;
+  }
+
+  return {
+    ...seed,
+    approvals: [
+      normalized,
+      ...seed.approvals.filter((approval) => approval.approvalId !== normalized.approvalId),
+    ],
+  };
+}
+
+function isLocalHostApprovalId(approvalId: string): boolean {
+  return approvalId.startsWith(LOCAL_CODEX_HOST_APPROVAL_PREFIX);
+}
+
 function createIntentId(prefix: string): string {
   if (typeof globalThis.crypto !== 'undefined' && typeof globalThis.crypto.randomUUID === 'function') {
     return `${prefix}:${globalThis.crypto.randomUUID()}`;
@@ -250,9 +331,12 @@ export class BrokerClient {
 
   async loadServiceSeed(): Promise<ProjectSeed> {
     if (isTauriEnvironment()) {
-      return normalizeProjectSeed(await invoke<ProjectSeed>('load_broker_service_seed', {
+      const seed = normalizeProjectSeed(await invoke<ProjectSeed>('load_broker_service_seed', {
         brokerUrl: this.brokerUrl,
       }));
+      const localApproval = await invoke<BrokerApprovalItem | null>('load_latest_local_host_approval_item')
+        .catch(() => null);
+      return mergeLocalHostApprovalIntoSeed(seed, localApproval);
     }
 
     const [health, participants, workStates, presence, events] = await Promise.all([
@@ -312,10 +396,15 @@ export class BrokerClient {
 
   async respondToApproval(input: BrokerApprovalResponseInput): Promise<void> {
     if (isTauriEnvironment()) {
-      await invoke('respond_to_broker_approval', {
+      await invoke(
+        isLocalHostApprovalId(input.approvalId)
+          ? 'respond_to_local_host_approval'
+          : 'respond_to_broker_approval',
+        {
         brokerUrl: this.brokerUrl,
         input,
-      });
+        }
+      );
       return;
     }
 

@@ -37,6 +37,7 @@ import {
 } from '../lib/settings/local-settings';
 import { useAppStore } from '../lib/store/use-app-store';
 import { ensureBrokerReady } from '../lib/update/broker-updater';
+import { nextLocalBrokerBootstrapAttempt } from './local-broker-bootstrap';
 import { DragDemoRoute } from './routes/drag-demo';
 import { ActivityCardRoute, type ActivityCardDebugInfo } from './routes/activity-card';
 import { ExpandedRoute } from './routes/expanded';
@@ -488,6 +489,9 @@ export function App() {
   const isExpandedWindow = windowMode === 'expanded';
   const isDragDemoWindow = windowMode === 'drag-demo';
   const store = useAppStore();
+  const panelBlurGuardUntilRef = useRef(0);
+  const localBrokerBootstrapAttemptRef = useRef<string | null>(null);
+  const [, setViewVersion] = useState(0);
   const [settings, setSettings] = useState(() => loadLocalSettings());
   const activityCardProjectOverride = isActivityCardWindow ? getActivityCardProjectOverride() : null;
   const currentProjectSetting = isActivityCardWindow
@@ -660,34 +664,47 @@ export function App() {
 
           try {
             if (settings.brokerUrl === DEFAULT_BROKER_URL) {
-              const bootstrap = await ensureBrokerReady(settings.brokerUrl);
-              if (disposed) {
-                return;
-              }
+              const nextBootstrapAttempt = nextLocalBrokerBootstrapAttempt(
+                localBrokerBootstrapAttemptRef.current,
+                settings.brokerUrl,
+                reloadKey,
+                DEFAULT_BROKER_URL
+              );
 
-              if (!bootstrap.ready) {
-                throw new Error(bootstrap.last_error ?? 'broker_not_ready');
+              if (nextBootstrapAttempt) {
+                localBrokerBootstrapAttemptRef.current = nextBootstrapAttempt;
+                const bootstrap = await ensureBrokerReady(settings.brokerUrl);
+                if (disposed) {
+                  return;
+                }
+
+                if (!bootstrap.ready) {
+                  throw new Error(bootstrap.last_error ?? 'broker_not_ready');
+                }
               }
 
               const runtime = await getBrokerRuntimeStatus().catch(() => null);
               if (!disposed) {
                 setRuntimeStatus(runtime);
               }
-            } else if (!disposed) {
-              setRuntimeStatus(null);
+            } else {
+              localBrokerBootstrapAttemptRef.current = null;
+              if (!disposed) {
+                setRuntimeStatus(null);
+              }
             }
 
-              const seed = await client.loadServiceSeed();
-              if (disposed) {
-                return;
-              }
+            const seed = await client.loadServiceSeed();
+            if (disposed) {
+              return;
+            }
 
-              const nowMs = Date.now();
-              const popupScopedSeed = filterPopupScopedLocalApprovals(seed, popupApprovalProjectScope);
-              const nextSnapshot = buildProjectSnapshot(seed);
-              const activitySeed = popupScopedSeed;
-              const activityCards = buildActivityCardsFromSeed(activitySeed);
-              await syncActivityCards(activitySeed, activityCards, nowMs);
+            const nowMs = Date.now();
+            const popupScopedSeed = filterPopupScopedLocalApprovals(seed, popupApprovalProjectScope);
+            const nextSnapshot = buildProjectSnapshot(seed);
+            const activitySeed = popupScopedSeed;
+            const activityCards = buildActivityCardsFromSeed(activitySeed);
+            await syncActivityCards(activitySeed, activityCards, nowMs);
             if (isActivityCardWindow) {
               const activeCard = store.getState().activityCards.activeCard;
               const latestEventId = activitySeed.events.reduce(
@@ -969,6 +986,10 @@ export function App() {
           return;
         }
 
+        if (Date.now() < panelBlurGuardUntilRef.current) {
+          return;
+        }
+
         void Promise.resolve(getCurrentWindow().hide()).catch(() => undefined);
       }))
       .then((unlisten) => {
@@ -1151,9 +1172,26 @@ export function App() {
     }
   };
 
-  const openExpandedWindow = async () => {
-    if (isExpandedWindow) {
+  const openExpandedInCurrentWindow = (section: 'settings') => {
+    if (typeof window === 'undefined') {
       return;
+    }
+
+    const next = new URLSearchParams(window.location.search);
+    next.set('view', 'expanded');
+    next.set('section', section);
+    window.history.replaceState({}, '', `${window.location.pathname}?${next.toString()}`);
+    setViewVersion((version) => version + 1);
+  };
+
+  const openExpandedWindow = async (section: 'settings' = 'settings') => {
+    if (isExpandedWindow) {
+      openExpandedInCurrentWindow(section);
+      return;
+    }
+
+    if (windowMode === 'panel') {
+      panelBlurGuardUntilRef.current = Date.now() + 1500;
     }
 
     try {
@@ -1161,10 +1199,16 @@ export function App() {
         import('@tauri-apps/api/core'),
         import('@tauri-apps/api/window'),
       ]);
-      await invoke('open_expanded_window', { section: 'settings' });
+      await invoke('open_expanded_window', { section });
       await getCurrentWindow().hide();
     } catch {
-      // Ignore when not running in Tauri.
+      openExpandedInCurrentWindow(section);
+    } finally {
+      if (typeof window !== 'undefined' && windowMode === 'panel') {
+        window.setTimeout(() => {
+          panelBlurGuardUntilRef.current = 0;
+        }, 1500);
+      }
     }
   };
 
@@ -1308,7 +1352,7 @@ export function App() {
         currentProject={settings.currentProject}
         brokerLive={brokerLive}
         onJump={handleJump}
-        onOpenSettings={() => void openExpandedWindow()}
+        onOpenSettings={() => void openExpandedWindow('settings')}
         onMinimize={() => void minimizeCurrentWindow()}
         onClose={() => void hidePanelWindow()}
       />

@@ -584,6 +584,8 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
   for (const event of seed.events) {
     const resolutionKey = getTaskThreadResolutionKey(event);
     const payload = (event.payload ?? {}) as Record<string, unknown>;
+    const participantId = resolveEventParticipantId(event, payload);
+    const hasKnownParticipant = typeof participantId === 'string' && participantsById.has(participantId);
 
     if (event.type === 'answer_clarification') {
       const questionResolutionKey = getQuestionResolutionEventKey(event, payload);
@@ -601,10 +603,13 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
     }
 
     if (event.type === 'request_approval') {
+      if (!hasKnownParticipant) {
+        continue;
+      }
+
       const approvalId = typeof payload.approvalId === 'string' ? payload.approvalId : null;
       const taskId = typeof event.taskId === 'string' ? event.taskId : null;
       if (isBrokerOwnedCodexApproval(payload, approvalId, taskId)) {
-        const participantId = resolveEventParticipantId(event, payload);
         const fingerprint = buildApprovalFingerprint(payload, participantId);
         if (fingerprint) {
           brokerOwnedCodexApprovalFingerprints.add(fingerprint);
@@ -692,11 +697,16 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
     const payload = (event.payload ?? {}) as Record<string, unknown>;
     const body = readPayloadBody(payload);
     const participantId = resolveEventParticipantId(event, payload);
+    const hasKnownParticipant = typeof participantId === 'string' && participantsById.has(participantId);
     const participantLabels = buildParticipantLabels(participantId, participantsById);
     const jumpTarget = participantId ? buildParticipantJumpTarget(participantId, participantsById) : null;
     const createdAtMs = parseEventCreatedAtMs(event);
 
     if (event.type === 'request_approval') {
+      if (!hasKnownParticipant) {
+        continue;
+      }
+
       const approvalId = typeof payload.approvalId === 'string' ? payload.approvalId : null;
       const taskId = typeof event.taskId === 'string' ? event.taskId : null;
       const approvalDisplay = splitLongDisplayText(String(body?.summary ?? payload.summary ?? 'Approval requested'), 'Approval requested');

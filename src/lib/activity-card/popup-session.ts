@@ -2,6 +2,8 @@ import type { ProjectSeed } from '../broker/types';
 import { getPopupCompletionGroupKey } from './popup-candidates';
 import type { ActivityCardProjection } from './types';
 
+const LOCAL_CODEX_HOST_APPROVAL_PREFIX = 'hexdeck-local-codex-host-';
+
 export type PopupVisibilityState = 'hidden' | 'visible' | 'pending_local_resolution';
 export type PopupVisibilityIntent = 'show' | 'keep' | 'hide';
 
@@ -141,6 +143,12 @@ function isPopupResolvedBySeed(
   }
 
   if (activeCard.kind === 'approval') {
+    if (activeCard.approvalId.startsWith(LOCAL_CODEX_HOST_APPROVAL_PREFIX)) {
+      return !seed.approvals.some((approval) => (
+        approval.approvalId === activeCard.approvalId && (approval.decision ?? 'pending') === 'pending'
+      ));
+    }
+
     if (seed.events.some(
       (event) => event.type === 'respond_approval' && event.payload?.approvalId === activeCard.approvalId
     )) {

@@ -1061,6 +1061,12 @@ describe('BrokerClient', () => {
       workStates: [{ participantId: 'a', status: 'implementing', projectName: 'projects' }],
       events: [{ id: 1, type: 'report_progress' }],
       approvals: [],
+    }).mockResolvedValueOnce({
+      approvalId: 'hexdeck-local-codex-host-codex-session-019db354-call_abc123',
+      taskId: 'local-host-approval-codex-session-019db354-call_abc123',
+      participantId: 'a',
+      summary: 'Allow once',
+      decision: 'pending',
     });
 
     Object.defineProperty(window, '__TAURI_INTERNALS__', {
@@ -1079,11 +1085,21 @@ describe('BrokerClient', () => {
 
       const snapshot = await client.loadServiceSeed();
 
-      expect(invokeMock).toHaveBeenCalledWith('load_broker_service_seed', {
+      expect(invokeMock).toHaveBeenNthCalledWith(1, 'load_broker_service_seed', {
         brokerUrl: 'http://127.0.0.1:4318',
       });
+      expect(invokeMock).toHaveBeenNthCalledWith(2, 'load_latest_local_host_approval_item');
       expect(snapshot.participants[0].alias).toBe('codex6');
       expect(snapshot.participants[0].presence).toBe('online');
+      expect(snapshot.approvals).toEqual([
+        {
+          approvalId: 'hexdeck-local-codex-host-codex-session-019db354-call_abc123',
+          taskId: 'local-host-approval-codex-session-019db354-call_abc123',
+          participantId: 'a',
+          summary: 'Allow once',
+          decision: 'pending',
+        },
+      ]);
     } finally {
       delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
     }
@@ -1130,7 +1146,7 @@ describe('BrokerClient', () => {
     }
   });
 
-  it('routes mirrored local Codex approvals through the broker approval command inside the desktop app', async () => {
+  it('routes local Codex host approvals through the local host approval command inside the desktop app', async () => {
     invokeMock.mockReset();
     invokeMock.mockResolvedValueOnce(undefined);
 
@@ -1158,7 +1174,7 @@ describe('BrokerClient', () => {
       });
 
       expect(fetchMock).not.toHaveBeenCalled();
-      expect(invokeMock).toHaveBeenCalledWith('respond_to_broker_approval', {
+      expect(invokeMock).toHaveBeenCalledWith('respond_to_local_host_approval', {
         brokerUrl: 'http://127.0.0.1:4318',
         input: {
           approvalId: 'hexdeck-local-codex-host-codex-session-019db354-call_abc123',

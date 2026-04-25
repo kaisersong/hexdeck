@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import type { ActivityCardProjection } from '../../../src/lib/activity-card/types';
+import type {
+  ActivityCardApprovalProjection,
+  ActivityCardProjection,
+} from '../../../src/lib/activity-card/types';
 import {
   createHiddenPopupSession,
   markPopupSessionLocalAction,
   reconcilePopupSession,
 } from '../../../src/lib/activity-card/popup-session';
 
-function makeApproval(summary = 'Need approval'): ActivityCardProjection {
+function makeApproval(summary = 'Need approval'): ActivityCardApprovalProjection {
   return {
     cardId: 'approval:1',
     resolutionKey: 'approval:approval-1',
@@ -18,6 +21,15 @@ function makeApproval(summary = 'Need approval'): ActivityCardProjection {
     actionMode: 'action',
     decision: 'pending',
     actions: [{ label: 'Yes', decisionMode: 'yes' }],
+  };
+}
+
+function makeLocalHostApproval(summary = 'Need local approval'): ActivityCardApprovalProjection {
+  return {
+    ...makeApproval(summary),
+    cardId: 'approval:local-1',
+    resolutionKey: 'approval:hexdeck-local-codex-host-approval-1',
+    approvalId: 'hexdeck-local-codex-host-approval-1',
   };
 }
 
@@ -110,6 +122,22 @@ describe('reconcilePopupSession', () => {
       seed: { health: { ok: true }, participants: [], workStates: [], events: [], approvals: [] },
       nowMs: 1_000,
       allowImmediateEmptySync: true,
+    });
+
+    expect(result.visibilityIntent).toBe('hide');
+    expect(result.cardsForStore).toEqual([]);
+  });
+
+  it('hides a stale local host approval as soon as it disappears from seed', () => {
+    const result = reconcilePopupSession({
+      session: {
+        visibility: 'visible',
+        activeCard: makeLocalHostApproval(),
+        pendingLocalResolutionKey: null,
+      },
+      nextCards: [],
+      seed: { health: { ok: true }, participants: [], workStates: [], events: [], approvals: [] },
+      nowMs: 1_000,
     });
 
     expect(result.visibilityIntent).toBe('hide');
