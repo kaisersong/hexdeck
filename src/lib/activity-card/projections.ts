@@ -104,6 +104,18 @@ function parseEventCreatedAtMs(event: ProjectSeed['events'][number]): number | u
   return Number.isFinite(createdAtMs) ? createdAtMs : undefined;
 }
 
+function parseApprovalCreatedAtMs(approval: ProjectSeed['approvals'][number]): number | undefined {
+  if (typeof approval.createdAt !== 'string') {
+    return undefined;
+  }
+
+  const normalizedCreatedAt = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(approval.createdAt)
+    ? `${approval.createdAt.replace(' ', 'T')}Z`
+    : approval.createdAt;
+  const createdAtMs = Date.parse(normalizedCreatedAt);
+  return Number.isFinite(createdAtMs) ? createdAtMs : undefined;
+}
+
 function readPayloadBody(payload: Record<string, unknown>): Record<string, unknown> | null {
   if (payload.body && typeof payload.body === 'object' && !Array.isArray(payload.body)) {
     return payload.body as Record<string, unknown>;
@@ -308,6 +320,31 @@ function buildParticipantLabels(
   };
 }
 
+function readDeliverySource(source: Record<string, unknown> | null | undefined): string | undefined {
+  const delivery = source?.delivery;
+  if (!delivery || typeof delivery !== 'object' || Array.isArray(delivery)) {
+    return undefined;
+  }
+
+  return readStringValue(delivery as Record<string, unknown>, ['source']);
+}
+
+function hasNonIdleWorkState(
+  workStates: ProjectSeed['workStates'],
+  participantId: string | undefined
+): boolean {
+  if (!participantId) {
+    return false;
+  }
+
+  return workStates.some((workState) => (
+    workState.participantId === participantId
+      && typeof workState.status === 'string'
+      && workState.status.trim().length > 0
+      && workState.status.trim().toLowerCase() !== 'idle'
+  ));
+}
+
 function isSuppressedApprovalSummary(summary: string | undefined | null): boolean {
   if (!summary) {
     return false;
@@ -323,7 +360,7 @@ function isSuppressedApprovalIdentity(approvalId: string | null | undefined, tas
   );
 }
 
-function isSuppressedInternalApprovalNoise(
+function isBrokerOwnedCodexNativeApproval(
   source: Record<string, unknown> | null | undefined,
   approvalId: string | null | undefined,
   taskId: string | null | undefined
@@ -336,10 +373,119 @@ function isSuppressedInternalApprovalNoise(
     }
   }
 
+  const nativeCodexApproval = source?.nativeCodexApproval;
+  if (nativeCodexApproval && typeof nativeCodexApproval === 'object' && !Array.isArray(nativeCodexApproval)) {
+    return true;
+  }
+
   return Boolean(
     approvalId?.startsWith('codex-native-call_')
       || taskId?.startsWith('codex-native-call_')
   );
+}
+
+function isBrokerOwnedCodexApproval(
+  source: Record<string, unknown> | null | undefined,
+  approvalId: string | null | undefined,
+  taskId: string | null | undefined
+): boolean {
+  return isMirroredCodexHookApproval(source) || isBrokerOwnedCodexNativeApproval(source, approvalId, taskId);
+}
+
+function isMirroredCodexHookApproval(source: Record<string, unknown> | null | undefined): boolean {
+  const delivery = source?.delivery;
+  if (delivery && typeof delivery === 'object' && !Array.isArray(delivery)) {
+    const deliverySource = (delivery as Record<string, unknown>).source;
+    if (deliverySource === 'codex-hook-approval') {
+      return true;
+    }
+  }
+
+  const nativeHookApproval = source?.nativeHookApproval;
+  if (!nativeHookApproval || typeof nativeHookApproval !== 'object' || Array.isArray(nativeHookApproval)) {
+    return false;
+  }
+
+  const agentTool = (nativeHookApproval as Record<string, unknown>).agentTool;
+  return typeof agentTool === 'string' && agentTool.trim().toLowerCase() === 'codex';
+}
+
+function isLocalCodexHostApproval(source: Record<string, unknown> | null | undefined): boolean {
+  const delivery = source?.delivery;
+  if (delivery && typeof delivery === 'object' && !Array.isArray(delivery)) {
+    const deliverySource = (delivery as Record<string, unknown>).source;
+    if (deliverySource === 'hexdeck-local-host-approval') {
+      return true;
+    }
+  }
+
+  const localHostApproval = source?.localHostApproval;
+  if (!localHostApproval || typeof localHostApproval !== 'object' || Array.isArray(localHostApproval)) {
+    return false;
+  }
+
+  const localSource = (localHostApproval as Record<string, unknown>).source;
+  return typeof localSource === 'string' && localSource.trim().toLowerCase() === 'codex';
+}
+
+function buildApprovalFingerprint(
+  source: Record<string, unknown> | null | undefined,
+  fallbackParticipantId?: string
+): string | null {
+  if (!source) {
+    return null;
+  }
+
+  const body = readPayloadBody(source);
+  const participantId = readStringValue(body, ['participantId'])
+    ?? readStringValue(source, ['participantId'])
+    ?? fallbackParticipantId;
+  const commandLine = normalizeDisplayText(
+    readStringValue(body, ['commandLine', 'command', 'script', 'shellCommand'])
+      ?? readStringValue(source, ['commandLine', 'command', 'script', 'shellCommand'])
+  );
+  const commandPreview = normalizeDisplayText(
+    readStringValue(body, ['commandPreview', 'preview', 'displayCommand'])
+      ?? readStringValue(source, ['commandPreview', 'preview', 'displayCommand'])
+  ) ?? '';
+
+  if (!participantId || !commandLine) {
+    return null;
+  }
+
+  return `${participantId.trim()}\u0000${commandLine}\u0000${commandPreview}`;
+}
+
+function buildCodexApprovalCallKey(
+  source: Record<string, unknown> | null | undefined,
+  fallbackParticipantId?: string
+): string | null {
+  if (!source) {
+    return null;
+  }
+
+  const body = readPayloadBody(source);
+  const participantId = readStringValue(body, ['participantId'])
+    ?? readStringValue(source, ['participantId'])
+    ?? fallbackParticipantId;
+  if (!participantId) {
+    return null;
+  }
+
+  const localHostApproval = body?.localHostApproval && typeof body.localHostApproval === 'object' && !Array.isArray(body.localHostApproval)
+    ? body.localHostApproval as Record<string, unknown>
+    : source.localHostApproval && typeof source.localHostApproval === 'object' && !Array.isArray(source.localHostApproval)
+      ? source.localHostApproval as Record<string, unknown>
+      : null;
+  const nativeCodexApproval = body?.nativeCodexApproval && typeof body.nativeCodexApproval === 'object' && !Array.isArray(body.nativeCodexApproval)
+    ? body.nativeCodexApproval as Record<string, unknown>
+    : source.nativeCodexApproval && typeof source.nativeCodexApproval === 'object' && !Array.isArray(source.nativeCodexApproval)
+      ? source.nativeCodexApproval as Record<string, unknown>
+      : null;
+  const callId = readStringValue(localHostApproval, ['callId'])
+    ?? readStringValue(nativeCodexApproval, ['callId']);
+
+  return callId ? `${participantId.trim()}\u0000${callId.trim()}` : null;
 }
 
 function normalizeApprovalAction(
@@ -352,7 +498,7 @@ function normalizeApprovalAction(
 
   const candidate = value as Record<string, unknown>;
   const decisionMode = candidate.decisionMode ?? candidate.mode ?? candidate.value;
-  if (decisionMode !== 'yes' && decisionMode !== 'always' && decisionMode !== 'no') {
+  if (decisionMode !== 'yes' && decisionMode !== 'always' && decisionMode !== 'no' && decisionMode !== 'cancel') {
     return null;
   }
 
@@ -360,10 +506,20 @@ function normalizeApprovalAction(
   const label = typeof candidate.label === 'string' && candidate.label.trim()
     ? candidate.label.trim()
     : fallbackLabel;
+  const key = typeof candidate.key === 'string' && candidate.key.trim()
+    ? candidate.key.trim()
+    : `${String(decisionMode)}:${label}`;
+  const unsupportedReason = typeof candidate.unsupportedReason === 'string' && candidate.unsupportedReason.trim()
+    ? candidate.unsupportedReason.trim()
+    : null;
 
   return {
+    key,
     label,
     decisionMode,
+    nativeDecision: candidate.nativeDecision,
+    disabled: Boolean(candidate.disabled),
+    unsupportedReason,
   };
 }
 
@@ -419,6 +575,8 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
   const questionCards: ActivityCardQuestionProjection[] = [];
   const completionCards: ActivityCardCompletionProjection[] = [];
   const approvalCardsById = new Map<string, ActivityCardApprovalProjection>();
+  const brokerOwnedCodexApprovalFingerprints = new Set<string>();
+  const brokerOwnedCodexApprovalCallKeys = new Set<string>();
   const resolvedApprovalIds = new Set<string>();
   const questionResolutionEventIdByKey = new Map<string, number>();
   const completedTaskKeys = new Set<string>();
@@ -442,6 +600,22 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
       );
     }
 
+    if (event.type === 'request_approval') {
+      const approvalId = typeof payload.approvalId === 'string' ? payload.approvalId : null;
+      const taskId = typeof event.taskId === 'string' ? event.taskId : null;
+      if (isBrokerOwnedCodexApproval(payload, approvalId, taskId)) {
+        const participantId = resolveEventParticipantId(event, payload);
+        const fingerprint = buildApprovalFingerprint(payload, participantId);
+        if (fingerprint) {
+          brokerOwnedCodexApprovalFingerprints.add(fingerprint);
+        }
+        const callKey = buildCodexApprovalCallKey(payload, participantId);
+        if (callKey) {
+          brokerOwnedCodexApprovalCallKeys.add(callKey);
+        }
+      }
+    }
+
     if (resolutionKey && isCompletedProgressEvent(event)) {
       completedTaskKeys.add(resolutionKey);
     }
@@ -456,6 +630,7 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
     const approvalBody = approval.body && typeof approval.body === 'object' && !Array.isArray(approval.body)
       ? approval.body as Record<string, unknown>
       : null;
+    const isLocalHostApproval = isLocalCodexHostApproval(approvalBody ?? approvalRecord);
     const approvalDisplay = splitLongDisplayText(
       readStringValue(approvalBody, ['summary'])
         ?? (typeof approval.summary === 'string' ? approval.summary : undefined)
@@ -463,15 +638,27 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
       'Approval requested'
     );
     const approvalSummary = approvalDisplay.summary;
-    if (isSuppressedApprovalSummary(approvalSummary)) {
+    const isBrokerOwnedApproval = isBrokerOwnedCodexApproval(
+      approvalBody ?? approvalRecord,
+      approval.approvalId,
+      approval.taskId
+    );
+    if (isSuppressedApprovalSummary(approvalSummary) && !isLocalHostApproval && !isBrokerOwnedApproval) {
       continue;
     }
     const approvalParticipantId = typeof approval.participantId === 'string' ? approval.participantId : undefined;
+    const approvalFingerprint = buildApprovalFingerprint(approvalBody ?? approvalRecord, approvalParticipantId);
+    const approvalCallKey = buildCodexApprovalCallKey(approvalBody ?? approvalRecord, approvalParticipantId);
     const approvalResolutionKey = getTaskThreadResolutionKey(approval);
+    const approvalCreatedAtMs = parseApprovalCreatedAtMs(approval);
     if (
       isSuppressedApprovalIdentity(approval.approvalId, approval.taskId)
-      || isSuppressedInternalApprovalNoise(approvalRecord, approval.approvalId, approval.taskId)
       || (approvalResolutionKey !== null && completedTaskKeys.has(approvalResolutionKey))
+      || (isLocalHostApproval
+        && (
+          (approvalFingerprint !== null && brokerOwnedCodexApprovalFingerprints.has(approvalFingerprint))
+          || (approvalCallKey !== null && brokerOwnedCodexApprovalCallKeys.has(approvalCallKey))
+        ))
     ) {
       continue;
     }
@@ -485,16 +672,20 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
       kind: 'approval',
       priority: 'critical',
       summary: approvalSummary,
+      createdAtMs: approvalCreatedAtMs,
       actionMode: 'action',
       approvalId: approval.approvalId,
       taskId: approval.taskId,
-      decision: approval.decision ?? 'pending',
+      decision: approval.decision === 'approved' || approval.decision === 'denied'
+        ? approval.decision
+        : 'pending',
       actions: buildApprovalActions(approvalRecord),
       ...buildApprovalPresentation(approvalSummary, approvalRecord, approvalBody, approvalDisplay.detailText),
       participantId: approvalParticipantId,
       ...participantLabels,
       jumpTarget,
     } satisfies ActivityCardApprovalProjection);
+
   }
 
   for (const event of seed.events) {
@@ -511,10 +702,10 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
       const approvalDisplay = splitLongDisplayText(String(body?.summary ?? payload.summary ?? 'Approval requested'), 'Approval requested');
       const summary = approvalDisplay.summary;
       const approvalResolutionKey = getTaskThreadResolutionKey(event);
+      const isBrokerOwnedApproval = isBrokerOwnedCodexApproval(payload, approvalId, taskId);
       if (
-        isSuppressedApprovalSummary(summary)
+        (isSuppressedApprovalSummary(summary) && !isBrokerOwnedApproval)
         || isSuppressedApprovalIdentity(approvalId, taskId)
-        || isSuppressedInternalApprovalNoise(payload, approvalId, taskId)
         || (approvalResolutionKey !== null && completedTaskKeys.has(approvalResolutionKey))
       ) {
         continue;
@@ -596,6 +787,11 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
     ) {
       const completionText = normalizeDisplayText(String(body?.summary ?? payload.summary ?? payload.message ?? 'Completed')) ?? 'Completed';
       const completionDisplay = splitLongDisplayText(completionText, 'Completed');
+      const deliverySource = readDeliverySource(body) ?? readDeliverySource(payload);
+      if (deliverySource === 'stop-fallback' && hasNonIdleWorkState(seed.workStates, participantId)) {
+        continue;
+      }
+
       completionCards.push({
         cardId: `completion:${event.id}`,
         resolutionKey: getCompletionResolutionKey(event),

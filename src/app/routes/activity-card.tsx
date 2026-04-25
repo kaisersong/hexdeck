@@ -1,6 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import type { ActivityCardApprovalProjection, ActivityCardProjection, ActivityCardQuestionOption, ActivityCardQuestionProjection } from '../../lib/activity-card/types';
-import type { BrokerApprovalDecisionMode } from '../../lib/broker/types';
+import type { ActivityCardApprovalAction, ActivityCardApprovalProjection, ActivityCardProjection, ActivityCardQuestionOption, ActivityCardQuestionProjection } from '../../lib/activity-card/types';
 import type { JumpTarget } from '../../lib/jump/types';
 import { FloatingActivityCard } from '../../features/activity-card/FloatingActivityCard';
 
@@ -12,6 +11,7 @@ const ACTIVITY_CARD_MIN_HEIGHTS = {
 } as const;
 const ACTIVITY_CARD_MAX_HEIGHT = 520;
 const ACTIVITY_CARD_WINDOW_HEIGHT_BUFFER = 2;
+const ACTIVITY_CARD_KEEP_EMPTY_HIDE_DELAY_MS = 250;
 const ACTIVITY_CARD_SHELL_STYLE = {
   borderBottomLeftRadius: '10px',
   borderBottomRightRadius: '10px',
@@ -222,8 +222,15 @@ async function debugLogActivityCardFrontend(message: string): Promise<void> {
     return;
   }
 
+  if (!('__TAURI_INTERNALS__' in window)) {
+    return;
+  }
+
   const params = new URLSearchParams(window.location.search);
-  const debugEnabled = params.has('debugLive') || params.get('debug') === 'activity-card';
+  const isActivityCardWindow = params.get('view') === 'activity-card';
+  const debugEnabled = isActivityCardWindow
+    || params.has('debugLive')
+    || params.get('debug') === 'activity-card';
   if (!debugEnabled) {
     return;
   }
@@ -241,7 +248,7 @@ export interface ActivityCardRouteProps {
   windowVisibility?: 'hide' | 'keep' | 'show';
   pendingApprovalIds?: Set<string>;
   debugInfo?: ActivityCardDebugInfo | null;
-  onApprovalAction?: (card: ActivityCardApprovalProjection, decisionMode: BrokerApprovalDecisionMode) => void;
+  onApprovalAction?: (card: ActivityCardApprovalProjection, action: ActivityCardApprovalAction) => void;
   onQuestionAction?: (card: ActivityCardQuestionProjection, option: ActivityCardQuestionOption) => void;
   onDismiss?: () => void;
   onJump?: (target: JumpTarget) => void;
@@ -325,6 +332,7 @@ export function ActivityCardRoute({
   const displayCard = previewCard ?? card;
   const hasHiddenActivityCardWindowRef = useRef(false);
   const hasShownActivityCardWindowRef = useRef(false);
+  const lastShownDisplayCardIdRef = useRef<string | null>(null);
   const [measurement, setMeasurement] = useState<ActivityCardMeasurement | null>(null);
   const displayCardId = displayCard?.cardId ?? null;
 
@@ -396,13 +404,44 @@ export function ActivityCardRoute({
   }, [previewCard, windowVisibility]);
 
   useEffect(() => {
+    if (
+      previewCard
+      || windowVisibility !== 'keep'
+      || displayCard
+      || !hasShownActivityCardWindowRef.current
+      || hasHiddenActivityCardWindowRef.current
+    ) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      hasHiddenActivityCardWindowRef.current = true;
+      void debugLogActivityCardFrontend(
+        `[route-delayed-hide] visibility=${windowVisibility} display=${displayCardId ?? 'null'}`
+      );
+      void Promise.all([
+        import('@tauri-apps/api/core'),
+      ])
+        .then(async ([{ invoke }]) => {
+          await Promise.resolve(invoke('hide_activity_card_window')).catch(() => undefined);
+        })
+        .catch(() => undefined);
+    }, ACTIVITY_CARD_KEEP_EMPTY_HIDE_DELAY_MS);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [displayCard, displayCardId, previewCard, windowVisibility]);
+
+  useEffect(() => {
     if (previewCard || windowVisibility === 'hide' || !displayCard) {
       return;
     }
 
+    const hasShownCurrentCard = lastShownDisplayCardIdRef.current === displayCardId;
     const shouldShow = windowVisibility === 'show'
-      ? !hasShownActivityCardWindowRef.current || hasHiddenActivityCardWindowRef.current
-      : hasHiddenActivityCardWindowRef.current;
+      ? !hasShownActivityCardWindowRef.current || hasHiddenActivityCardWindowRef.current || !hasShownCurrentCard
+      : hasHiddenActivityCardWindowRef.current || !hasShownCurrentCard;
 
     if (!shouldShow) {
       return;
@@ -410,11 +449,27 @@ export function ActivityCardRoute({
 
     hasHiddenActivityCardWindowRef.current = false;
     hasShownActivityCardWindowRef.current = true;
+    lastShownDisplayCardIdRef.current = displayCardId;
     void debugLogActivityCardFrontend(
       `[route-show] visibility=${windowVisibility} display=${displayCardId ?? 'null'} hiddenSeen=${hasHiddenActivityCardWindowRef.current}`
     );
     void import('@tauri-apps/api/core')
-      .then(({ invoke }) => invoke('show_activity_card_window'))
+      .then(async (core) => {
+        const invoke = core?.invoke;
+        if (typeof invoke !== 'function') {
+          return;
+        }
+        try {
+          await Promise.resolve(invoke('show_activity_card_window'));
+          void debugLogActivityCardFrontend(
+            `[route-show-result] visibility=${windowVisibility} display=${displayCardId ?? 'null'} result=ok`
+          );
+        } catch (error) {
+          void debugLogActivityCardFrontend(
+            `[route-show-result] visibility=${windowVisibility} display=${displayCardId ?? 'null'} result=error:${String(error)}`
+          );
+        }
+      })
       .catch(() => undefined);
   }, [displayCard, displayCardId, previewCard, windowVisibility]);
 
@@ -540,7 +595,7 @@ export function ActivityCardRoute({
         onDismiss={onDismiss}
         onApprovalDecision={
           displayCard.kind === 'approval'
-            ? (mode) => onApprovalAction?.(displayCard, mode)
+            ? (action) => onApprovalAction?.(displayCard, action)
             : undefined
         }
         onQuestionSelect={

@@ -1129,4 +1129,47 @@ describe('BrokerClient', () => {
       delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
     }
   });
+
+  it('routes mirrored local Codex approvals through the broker approval command inside the desktop app', async () => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValueOnce(undefined);
+
+    Object.defineProperty(window, '__TAURI_INTERNALS__', {
+      configurable: true,
+      value: {},
+    });
+
+    try {
+      const fetchMock = vi.fn();
+      const client = new BrokerClient({
+        brokerUrl: 'http://127.0.0.1:4318',
+        fetchImpl: fetchMock as typeof fetch,
+        websocketFactory: () => {
+          throw new Error('not used in this test');
+        },
+      });
+
+      await client.respondToApproval({
+        approvalId: 'hexdeck-local-codex-host-codex-session-019db354-call_abc123',
+        taskId: 'local-host-approval-codex-session-019db354-call_abc123',
+        fromParticipantId: 'human.local',
+        decision: 'approved',
+        decisionMode: 'yes',
+      });
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(invokeMock).toHaveBeenCalledWith('respond_to_broker_approval', {
+        brokerUrl: 'http://127.0.0.1:4318',
+        input: {
+          approvalId: 'hexdeck-local-codex-host-codex-session-019db354-call_abc123',
+          taskId: 'local-host-approval-codex-session-019db354-call_abc123',
+          fromParticipantId: 'human.local',
+          decision: 'approved',
+          decisionMode: 'yes',
+        },
+      });
+    } finally {
+      delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    }
+  });
 });

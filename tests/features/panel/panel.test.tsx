@@ -166,13 +166,13 @@ describe('PanelRoute', () => {
     expect(screen.getByRole('button', { name: 'Hide offline agents' })).toBeInTheDocument();
   });
 
-  it('keeps registration-only online participants in the active project groups', () => {
+  it('moves registration-only participants without a live transport or terminal locator into offline', () => {
     render(
       <PanelRoute
         snapshot={{
           overview: {
             brokerHealthy: true,
-            onlineCount: 2,
+            onlineCount: 1,
             busyCount: 1,
             blockedCount: 0,
             pendingApprovalCount: 0,
@@ -211,8 +211,122 @@ describe('PanelRoute', () => {
     );
 
     expect(screen.getByText('Agent-A')).toBeInTheDocument();
+    expect(screen.queryByText('Agent-B')).not.toBeInTheDocument();
+
+    const offlineToggle = screen.getByRole('button', { name: 'Show offline agents' });
+    expect(offlineToggle).toHaveTextContent('1 Agents');
+
+    fireEvent.click(offlineToggle);
+
+    expect(screen.getByText('Agent-B')).toBeInTheDocument();
+    expect(screen.getByText('offline')).toBeInTheDocument();
+  });
+
+  it('keeps registration-only participants visible when they still have a usable terminal locator', () => {
+    render(
+      <PanelRoute
+        snapshot={{
+          overview: {
+            brokerHealthy: true,
+            onlineCount: 2,
+            busyCount: 1,
+            blockedCount: 0,
+            pendingApprovalCount: 0,
+          },
+          now: [
+            {
+              participantId: 'agent-a',
+              alias: 'Agent-A',
+              toolLabel: 'codex',
+              workState: 'implementing',
+              summary: 'Working',
+              updatedAtLabel: 'just now',
+            },
+          ],
+          attention: [],
+          recent: [],
+        }}
+        participants={[
+          {
+            participantId: 'agent-a',
+            alias: 'Agent-A',
+            presence: 'online',
+            presenceMetadata: { transport: 'websocket', connectionCount: 1 },
+            context: { projectName: 'HexDeck' },
+          },
+          {
+            participantId: 'agent-b',
+            alias: 'Agent-B',
+            presence: 'online',
+            presenceMetadata: { source: 'registration' },
+            metadata: {
+              terminalApp: 'Ghostty',
+              terminalSessionID: 'ghostty-session-1',
+              projectPath: '/Users/song/projects/intent-broker',
+            },
+            context: { projectName: 'HexDeck' },
+          },
+        ]}
+        currentProject="HexDeck"
+      />
+    );
+
+    expect(screen.getByText('Agent-A')).toBeInTheDocument();
     expect(screen.getByText('Agent-B')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Show offline agents' })).not.toBeInTheDocument();
+  });
+
+  it('deduplicates registration-only online participants that share the same weak Ghostty locator', () => {
+    render(
+      <PanelRoute
+        snapshot={{
+          overview: {
+            brokerHealthy: true,
+            onlineCount: 1,
+            busyCount: 0,
+            blockedCount: 0,
+            pendingApprovalCount: 0,
+          },
+          now: [],
+          attention: [],
+          recent: [],
+        }}
+        participants={[
+          {
+            participantId: 'codex-session-019db0b3',
+            alias: 'codex21',
+            kind: 'agent',
+            presence: 'online',
+            presenceMetadata: { source: 'registration' },
+            context: { projectName: 'xiaok-cli' },
+            metadata: {
+              terminalApp: 'Ghostty',
+              terminalTTY: '/dev/ttys005',
+              sessionHint: 'codex21',
+              projectPath: '/Users/song/projects/xiaok-cli',
+            },
+          },
+          {
+            participantId: 'codex-session-019db4d2',
+            alias: 'codex50',
+            kind: 'agent',
+            presence: 'online',
+            presenceMetadata: { source: 'registration' },
+            context: { projectName: 'xiaok-cli' },
+            metadata: {
+              terminalApp: 'Ghostty',
+              terminalTTY: '/dev/ttys005',
+              sessionHint: 'codex50',
+              projectPath: '/Users/song/projects/xiaok-cli',
+            },
+          },
+        ]}
+        currentProject="xiaok-cli"
+      />
+    );
+
+    expect(screen.queryByText('codex21')).not.toBeInTheDocument();
+    expect(screen.getByText('codex50')).toBeInTheDocument();
   });
 
   it('scrolls the offline section into view when expanding it', () => {

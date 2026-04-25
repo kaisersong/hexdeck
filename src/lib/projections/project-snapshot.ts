@@ -1,3 +1,4 @@
+import { dedupeActivelyPresentParticipants, isParticipantActivelyPresent } from '../broker/liveness';
 import type { ProjectSeed } from '../broker/types';
 import { buildJumpTarget } from '../jump/targets';
 import { buildRecentFeed } from './recent-feed';
@@ -7,28 +8,72 @@ import type {
   ProjectSnapshotProjection
 } from './types';
 
+function derivePendingApprovals(seed: ProjectSeed): ProjectSeed['approvals'] {
+  const pendingById = new Map<string, ProjectSeed['approvals'][number]>();
+
+  for (const approval of seed.approvals) {
+    if ((approval.decision ?? 'pending') === 'pending') {
+      pendingById.set(approval.approvalId, approval);
+    }
+  }
+
+  for (const event of seed.events) {
+    const payload = event.payload;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      continue;
+    }
+
+    if (event.type === 'request_approval') {
+      const approvalId = typeof payload.approvalId === 'string' ? payload.approvalId : null;
+      const taskId = typeof event.taskId === 'string' ? event.taskId : null;
+      if (!approvalId || !taskId || pendingById.has(approvalId)) {
+        continue;
+      }
+
+      const body = payload.body && typeof payload.body === 'object' && !Array.isArray(payload.body)
+        ? payload.body as Record<string, unknown>
+        : null;
+      const summary = typeof body?.summary === 'string' && body.summary.trim()
+        ? body.summary.trim()
+        : typeof payload.summary === 'string' && payload.summary.trim()
+          ? payload.summary.trim()
+          : 'Approval requested';
+
+      pendingById.set(approvalId, {
+        approvalId,
+        taskId,
+        threadId: typeof event.threadId === 'string' ? event.threadId : undefined,
+        createdAt: typeof event.createdAt === 'string' ? event.createdAt : undefined,
+        summary,
+        decision: 'pending',
+        participantId: typeof payload.participantId === 'string' ? payload.participantId : undefined,
+        body: body ?? payload,
+      });
+      continue;
+    }
+
+    if (event.type === 'respond_approval') {
+      const approvalId = typeof payload.approvalId === 'string' ? payload.approvalId : null;
+      if (approvalId) {
+        pendingById.delete(approvalId);
+      }
+    }
+  }
+
+  return [...pendingById.values()];
+}
+
 export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjection {
-  const byParticipant = new Map(seed.participants.map((participant) => [participant.participantId, participant]));
-  const agentParticipants = seed.participants.filter(
+  const workStateParticipantIds = new Set(seed.workStates.map((workState) => workState.participantId));
+  const dedupedParticipants = dedupeActivelyPresentParticipants(seed.participants, workStateParticipantIds);
+  const byParticipant = new Map(dedupedParticipants.map((participant) => [participant.participantId, participant]));
+  const agentParticipants = dedupedParticipants.filter(
     (participant) => participant.kind !== 'human' && participant.kind !== 'adapter'
   );
   const agentParticipantIds = new Set(agentParticipants.map((participant) => participant.participantId));
-  const workStateParticipantIds = new Set(seed.workStates.map((workState) => workState.participantId));
-  const onlineAgentCount = agentParticipants.filter((participant) => {
-    if (participant.presence === 'online') {
-      return true;
-    }
-
-    if (participant.presence === 'offline') {
-      return false;
-    }
-
-    if (workStateParticipantIds.has(participant.participantId)) {
-      return true;
-    }
-
-    return false;
-  }).length;
+  const onlineAgentCount = agentParticipants.filter((participant) =>
+    isParticipantActivelyPresent(participant, workStateParticipantIds)
+  ).length;
 
   const buildParticipantJumpTarget = (participantId: string) => {
     const participant = byParticipant.get(participantId);
@@ -73,6 +118,7 @@ export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjecti
     });
 
   const attention: AttentionItemProjection[] = [];
+  const pendingApprovals = derivePendingApprovals(seed);
   for (const workState of seed.workStates) {
     if (byParticipant.has(workState.participantId) && !agentParticipantIds.has(workState.participantId)) {
       continue;
@@ -88,17 +134,15 @@ export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjecti
       });
     }
   }
-  for (const approval of seed.approvals) {
-    if ((approval.decision ?? 'pending') === 'pending') {
-      attention.push({
-        kind: 'approval',
-        priority: 'critical',
-        summary: approval.summary ?? 'Approval requested',
-        approvalId: approval.approvalId,
-        taskId: approval.taskId,
-        approvalDecision: approval.decision ?? 'pending',
-      });
-    }
+  for (const approval of pendingApprovals) {
+    attention.push({
+      kind: 'approval',
+      priority: 'critical',
+      summary: approval.summary ?? 'Approval requested',
+      approvalId: approval.approvalId,
+      taskId: approval.taskId,
+      approvalDecision: approval.decision ?? 'pending',
+    });
   }
 
   return {
@@ -111,7 +155,7 @@ export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjecti
       blockedCount: seed.workStates.filter(
         (item) => item.status === 'blocked' && (agentParticipantIds.has(item.participantId) || !byParticipant.has(item.participantId))
       ).length,
-      pendingApprovalCount: seed.approvals.filter((approval) => (approval.decision ?? 'pending') === 'pending').length,
+      pendingApprovalCount: pendingApprovals.length,
     },
     now,
     attention,

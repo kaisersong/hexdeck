@@ -46,6 +46,20 @@ function findSupersedingCompletion(
   )) ?? null;
 }
 
+function findSupersedingApproval(
+  activeCard: ActivityCardProjection | null,
+  nextCards: ActivityCardProjection[],
+): ActivityCardProjection | null {
+  if (!activeCard || activeCard.kind !== 'approval') {
+    return null;
+  }
+
+  return nextCards.find((card) => (
+    card.kind === 'approval'
+      && card.approvalId !== activeCard.approvalId
+  )) ?? null;
+}
+
 function getTaskThreadResolutionKey(value: { taskId?: string; threadId?: string }): string | null {
   if (value.taskId && value.threadId) {
     return `task-thread:${value.taskId}:${value.threadId}`;
@@ -201,6 +215,20 @@ export function reconcilePopupSession(input: ReconcilePopupSessionInput): Reconc
       session: {
         visibility: 'visible',
         activeCard: supersedingCompletion,
+        pendingLocalResolutionKey: null,
+      },
+      cardsForStore: nextCards,
+      visibilityIntent: 'keep',
+      allowPreemption: true,
+    };
+  }
+
+  const supersedingApproval = findSupersedingApproval(activeCard, nextCards);
+  if (supersedingApproval) {
+    return {
+      session: {
+        visibility: 'visible',
+        activeCard: supersedingApproval,
         pendingLocalResolutionKey: null,
       },
       cardsForStore: nextCards,

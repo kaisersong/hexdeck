@@ -441,7 +441,7 @@ describe('activity card action dispatcher', () => {
     expect(respondToApproval).not.toHaveBeenCalled();
   });
 
-  it('passes callable approval handlers to ExpandedRoute', async () => {
+  it('renders ExpandedRoute without overview section switching props', async () => {
     const { App } = await import('../../../src/app/App');
     window.history.pushState({}, '', '/?view=expanded');
 
@@ -452,12 +452,12 @@ describe('activity card action dispatcher', () => {
     });
 
     const props = expandedRouteSpy.mock.calls.at(-1)?.[0] as {
-      onApprove?: unknown;
-      onDeny?: unknown;
+      section?: unknown;
+      onSectionChange?: unknown;
     };
 
-    expect(typeof props.onApprove).toBe('function');
-    expect(typeof props.onDeny).toBe('function');
+    expect(props.section).toBeUndefined();
+    expect(props.onSectionChange).toBeUndefined();
   });
 
   it('queues a second refresh when focus arrives during a slow refresh', async () => {
@@ -509,8 +509,14 @@ describe('FloatingActivityCard', () => {
     fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
     fireEvent.click(screen.getByRole('button', { name: '取消' }));
 
-    expect(onApprovalDecision).toHaveBeenNthCalledWith(1, 'yes');
-    expect(onApprovalDecision).toHaveBeenNthCalledWith(2, 'no');
+    expect(onApprovalDecision).toHaveBeenNthCalledWith(1, {
+      decisionMode: 'yes',
+      label: '确认删除',
+    });
+    expect(onApprovalDecision).toHaveBeenNthCalledWith(2, {
+      decisionMode: 'no',
+      label: '取消',
+    });
   });
 
   it('renders a manual close button for activity cards', () => {
@@ -549,9 +555,18 @@ describe('FloatingActivityCard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Approve Always' }));
     fireEvent.click(screen.getByRole('button', { name: 'Reject' }));
 
-    expect(onApprovalDecision).toHaveBeenNthCalledWith(1, 'yes');
-    expect(onApprovalDecision).toHaveBeenNthCalledWith(2, 'always');
-    expect(onApprovalDecision).toHaveBeenNthCalledWith(3, 'no');
+    expect(onApprovalDecision).toHaveBeenNthCalledWith(1, {
+      decisionMode: 'yes',
+      label: 'Approve',
+    });
+    expect(onApprovalDecision).toHaveBeenNthCalledWith(2, {
+      decisionMode: 'always',
+      label: 'Approve Always',
+    });
+    expect(onApprovalDecision).toHaveBeenNthCalledWith(3, {
+      decisionMode: 'no',
+      label: 'Reject',
+    });
   });
 
   it('renders source and runtime metadata chips when provided by the agent', () => {
@@ -1148,6 +1163,38 @@ describe('ActivityCardRoute', () => {
     expect(hideWindowMock).not.toHaveBeenCalled();
   });
 
+  it('hides the native window when keep intent stays empty long enough to become a stale shell', async () => {
+    const { rerender } = render(
+      <ActivityCardRoute
+        card={makeApprovalCard()}
+        windowVisibility="show"
+      />
+    );
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+    });
+
+    invokeMock.mockClear();
+    hideWindowMock.mockClear();
+
+    rerender(
+      <ActivityCardRoute
+        card={null}
+        windowVisibility="keep"
+      />
+    );
+
+    await new Promise((resolve) => {
+      window.setTimeout(resolve, 300);
+    });
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    });
+    expect(hideWindowMock).not.toHaveBeenCalled();
+  });
+
   it('reopens the live activity-card window when a new real card arrives after hiding', async () => {
     const { rerender } = render(<ActivityCardRoute card={makeApprovalCard('approval-1')} />);
 
@@ -1163,6 +1210,32 @@ describe('ActivityCardRoute', () => {
     invokeMock.mockClear();
 
     rerender(<ActivityCardRoute card={makeApprovalCard('approval-2')} />);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+    });
+  });
+
+  it('re-shows the live activity-card window when keep intent swaps in a new real card', async () => {
+    const { rerender } = render(
+      <ActivityCardRoute
+        card={makeApprovalCard('approval-1')}
+        windowVisibility="show"
+      />
+    );
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+    });
+
+    invokeMock.mockClear();
+
+    rerender(
+      <ActivityCardRoute
+        card={makeApprovalCard('approval-2')}
+        windowVisibility="keep"
+      />
+    );
 
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
@@ -1277,6 +1350,66 @@ describe('activity-card window routing', () => {
       expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
     });
     expect(screen.queryByRole('heading', { name: /Dismiss should still close the live popup/ })).not.toBeInTheDocument();
+  });
+
+  it('hides the whole live popup stack instead of promoting queued cards after manual close', async () => {
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue({
+        health: { ok: true },
+        participants: [makeProjectParticipant()],
+        workStates: [],
+        events: [
+          {
+            id: 1,
+            type: 'ask_clarification',
+            taskId: 'task-queued-question',
+            threadId: 'thread-queued-question',
+            payload: {
+              participantId: 'codex.main',
+              summary: 'Queued follow-up question',
+              prompt: 'Queued follow-up question',
+              selectionMode: 'single-select',
+              options: [{ label: 'staging', value: 'staging' }],
+            },
+          },
+        ],
+        approvals: [
+          {
+            approvalId: 'approval-close-stack',
+            taskId: 'task-close-stack',
+            summary: 'Dismiss should hide the whole popup stack',
+            decision: 'pending',
+            participantId: 'codex.main',
+          },
+        ],
+      }),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    const { App } = await import('../../../src/app/App');
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /Dismiss should hide the whole popup stack/ })).toBeInTheDocument();
+    });
+
+    invokeMock.mockClear();
+    hideWindowMock.mockClear();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close activity card' }));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    });
+    expect(screen.queryByRole('heading', { name: /Dismiss should hide the whole popup stack/ })).not.toBeInTheDocument();
+    expect(screen.queryByText('Queued follow-up question')).not.toBeInTheDocument();
   });
 
   it('keeps passive startup backlog hidden for the floating activity-card window', async () => {
@@ -1694,7 +1827,257 @@ describe('activity-card window routing', () => {
     expect(hideWindowMock).not.toHaveBeenCalled();
   });
 
-  it('replaces a visible completion with a later approval without hide-show churn', async () => {
+  it('refreshes into a broker-owned Codex native approval when the native local approval event arrives', async () => {
+    const localApproval = {
+      approvalId: 'hexdeck-local-codex-host-codex-session-call_local',
+      taskId: 'task-local',
+      createdAt: new Date().toISOString(),
+      summary: 'Local host approval request',
+      decision: 'pending' as const,
+      participantId: 'codex.main',
+      actions: [
+        { label: 'Allow once', decisionMode: 'yes' as const },
+        { label: 'Reject', decisionMode: 'no' as const },
+      ],
+      body: {
+        summary: 'Local host approval request',
+        commandTitle: 'Codex',
+        commandLine: 'mkdir ~/Desktop/hexdeck-codex-approval-refresh-test',
+        commandPreview: '/Users/song/projects/hexdeck',
+        delivery: { source: 'hexdeck-local-host-approval' },
+        localHostApproval: { source: 'codex', callId: 'call_local' },
+      },
+    };
+    const eventListeners = new Map<string, (event: { payload?: unknown }) => void>();
+    const nativeApprovalSeed = {
+      health: { ok: true },
+      participants: [makeProjectParticipant()],
+      workStates: [],
+      events: [
+        {
+          id: 901,
+          type: 'request_approval',
+          createdAt: new Date().toISOString(),
+          taskId: 'codex-native-task',
+          threadId: 'codex-native-thread',
+          payload: {
+            approvalId: 'codex-native-call_local',
+            participantId: 'codex.main',
+            delivery: {
+              semantic: 'actionable',
+              source: 'codex-native-approval',
+            },
+            nativeCodexApproval: {
+              callId: 'call_local',
+            },
+            body: {
+              summary: 'Allow Desktop mkdir?',
+              detailText: 'Mirrored from the live Codex terminal approval prompt.',
+              commandTitle: 'Codex',
+              commandLine: 'mkdir ~/Desktop/hexdeck-codex-approval-refresh-test',
+            },
+            actions: [
+              { label: 'Allow once', decisionMode: 'yes' as const },
+              { label: 'Reject', decisionMode: 'no' as const },
+            ],
+          },
+        },
+      ],
+      approvals: [
+        localApproval,
+      ],
+    };
+
+    listenMock.mockImplementation(async (eventName, handler) => {
+      eventListeners.set(String(eventName), handler as (event: { payload?: unknown }) => void);
+      return () => {
+        eventListeners.delete(String(eventName));
+      };
+    });
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn()
+        .mockResolvedValueOnce(makeSeed())
+        .mockResolvedValueOnce(nativeApprovalSeed),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(1);
+    });
+
+    invokeMock.mockClear();
+
+    const localApprovalListener = eventListeners.get('activity-card-local-approval-requested');
+    expect(localApprovalListener).toBeTypeOf('function');
+
+    localApprovalListener?.({
+      payload: localApproval,
+    });
+
+    await waitFor(() => {
+      expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(2);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: '@codex4 · Allow Desktop mkdir?' })).toBeInTheDocument();
+    });
+
+    expect(screen.queryByRole('heading', { name: '@codex4 · Local host approval request' })).not.toBeInTheDocument();
+    expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+  });
+
+  it('replaces an older visible approval with the refreshed broker-owned Codex native approval when the native event arrives', async () => {
+    const firstSeed = {
+      health: { ok: true },
+      participants: [
+        makeProjectParticipant(),
+        {
+          participantId: 'claude.other',
+          alias: 'claude7',
+          kind: 'agent',
+          tool: 'claude-code',
+          metadata: {
+            terminalApp: 'Ghostty',
+            terminalSessionID: 'ghostty-7',
+            projectPath: '/Users/song/projects',
+          },
+          context: { projectName: 'projects' },
+        },
+      ],
+      workStates: [],
+      events: [
+        {
+          id: 410,
+          type: 'request_approval',
+          createdAt: '2026-04-21T04:10:00.000Z',
+          taskId: 'claude-approval-task',
+          threadId: 'claude-approval-thread',
+          payload: {
+            approvalId: 'claude-approval',
+            participantId: 'claude.other',
+            body: {
+              summary: 'Claude approval already visible',
+            },
+          },
+        },
+      ],
+      approvals: [],
+    };
+    const localApproval = {
+      approvalId: 'hexdeck-local-codex-host-codex-session-call_local',
+      taskId: 'task-local',
+      createdAt: new Date().toISOString(),
+      summary: 'Local host approval request',
+      decision: 'pending' as const,
+      participantId: 'codex.main',
+      actions: [
+        { label: 'Allow once', decisionMode: 'yes' as const },
+        { label: 'Reject', decisionMode: 'no' as const },
+      ],
+      body: {
+        summary: 'Local host approval request',
+        commandTitle: 'Codex',
+        commandLine: 'mkdir ~/Desktop/hexdeck-codex-approval-refresh-test-2',
+        commandPreview: '/Users/song/projects/hexdeck',
+        delivery: { source: 'hexdeck-local-host-approval' },
+        localHostApproval: { source: 'codex', callId: 'call_local' },
+      },
+    };
+    const eventListeners = new Map<string, (event: { payload?: unknown }) => void>();
+    const refreshedSeed = {
+      ...firstSeed,
+      events: [
+        ...firstSeed.events,
+        {
+          id: 411,
+          type: 'request_approval',
+          createdAt: new Date().toISOString(),
+          taskId: 'codex-native-task',
+          threadId: 'codex-native-thread',
+          payload: {
+            approvalId: 'codex-native-call_local',
+            participantId: 'codex.main',
+            delivery: {
+              semantic: 'actionable',
+              source: 'codex-native-approval',
+            },
+            nativeCodexApproval: {
+              callId: 'call_local',
+            },
+            body: {
+              summary: 'Broker-owned native approval request',
+              commandTitle: 'Codex',
+              commandLine: 'mkdir ~/Desktop/hexdeck-codex-approval-refresh-test-2',
+            },
+            actions: [
+              { label: 'Allow once', decisionMode: 'yes' as const },
+              { label: 'Reject', decisionMode: 'no' as const },
+            ],
+          },
+        },
+      ],
+      approvals: [
+        localApproval,
+      ],
+    };
+
+    listenMock.mockImplementation(async (eventName, handler) => {
+      eventListeners.set(String(eventName), handler as (event: { payload?: unknown }) => void);
+      return () => {
+        eventListeners.delete(String(eventName));
+      };
+    });
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn()
+        .mockResolvedValueOnce(firstSeed)
+        .mockResolvedValueOnce(refreshedSeed),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: '@claude7 · Claude approval already visible' })).toBeInTheDocument();
+    });
+
+    invokeMock.mockClear();
+
+    const localApprovalListener = eventListeners.get('activity-card-local-approval-requested');
+    expect(localApprovalListener).toBeTypeOf('function');
+
+    localApprovalListener?.({
+      payload: localApproval,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: '@codex4 · Broker-owned native approval request' })).toBeInTheDocument();
+    });
+
+    expect(screen.queryByRole('heading', { name: '@claude7 · Claude approval already visible' })).not.toBeInTheDocument();
+    expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+  });
+
+  it('replaces a visible completion with a later approval without hiding the popup', async () => {
     const completionSeed = {
       health: { ok: true },
       participants: [makeProjectParticipant()],
@@ -1760,11 +2143,11 @@ describe('activity-card window routing', () => {
     );
 
     expect(invokeMock).not.toHaveBeenCalledWith('hide_activity_card_window');
-    expect(invokeMock).not.toHaveBeenCalledWith('show_activity_card_window');
+    expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
     expect(hideWindowMock).not.toHaveBeenCalled();
   });
 
-  it('replaces a visible approval with a newer approval without hide-show churn', async () => {
+  it('replaces a visible approval with a newer approval without hiding the popup', async () => {
     const firstSeed = {
       health: { ok: true },
       participants: [
@@ -1873,7 +2256,7 @@ describe('activity-card window routing', () => {
     });
 
     expect(invokeMock).not.toHaveBeenCalledWith('hide_activity_card_window');
-    expect(invokeMock).not.toHaveBeenCalledWith('show_activity_card_window');
+    expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
     expect(hideWindowMock).not.toHaveBeenCalled();
   });
 
@@ -1916,7 +2299,7 @@ describe('activity-card window routing', () => {
     expect(brokerClientInstance.connectRealtime).not.toHaveBeenCalled();
   });
 
-  it('does not refetch broker seed when the live activity-card window fires focus or visibility events', async () => {
+  it('refetches broker seed when the live activity-card window fires focus or visibility events', async () => {
     const approvalSeed = {
       health: { ok: true },
       participants: [makeProjectParticipant()],
@@ -1955,11 +2338,9 @@ describe('activity-card window routing', () => {
     window.dispatchEvent(new Event('focus'));
     document.dispatchEvent(new Event('visibilitychange'));
 
-    await new Promise((resolve) => {
-      window.setTimeout(resolve, 50);
+    await waitFor(() => {
+      expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(3);
     });
-
-    expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(1);
   });
 
   it('ignores non-popup realtime events in the live activity-card window', async () => {
@@ -2127,6 +2508,174 @@ describe('activity-card window routing', () => {
     });
   });
 
+  it('shows a native activity-card window for mirrored codex hook approvals with the default summary', async () => {
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue({
+        health: { ok: true },
+        participants: [makeProjectParticipant()],
+        workStates: [],
+        events: [
+          {
+            id: 111,
+            type: 'request_approval',
+            createdAt: new Date().toISOString(),
+            taskId: 'codex-hook-approval-task',
+            threadId: 'codex-hook-approval-thread',
+            payload: {
+              participantId: 'codex.main',
+              approvalId: 'codex-hook-approval-1',
+              delivery: {
+                semantic: 'actionable',
+                source: 'codex-hook-approval',
+              },
+              nativeHookApproval: {
+                agentTool: 'codex',
+                hookEventName: 'PreToolUse',
+              },
+              body: {
+                summary: 'Codex needs approval to run Bash.',
+                detailText: 'Mirrored from the live Codex PreToolUse hook. Approving this card lets the hook continue.',
+                commandTitle: 'Codex',
+                commandLine: 'mkdir -p /tmp/important-dir',
+              },
+              actions: [
+                { label: '允许一次', decisionMode: 'yes' },
+                { label: '拒绝', decisionMode: 'no' },
+              ],
+            },
+          },
+        ],
+        approvals: [],
+      }),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: '@codex4 · Codex needs approval to run Bash.' })).toBeInTheDocument();
+    });
+
+    expect(screen.getByText('Mirrored from the live Codex PreToolUse hook. Approving this card lets the hook continue.')).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+    });
+  });
+
+  it('prefers the broker-owned Codex hook approval card over the local fallback approval and routes clicks through the broker approval id', async () => {
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn()
+        .mockResolvedValueOnce({
+          health: { ok: true },
+          participants: [makeProjectParticipant()],
+          workStates: [],
+          events: [
+            {
+              id: 112,
+              type: 'request_approval',
+              createdAt: new Date().toISOString(),
+              taskId: 'codex-hook-approval-task',
+              threadId: 'codex-hook-approval-thread',
+              payload: {
+                participantId: 'codex.main',
+                approvalId: 'codex-hook-approval-1',
+                delivery: {
+                  semantic: 'actionable',
+                  source: 'codex-hook-approval',
+                },
+                nativeHookApproval: {
+                  agentTool: 'codex',
+                  hookEventName: 'PreToolUse',
+                },
+                body: {
+                  summary: 'Codex needs approval to run Bash.',
+                  detailText: 'Mirrored from the live Codex PreToolUse hook. Approving this card lets the hook continue.',
+                  commandTitle: 'Codex',
+                  commandLine: 'rm -f ~/Desktop/hexdeck-approval-smoke.txt',
+                  commandPreview: '/Users/song/projects/hexdeck',
+                },
+                actions: [
+                  { label: '允许一次', decisionMode: 'yes' },
+                  { label: '拒绝', decisionMode: 'no' },
+                ],
+              },
+            },
+          ],
+          approvals: [
+            {
+              approvalId: 'hexdeck-local-codex-host-codex-main-call_1',
+              taskId: 'local-host-approval-codex-main-call_1',
+              threadId: 'local-host-approval-codex-main',
+              summary: 'Do you want to allow this command?',
+              decision: 'pending',
+              participantId: 'codex.main',
+              actions: [
+                { label: 'Allow once', decisionMode: 'yes' },
+                { label: 'Reject', decisionMode: 'no' },
+              ],
+              body: {
+                summary: 'Do you want to allow this command?',
+                commandTitle: 'Codex',
+                commandLine: 'rm -f ~/Desktop/hexdeck-approval-smoke.txt',
+                commandPreview: '/Users/song/projects/hexdeck',
+                participantId: 'codex.main',
+                localHostApproval: {
+                  source: 'codex',
+                  callId: 'call_1',
+                  terminalApp: 'Ghostty',
+                  terminalSessionId: 'ghostty-1',
+                },
+                delivery: {
+                  semantic: 'actionable',
+                  source: 'hexdeck-local-host-approval',
+                },
+              },
+            },
+          ],
+        })
+        .mockResolvedValueOnce(makeSeed()),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: '@codex4 · Codex needs approval to run Bash.' })).toBeInTheDocument();
+    });
+
+    expect(screen.getByText('Mirrored from the live Codex PreToolUse hook. Approving this card lets the hook continue.')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Always allow' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '允许一次' }));
+
+    await waitFor(() => {
+      expect(brokerClientInstance.respondToApproval).toHaveBeenCalledWith({
+        approvalId: 'codex-hook-approval-1',
+        taskId: 'codex-hook-approval-task',
+        fromParticipantId: 'human.local',
+        decision: 'approved',
+        decisionMode: 'yes',
+      });
+    });
+  });
+
   it('does not revive stale question and completion replay cards when the activity-card window boots', async () => {
     brokerClientInstance = {
       loadServiceSeed: vi.fn().mockResolvedValue({
@@ -2281,6 +2830,58 @@ describe('activity-card window routing', () => {
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
     });
+  });
+
+  it('does not show a stop-fallback completion popup while the same participant is still actively working', async () => {
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue({
+        health: { ok: true },
+        participants: [makeProjectParticipant()],
+        workStates: [
+          {
+            participantId: 'codex.main',
+            status: 'implementing',
+            summary: 'Still handling follow-up work',
+          },
+        ],
+        events: [
+          {
+            id: 402,
+            type: 'report_progress',
+            createdAt: new Date().toISOString(),
+            taskId: 'completion-task',
+            threadId: 'completion-thread',
+            payload: {
+              participantId: 'codex.main',
+              summary: '✅ Spec compliant',
+              stage: 'completed',
+              delivery: {
+                semantic: 'informational',
+                source: 'stop-fallback',
+              },
+            },
+          },
+        ],
+        approvals: [],
+      }),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    });
+
+    expect(screen.queryByText('✅ Spec compliant')).not.toBeInTheDocument();
   });
 
   it('opens the live activity-card window when a real xiaok question arrives after boot even without createdAt', async () => {
@@ -3077,6 +3678,316 @@ describe('activity-card window routing', () => {
       expect(screen.getByRole('heading', { name: 'Claude 7 completed the task' })).toBeInTheDocument();
     });
     expect(brokerClientInstance.loadProjectSeed).not.toHaveBeenCalled();
+  });
+
+  it('suppresses cross-project queued-context local approvals when a specific current project is saved', async () => {
+    loadLocalSettingsMock.mockReturnValue({
+      brokerUrl: 'http://broker.test',
+      globalShortcut: 'CmdOrCtrl+Shift+H',
+      currentProject: 'HexDeck',
+      recentProjects: ['HexDeck'],
+    });
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue({
+        health: { ok: true },
+        participants: [
+          {
+            participantId: 'codex.other',
+            alias: 'codex5',
+            kind: 'agent',
+            tool: 'codex',
+            metadata: {
+              terminalApp: 'Ghostty',
+              terminalSessionID: 'ghostty-5',
+              projectPath: '/Users/song/projects/kai-export-ppt-lite',
+            },
+            context: { projectName: 'kai-export-ppt-lite' },
+          },
+        ],
+        workStates: [],
+        events: [
+          {
+            id: 701,
+            type: 'request_approval',
+            createdAt: new Date().toISOString(),
+            taskId: 'codex-native-bg-task',
+            threadId: 'codex-native-bg-thread',
+            payload: {
+              approvalId: 'codex-native-call_bg',
+              participantId: 'codex.other',
+              delivery: {
+                semantic: 'actionable',
+                source: 'codex-native-approval',
+              },
+              nativeCodexApproval: {
+                callId: 'call_bg',
+              },
+              body: {
+                summary: 'Do you want to allow a browser-based visual comparison?',
+                commandTitle: 'Codex',
+                commandLine: 'python3 scripts/compare-html-ppt-visual.py',
+                commandPreview: '/Users/song/projects/kai-export-ppt-lite',
+              },
+            },
+          },
+        ],
+        approvals: [
+          {
+            approvalId: 'hexdeck-local-codex-host-codex-session-queued-call_bg',
+            taskId: 'local-host-approval-codex-session-queued-call_bg',
+            threadId: 'local-host-approval-codex-session-queued',
+            createdAt: new Date().toISOString(),
+            summary: 'Do you want to allow a browser-based visual comparison?',
+            decision: 'pending',
+            participantId: 'codex.other',
+            actions: [
+              { label: 'Allow once', decisionMode: 'yes' as const },
+              { label: 'Reject', decisionMode: 'no' as const },
+            ],
+            body: {
+              summary: 'Do you want to allow a browser-based visual comparison?',
+              commandTitle: 'Codex',
+              commandLine: 'python3 scripts/compare-html-ppt-visual.py',
+              commandPreview: '/Users/song/projects/kai-export-ppt-lite',
+              localHostApproval: {
+                source: 'codex',
+                runtimeSource: 'queued-context',
+                projectPath: '/Users/song/projects/kai-export-ppt-lite',
+              },
+              delivery: {
+                source: 'hexdeck-local-host-approval',
+              },
+            },
+          },
+        ],
+      }),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(brokerClientInstance.loadServiceSeed).toHaveBeenCalledTimes(1);
+    });
+
+    expect(screen.queryByText('Do you want to allow a browser-based visual comparison?')).not.toBeInTheDocument();
+  });
+
+  it('keeps same-project queued-context local approvals visible when the saved project matches', async () => {
+    loadLocalSettingsMock.mockReturnValue({
+      brokerUrl: 'http://broker.test',
+      globalShortcut: 'CmdOrCtrl+Shift+H',
+      currentProject: 'HexDeck',
+      recentProjects: ['HexDeck'],
+    });
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue({
+        health: { ok: true },
+        participants: [
+          {
+            participantId: 'codex.main',
+            alias: 'codex6',
+            kind: 'agent',
+            tool: 'codex',
+            metadata: {
+              terminalApp: 'Ghostty',
+              terminalSessionID: 'ghostty-6',
+              projectPath: '/Users/song/projects/hexdeck',
+            },
+            context: { projectName: 'HexDeck' },
+          },
+        ],
+        workStates: [],
+        events: [
+          {
+            id: 702,
+            type: 'request_approval',
+            createdAt: new Date().toISOString(),
+            taskId: 'codex-native-fg-task',
+            threadId: 'codex-native-fg-thread',
+            payload: {
+              approvalId: 'codex-native-call_fg',
+              participantId: 'codex.main',
+              delivery: {
+                semantic: 'actionable',
+                source: 'codex-native-approval',
+              },
+              nativeCodexApproval: {
+                callId: 'call_fg',
+              },
+              body: {
+                summary: 'Do you want to create /Users/song/Desktop/hexdeck-codex-click-check-20260423-u on your Desktop?',
+                commandTitle: 'Codex',
+                commandLine: 'mkdir /Users/song/Desktop/hexdeck-codex-click-check-20260423-u',
+                commandPreview: '/Users/song/projects/hexdeck',
+              },
+              actions: [
+                { label: 'Allow once', decisionMode: 'yes' as const },
+                { label: 'Reject', decisionMode: 'no' as const },
+              ],
+            },
+          },
+        ],
+        approvals: [
+          {
+            approvalId: 'hexdeck-local-codex-host-codex-session-queued-call_fg',
+            taskId: 'local-host-approval-codex-session-queued-call_fg',
+            threadId: 'local-host-approval-codex-session-queued',
+            createdAt: new Date().toISOString(),
+            summary: 'Do you want to create /Users/song/Desktop/hexdeck-codex-click-check-20260423-u on your Desktop?',
+            decision: 'pending',
+            participantId: 'codex.main',
+            actions: [
+              { label: 'Allow once', decisionMode: 'yes' as const },
+              { label: 'Reject', decisionMode: 'no' as const },
+            ],
+            body: {
+              summary: 'Do you want to create /Users/song/Desktop/hexdeck-codex-click-check-20260423-u on your Desktop?',
+              commandTitle: 'Codex',
+              commandLine: 'mkdir /Users/song/Desktop/hexdeck-codex-click-check-20260423-u',
+              commandPreview: '/Users/song/projects/hexdeck',
+              localHostApproval: {
+                source: 'codex',
+                runtimeSource: 'queued-context',
+                projectPath: '/Users/song/projects/hexdeck',
+              },
+              delivery: {
+                source: 'hexdeck-local-host-approval',
+              },
+            },
+          },
+        ],
+      }),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('@codex6 · Do you want to create /Users/song/Desktop/hexdeck-codex-click-check-20260423-u on your Desktop?')).toBeInTheDocument();
+    });
+  });
+
+  it('keeps same-project queued-context approvals visible in the activity-card window when a matching project override is present', async () => {
+    loadLocalSettingsMock.mockReturnValue({
+      brokerUrl: 'http://broker.test',
+      globalShortcut: 'CmdOrCtrl+Shift+H',
+      currentProject: 'kai-export-ppt-lite',
+      recentProjects: ['kai-export-ppt-lite', 'HexDeck'],
+    });
+
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue({
+        health: { ok: true },
+        participants: [
+          {
+            participantId: 'codex.main',
+            alias: 'codex6',
+            kind: 'agent',
+            tool: 'codex',
+            metadata: {
+              terminalApp: 'Ghostty',
+              terminalSessionID: 'ghostty-6',
+              projectPath: '/Users/song/projects/hexdeck',
+            },
+            context: { projectName: 'HexDeck' },
+          },
+        ],
+        workStates: [],
+        events: [
+          {
+            id: 703,
+            type: 'request_approval',
+            createdAt: new Date().toISOString(),
+            taskId: 'codex-native-fg-all-agents-task',
+            threadId: 'codex-native-fg-all-agents-thread',
+            payload: {
+              approvalId: 'codex-native-call_fg_all_agents',
+              participantId: 'codex.main',
+              delivery: {
+                semantic: 'actionable',
+                source: 'codex-native-approval',
+              },
+              nativeCodexApproval: {
+                callId: 'call_fg_all_agents',
+              },
+              body: {
+                summary: 'Do you want to create /Users/song/Desktop/hexdeck-codex-click-check-20260423-v on your Desktop?',
+                commandTitle: 'Codex',
+                commandLine: 'mkdir /Users/song/Desktop/hexdeck-codex-click-check-20260423-v',
+                commandPreview: '/Users/song/projects/hexdeck',
+              },
+              actions: [
+                { label: 'Allow once', decisionMode: 'yes' as const },
+                { label: 'Reject', decisionMode: 'no' as const },
+              ],
+            },
+          },
+        ],
+        approvals: [
+          {
+            approvalId: 'hexdeck-local-codex-host-codex-session-queued-call_fg_all_agents',
+            taskId: 'local-host-approval-codex-session-queued-call_fg_all_agents',
+            threadId: 'local-host-approval-codex-session-queued',
+            createdAt: new Date().toISOString(),
+            summary: 'Do you want to create /Users/song/Desktop/hexdeck-codex-click-check-20260423-v on your Desktop?',
+            decision: 'pending',
+            participantId: 'codex.main',
+            actions: [
+              { label: 'Allow once', decisionMode: 'yes' as const },
+              { label: 'Reject', decisionMode: 'no' as const },
+            ],
+            body: {
+              summary: 'Do you want to create /Users/song/Desktop/hexdeck-codex-click-check-20260423-v on your Desktop?',
+              commandTitle: 'Codex',
+              commandLine: 'mkdir /Users/song/Desktop/hexdeck-codex-click-check-20260423-v',
+              commandPreview: '/Users/song/projects/hexdeck',
+              localHostApproval: {
+                source: 'codex',
+                runtimeSource: 'queued-context',
+                projectPath: '/Users/song/projects/hexdeck',
+              },
+              delivery: {
+                source: 'hexdeck-local-host-approval',
+              },
+            },
+          },
+        ],
+      }),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card&project=HexDeck');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('@codex6 · Do you want to create /Users/song/Desktop/hexdeck-codex-click-check-20260423-v on your Desktop?')).toBeInTheDocument();
+    });
   });
 
   it('ignores the activity-card project query for popup data when running live debug', async () => {

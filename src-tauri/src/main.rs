@@ -27,6 +27,7 @@ const ACTIVITY_CARD_BROKER_POLL_INTERVAL: std::time::Duration = std::time::Durat
 const ACTIVITY_CARD_LOCAL_APPROVAL_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(100);
 const ACTIVITY_CARD_DIAGNOSTICS_LOG_NAME: &str = "hexdeck-activity-card-diagnostics.log";
+const ACTIVITY_CARD_DIAGNOSTICS_JSONL_NAME: &str = "hexdeck-activity-card-diagnostics.jsonl";
 #[cfg(target_os = "macos")]
 const MACOS_TRAY_ICON_PNG: &[u8] = include_bytes!("../../public/hexdeck-menu-tray.png");
 
@@ -235,6 +236,10 @@ fn activity_card_diagnostics_log_path() -> std::path::PathBuf {
     env::temp_dir().join(ACTIVITY_CARD_DIAGNOSTICS_LOG_NAME)
 }
 
+fn activity_card_diagnostics_jsonl_path() -> std::path::PathBuf {
+    env::temp_dir().join(ACTIVITY_CARD_DIAGNOSTICS_JSONL_NAME)
+}
+
 fn append_activity_card_diagnostics_log(message: &str) {
     let log_path = activity_card_diagnostics_log_path();
     if let Some(parent) = log_path.parent() {
@@ -250,6 +255,36 @@ fn append_activity_card_diagnostics_log(message: &str) {
             message
         );
     }
+}
+
+fn append_activity_card_diagnostics_event(event: &serde_json::Value) {
+    let log_path = activity_card_diagnostics_jsonl_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let mut object = match event.as_object() {
+        Some(event) => event.clone(),
+        None => {
+            let mut object = serde_json::Map::new();
+            object.insert("message".to_string(), event.clone());
+            object
+        }
+    };
+    object.insert("timestamp".to_string(), serde_json::json!(Utc::now().to_rfc3339()));
+    object.insert("pid".to_string(), serde_json::json!(std::process::id()));
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = writeln!(file, "{}", serde_json::Value::Object(object));
+    }
+}
+
+fn project_name_from_project_path(project_path: Option<&str>) -> Option<String> {
+    project_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| std::path::Path::new(value).file_name().and_then(|name| name.to_str()))
+        .map(str::to_string)
 }
 
 fn truncate_diagnostic_message(value: Option<&str>) -> String {
@@ -524,6 +559,16 @@ fn position_activity_card_window(
             work_area.size.width,
             monitor.scale_factor(),
         );
+        append_activity_card_diagnostics_log(&format!(
+            "[native/position] workAreaPos=({}, {}) workAreaSize=({}, {}) scale={} targetPos=({}, {})",
+            work_area.position.x,
+            work_area.position.y,
+            work_area.size.width,
+            work_area.size.height,
+            monitor.scale_factor(),
+            position.x,
+            position.y
+        ));
         window.set_position(position)?;
     }
 
@@ -577,6 +622,11 @@ fn open_expanded_window(app: tauri::AppHandle, section: String) -> Result<(), St
 
 fn show_activity_card_window_for_app(app: &tauri::AppHandle) -> tauri::Result<()> {
     let window = ensure_activity_card_window(app)?;
+    append_activity_card_diagnostics_log(&format!(
+        "[native/show-before] visible={} location={}",
+        window.is_visible().unwrap_or(false),
+        activity_card_window_location()
+    ));
     log_activity_card_window_state("show-before-position", &window);
     if matches!(window.is_visible(), Ok(false)) {
         sync_window_location_if_needed(&window, &activity_card_window_location())?;
@@ -598,11 +648,20 @@ fn show_activity_card_window_for_app(app: &tauri::AppHandle) -> tauri::Result<()
         log_activity_card_window_state("show-after-focus", &window);
     }
 
+    append_activity_card_diagnostics_log(&format!(
+        "[native/show-after] visible={} focusable={} outerPos={:?} outerSize={:?}",
+        window.is_visible().unwrap_or(false),
+        activity_card_window_focusable(),
+        window.outer_position().ok(),
+        window.outer_size().ok()
+    ));
+
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 fn show_activity_card_window_inactive(window: &WebviewWindow) -> tauri::Result<()> {
+    window.show()?;
     let ns_window = window.ns_window()?;
     let ns_window: &objc2_app_kit::NSWindow = unsafe { &*ns_window.cast() };
     unsafe {
@@ -716,6 +775,17 @@ fn hide_activity_card_window(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn debug_log_activity_card_frontend(message: String) -> Result<(), String> {
     append_activity_card_diagnostics_log(&format!("[frontend] {message}"));
+    if let Ok(mut event) = serde_json::from_str::<serde_json::Value>(&message) {
+        if let Some(object) = event.as_object_mut() {
+            object
+                .entry("kind".to_string())
+                .or_insert_with(|| serde_json::json!("activity_card_frontend"));
+            object
+                .entry("source".to_string())
+                .or_insert_with(|| serde_json::json!("frontend"));
+            append_activity_card_diagnostics_event(&event);
+        }
+    }
     if activity_card_preview_mode().is_some() {
         eprintln!("[activity-card-frontend] {message}");
     }
@@ -739,6 +809,71 @@ fn broker_event_kind(value: &serde_json::Value) -> Option<&str> {
 
 fn local_host_approval_id(value: &serde_json::Value) -> Option<&str> {
     value.get("approvalId").and_then(serde_json::Value::as_str)
+}
+
+fn approval_item_string(value: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    value
+        .and_then(|value| value.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn local_host_approval_meta_string(
+    value: Option<&serde_json::Value>,
+    key: &str,
+) -> Option<String> {
+    value.and_then(|value| {
+        value.get("body")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|body| body.get("localHostApproval"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|meta| meta.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+fn build_local_host_approval_event(
+    stage: &str,
+    approval_item: Option<&serde_json::Value>,
+    extra: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    object.insert("kind".to_string(), serde_json::json!("activity_card_watcher"));
+    object.insert("stage".to_string(), serde_json::json!(stage));
+
+    if let Some(approval_id) = approval_item.and_then(local_host_approval_id) {
+        object.insert("approvalId".to_string(), serde_json::json!(approval_id));
+    }
+    if let Some(participant_id) = approval_item_string(approval_item, "participantId") {
+        object.insert("participantId".to_string(), serde_json::json!(participant_id));
+    }
+    if let Some(task_id) = approval_item_string(approval_item, "taskId") {
+        object.insert("taskId".to_string(), serde_json::json!(task_id));
+    }
+    if let Some(thread_id) = approval_item_string(approval_item, "threadId") {
+        object.insert("threadId".to_string(), serde_json::json!(thread_id));
+    }
+    if let Some(session_id) = local_host_approval_meta_string(approval_item, "sessionId") {
+        object.insert("sessionId".to_string(), serde_json::json!(session_id));
+    }
+    if let Some(call_id) = local_host_approval_meta_string(approval_item, "callId") {
+        object.insert("callId".to_string(), serde_json::json!(call_id));
+    }
+    if let Some(project_path) = local_host_approval_meta_string(approval_item, "projectPath") {
+        object.insert("projectPath".to_string(), serde_json::json!(project_path));
+        if let Some(project_name) = project_name_from_project_path(Some(&project_path)) {
+            object.insert("projectName".to_string(), serde_json::json!(project_name));
+        }
+    }
+
+    if let Some(extra) = extra.and_then(|value| value.as_object().cloned()) {
+        for (key, value) in extra {
+            object.insert(key, value);
+        }
+    }
+
+    serde_json::Value::Object(object)
 }
 
 fn describe_local_host_approval(value: Option<&serde_json::Value>) -> String {
@@ -846,9 +981,10 @@ struct ActivityCardBrokerWatcher {
     initialized: bool,
     after: u64,
     last_prepared_popup_event_id: Option<u64>,
+    #[allow(dead_code)]
     last_prepared_local_approval_id: Option<String>,
+    #[allow(dead_code)]
     last_prepared_local_approval_at: Option<tokio::time::Instant>,
-    last_observed_local_approval_id: Option<String>,
     consecutive_error_count: u32,
 }
 
@@ -860,7 +996,6 @@ impl ActivityCardBrokerWatcher {
             last_prepared_popup_event_id: None,
             last_prepared_local_approval_id: None,
             last_prepared_local_approval_at: None,
-            last_observed_local_approval_id: None,
             consecutive_error_count: 0,
         }
     }
@@ -908,6 +1043,7 @@ impl ActivityCardBrokerWatcher {
         }
     }
 
+    #[allow(dead_code)]
     fn take_prepare_local_approval_id(
         &mut self,
         approval_id: Option<&str>,
@@ -943,23 +1079,6 @@ impl ActivityCardBrokerWatcher {
         }
     }
 
-    fn note_local_approval_observation(
-        &mut self,
-        approval_item: Option<&serde_json::Value>,
-        window_visible: bool,
-    ) {
-        let next_id = approval_item
-            .and_then(local_host_approval_id)
-            .map(str::to_string);
-        if next_id != self.last_observed_local_approval_id {
-            append_activity_card_diagnostics_log(&format!(
-                "[watcher/local-observed] windowVisible={} {}",
-                window_visible,
-                describe_local_host_approval(approval_item)
-            ));
-            self.last_observed_local_approval_id = next_id;
-        }
-    }
 }
 
 async fn poll_activity_card_events(app: tauri::AppHandle) {
@@ -977,14 +1096,8 @@ async fn poll_activity_card_events(app: tauri::AppHandle) {
             .get_webview_window("activity-card")
             .and_then(|window| window.is_visible().ok())
             .unwrap_or(false);
-        let local_approval_item = commands::broker::latest_local_host_approval_item_value();
-        watcher.note_local_approval_observation(local_approval_item.as_ref(), window_visible);
-        let prepare_local_approval_id = watcher.take_prepare_local_approval_id(
-            local_approval_item
-                .as_ref()
-                .and_then(local_host_approval_id),
-            now,
-        );
+        let local_approval_item: Option<serde_json::Value> = None;
+        let prepare_local_approval_id: Option<String> = None;
         let mut prepare_event_id = None;
 
         if now >= next_broker_poll_at {
@@ -1082,6 +1195,17 @@ async fn poll_activity_card_events(app: tauri::AppHandle) {
                     .and_then(|window| window.is_visible().ok())
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
+                append_activity_card_diagnostics_event(&build_local_host_approval_event(
+                    "approval_emitted",
+                    local_approval_payload.as_ref(),
+                    Some(serde_json::json!({
+                        "prepareResult": prepare_result.clone(),
+                        "showResult": show_result.clone(),
+                        "emitLocalResult": emit_local_result.clone(),
+                        "emitRefreshResult": emit_refresh_result.clone(),
+                        "windowVisibleAfter": window_visible_after.clone()
+                    })),
+                ));
                 append_activity_card_diagnostics_log(&format!(
                     "[watcher/main-thread] action={:?} prepare={} show={} emitLocal={} emitRefresh={} windowVisibleAfter={} {}",
                     window_action,

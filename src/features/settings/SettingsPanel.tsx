@@ -1,20 +1,19 @@
 import { useEffect, useState } from 'react';
-import { INTERNAL_BROKER_URL, type BrokerRuntimeStatus } from '../../lib/broker/runtime';
+import packageJson from '../../../package.json';
+import type { BrokerRuntimeStatus } from '../../lib/broker/runtime';
 import { checkHexDeckUpdate, downloadAndInstallHexDeckUpdate } from '../../lib/update/hexdeck-updater';
 import type { UpdateStatus } from '../../lib/update/types';
 
+const HEXDECK_VERSION = packageJson.version;
+
 export function SettingsPanel({
   globalShortcut,
-  connectionState,
-  connectionMessage,
   runtimeStatus,
   onSaveSettings,
   onRefreshBroker,
   onRestartBroker,
 }: {
   globalShortcut: string;
-  connectionState: 'idle' | 'checking' | 'connected' | 'error';
-  connectionMessage: string | null;
   runtimeStatus: BrokerRuntimeStatus | null;
   onSaveSettings: (input: { globalShortcut: string }) => void;
   onRefreshBroker: () => void;
@@ -41,7 +40,7 @@ export function SettingsPanel({
       <section className="update-section">
         <h2>Broker Runtime</h2>
         <div className="update-status">
-          <dl className="status-grid">
+          <dl className="status-grid settings-runtime-grid">
             <div className="status-item">
               <dt>Status</dt>
               <dd className="status-value">
@@ -50,32 +49,20 @@ export function SettingsPanel({
                   : runtimeStatus?.running
                     ? 'Starting'
                     : runtimeStatus?.installed
-                      ? 'Installed'
-                      : 'Not installed'}
+                    ? 'Installed'
+                    : 'Not installed'}
               </dd>
             </div>
             <div className="status-item">
-              <dt>Endpoint</dt>
-              <dd className="status-value url">{INTERNAL_BROKER_URL}</dd>
+              <dt>HexDeck Version</dt>
+              <dd className="status-value">{HEXDECK_VERSION}</dd>
             </div>
             <div className="status-item">
-              <dt>Version</dt>
+              <dt>Broker Version</dt>
               <dd className="status-value">{runtimeStatus?.version ?? 'pending'}</dd>
             </div>
-            <div className="status-item">
-              <dt>Repo Path</dt>
-              <dd className="status-value url">{runtimeStatus?.path ?? 'not installed yet'}</dd>
-            </div>
-            <div className="status-item">
-              <dt>Heartbeat</dt>
-              <dd className="status-value url">{runtimeStatus?.heartbeatPath ?? 'pending'}</dd>
-            </div>
-            <div className="status-item">
-              <dt>Broker Log</dt>
-              <dd className="status-value url">{runtimeStatus?.stdoutPath ?? 'pending'}</dd>
-            </div>
           </dl>
-          <div className="settings-actions">
+          <div className="settings-actions settings-actions--spread">
             <button type="button" className="update-check-btn" onClick={onRefreshBroker}>
               Refresh Runtime
             </button>
@@ -84,41 +71,28 @@ export function SettingsPanel({
             </button>
           </div>
           {runtimeStatus?.lastError ? <p className="update-error">Error: {runtimeStatus.lastError}</p> : null}
-          {connectionMessage ? (
-            <p
-              className={
-                connectionState === 'connected'
-                  ? 'settings-connection-status settings-connection-status--good'
-                  : connectionState === 'error'
-                    ? 'settings-connection-status settings-connection-status--error'
-                    : 'settings-connection-status'
-              }
-            >
-              {connectionMessage}
-            </p>
-          ) : null}
         </div>
       </section>
 
       <section className="update-section">
         <h2>HexDeck Shortcut</h2>
         <div className="settings-form">
-          <label className="settings-field">
-            <span>Global Shortcut</span>
-            <input
-              className="project-input"
-              value={draftShortcut}
-              onChange={(event) => setDraftShortcut(event.target.value)}
-              placeholder="CommandOrControl+Shift+H"
-            />
-          </label>
-          <div className="settings-actions">
+          <div className="settings-shortcut-row">
+            <label className="settings-field settings-field--grow">
+              <span>Global Shortcut</span>
+              <input
+                className="project-input"
+                value={draftShortcut}
+                onChange={(event) => setDraftShortcut(event.target.value)}
+                placeholder="CommandOrControl+Shift+H"
+              />
+            </label>
             <button
               type="button"
-              className="update-install-btn"
+              className="update-install-btn settings-inline-save"
               onClick={() => onSaveSettings({ globalShortcut: draftShortcut })}
             >
-              Save Shortcut
+              Save
             </button>
           </div>
         </div>

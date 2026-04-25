@@ -329,6 +329,7 @@ export class BrokerClient {
           fromParticipantId: input.fromParticipantId,
           decision: input.decision,
           decisionMode: input.decisionMode,
+          nativeDecision: input.nativeDecision,
         }),
       }
     );

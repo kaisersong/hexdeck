@@ -1,20 +1,38 @@
-use chrono::Utc;
+use chrono::{DateTime, Datelike, Utc};
 use flate2::read::GzDecoder;
+use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fs::{self, File, OpenOptions};
 use std::future::Future;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{LazyLock, Mutex};
 use tar::Archive;
 use tauri::{AppHandle, Manager};
 use tokio::time::{sleep, Duration};
 
 const REPLAY_PAGE_SIZE: usize = 100;
 const INTENT_BROKER_REPO: &str = "kaisersong/intent-broker";
+const LOCAL_CODEX_HOST_APPROVAL_PREFIX: &str = "hexdeck-local-codex-host-";
+const LOCAL_CODEX_APPROVAL_DIAGNOSTICS_LOG_NAME: &str = "hexdeck-activity-card-diagnostics.log";
+const LOCAL_CODEX_APPROVAL_DIAGNOSTICS_JSONL_NAME: &str =
+    "hexdeck-activity-card-diagnostics.jsonl";
+const LOCAL_CODEX_TRANSCRIPT_TAIL_BYTES: u64 = 1_048_576;
+const LOCAL_CODEX_APPROVAL_DETAIL_TEXT: &str = "";
+const LOCAL_CODEX_APPROVAL_MAX_AGE_MS: i64 = 30 * 60 * 1000;
+const LOCAL_CODEX_LOG_LOOKBACK_SECS: i64 = 10 * 60;
+// Give transcript/log reconciliation enough time to observe that a local
+// approval was handled before surfacing the same prompt again.
+const LOCAL_CODEX_RESOLUTION_SUPPRESSION_TTL_MS: i64 = 60_000;
+
+static RECENT_LOCAL_CODEX_APPROVAL_RESOLUTIONS: LazyLock<Mutex<HashMap<String, i64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static LAST_LOCAL_CODEX_APPROVAL_LOAD_DIAGNOSTIC: LazyLock<Mutex<Option<String>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BrokerVersionInfo {
@@ -65,6 +83,66 @@ pub struct BrokerApprovalResponsePayload {
     pub task_id: String,
     pub from_participant_id: String,
     pub decision: String,
+    pub decision_mode: Option<String>,
+    pub native_decision: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalCodexRuntimeState {
+    source: Option<String>,
+    status: Option<String>,
+    session_id: Option<String>,
+    terminal_app: Option<String>,
+    project_path: Option<String>,
+    #[serde(alias = "terminalSessionID")]
+    terminal_session_id: Option<String>,
+    updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingLocalCodexApprovalCall {
+    call_id: String,
+    command: String,
+    workdir: String,
+    justification: String,
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingLocalCodexApprovalLogEntry {
+    log_id: i64,
+    command: String,
+    workdir: String,
+    justification: String,
+    created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LocalCodexApprovalTranscriptSnapshot {
+    pending: Vec<PendingLocalCodexApprovalCall>,
+    resolved: Vec<PendingLocalCodexApprovalCall>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalHostApprovalPrompt {
+    approval_id: String,
+    task_id: String,
+    thread_id: String,
+    participant_id: String,
+    session_id: String,
+    summary: String,
+    detail_text: String,
+    command_title: String,
+    command_line: String,
+    command_preview: String,
+    terminal_app: String,
+    terminal_session_id: String,
+    runtime_source: Option<String>,
+    project_path: Option<String>,
+    transcript_path: PathBuf,
+    call_id: String,
+    sort_key_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +203,197 @@ fn append_bootstrap_log(log_path: &Path, message: &str) {
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
         let _ = writeln!(file, "{} {}", Utc::now().to_rfc3339(), message);
     }
+}
+
+fn activity_card_diagnostics_log_path() -> PathBuf {
+    env::temp_dir().join(LOCAL_CODEX_APPROVAL_DIAGNOSTICS_LOG_NAME)
+}
+
+fn activity_card_diagnostics_jsonl_path() -> PathBuf {
+    env::temp_dir().join(LOCAL_CODEX_APPROVAL_DIAGNOSTICS_JSONL_NAME)
+}
+
+fn append_activity_card_diagnostics_log(message: &str) {
+    let log_path = activity_card_diagnostics_log_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = writeln!(
+            file,
+            "{} pid={} {}",
+            Utc::now().to_rfc3339(),
+            std::process::id(),
+            message
+        );
+    }
+}
+
+fn append_activity_card_diagnostics_event(event: &Value) {
+    let log_path = activity_card_diagnostics_jsonl_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let mut object = match event.as_object() {
+        Some(event) => event.clone(),
+        None => {
+            let mut object = Map::new();
+            object.insert("message".to_string(), event.clone());
+            object
+        }
+    };
+    object.insert("timestamp".to_string(), json!(Utc::now().to_rfc3339()));
+    object.insert("pid".to_string(), json!(std::process::id()));
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = writeln!(file, "{}", Value::Object(object));
+    }
+}
+
+fn maybe_log_local_codex_approval_diagnostic(message: String, event: Option<Value>) {
+    let Ok(mut last_message) = LAST_LOCAL_CODEX_APPROVAL_LOAD_DIAGNOSTIC.lock() else {
+        return;
+    };
+    if last_message.as_deref() == Some(message.as_str()) {
+        return;
+    }
+    append_activity_card_diagnostics_log(&message);
+    if let Some(event) = event {
+        append_activity_card_diagnostics_event(&event);
+    }
+    *last_message = Some(message);
+}
+
+fn truncate_local_codex_diagnostic(value: &str, limit: usize) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return "-".to_string();
+    }
+    let truncated = value.chars().take(limit).collect::<String>();
+    if value.chars().count() > limit {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+fn project_name_from_project_path(project_path: Option<&str>) -> Option<String> {
+    project_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| Path::new(value).file_name().and_then(|name| name.to_str()))
+        .map(str::to_string)
+}
+
+fn extend_json_object(target: &mut Map<String, Value>, value: Option<Value>) {
+    let Some(value) = value else {
+        return;
+    };
+    let Some(extra) = value.as_object() else {
+        return;
+    };
+    for (key, value) in extra {
+        target.insert(key.clone(), value.clone());
+    }
+}
+
+fn build_local_codex_approval_event(
+    stage: &str,
+    approval: Option<&LocalHostApprovalPrompt>,
+    response: Option<&BrokerApprovalResponsePayload>,
+    extra: Option<Value>,
+) -> Value {
+    let mut object = Map::new();
+    object.insert("kind".to_string(), json!("local_codex_approval"));
+    object.insert("stage".to_string(), json!(stage));
+
+    if let Some(approval) = approval {
+        object.insert("approvalId".to_string(), json!(approval.approval_id.clone()));
+        object.insert(
+            "participantId".to_string(),
+            json!(approval.participant_id.clone()),
+        );
+        if !approval.session_id.trim().is_empty() {
+            object.insert("sessionId".to_string(), json!(approval.session_id.clone()));
+        }
+        object.insert("callId".to_string(), json!(approval.call_id.clone()));
+        object.insert("taskId".to_string(), json!(approval.task_id.clone()));
+        object.insert("threadId".to_string(), json!(approval.thread_id.clone()));
+        if let Some(project_path) = approval.project_path.as_deref() {
+            object.insert("projectPath".to_string(), json!(project_path));
+        }
+        if let Some(project_name) = project_name_from_project_path(approval.project_path.as_deref()) {
+            object.insert("projectName".to_string(), json!(project_name));
+        }
+        object.insert("command".to_string(), json!(approval.command_line.clone()));
+        object.insert("workdir".to_string(), json!(approval.command_preview.clone()));
+        object.insert("transport".to_string(), json!("local-host"));
+    }
+
+    if let Some(response) = response {
+        object.insert(
+            "responseApprovalId".to_string(),
+            json!(response.approval_id.clone()),
+        );
+        object.insert("responseTaskId".to_string(), json!(response.task_id.clone()));
+        object.insert(
+            "fromParticipantId".to_string(),
+            json!(response.from_participant_id.clone()),
+        );
+        object.insert("decision".to_string(), json!(response.decision.clone()));
+        if let Some(decision_mode) = response.decision_mode.as_deref() {
+            object.insert("decisionMode".to_string(), json!(decision_mode));
+        }
+    }
+
+    extend_json_object(&mut object, extra);
+    Value::Object(object)
+}
+
+fn append_local_codex_approval_event(
+    stage: &str,
+    approval: Option<&LocalHostApprovalPrompt>,
+    response: Option<&BrokerApprovalResponsePayload>,
+    extra: Option<Value>,
+) {
+    append_activity_card_diagnostics_event(&build_local_codex_approval_event(
+        stage, approval, response, extra,
+    ));
+}
+
+fn build_approval_response_event(
+    stage: &str,
+    input: &BrokerApprovalResponsePayload,
+    extra: Option<Value>,
+) -> Value {
+    let mut object = Map::new();
+    object.insert("kind".to_string(), json!("approval_response"));
+    object.insert("stage".to_string(), json!(stage));
+    object.insert("approvalId".to_string(), json!(input.approval_id.clone()));
+    object.insert("taskId".to_string(), json!(input.task_id.clone()));
+    object.insert(
+        "fromParticipantId".to_string(),
+        json!(input.from_participant_id.clone()),
+    );
+    object.insert("decision".to_string(), json!(input.decision.clone()));
+    if let Some(decision_mode) = input.decision_mode.as_deref() {
+        object.insert("decisionMode".to_string(), json!(decision_mode));
+    }
+    if let Some(native_decision) = input.native_decision.as_ref() {
+        object.insert("nativeDecision".to_string(), native_decision.clone());
+    }
+    extend_json_object(&mut object, extra);
+    Value::Object(object)
+}
+
+fn append_approval_response_event(
+    stage: &str,
+    input: &BrokerApprovalResponsePayload,
+    extra: Option<Value>,
+) {
+    append_activity_card_diagnostics_event(&build_approval_response_event(stage, input, extra));
 }
 
 fn maybe_log(log_path: Option<&Path>, message: &str) {
@@ -259,6 +528,1251 @@ fn heartbeat_is_running(heartbeat: &serde_json::Value, expected_pid: Option<u32>
     }
 }
 
+fn safe_identifier(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME").map(PathBuf::from)
+}
+
+fn parse_rfc3339_timestamp_ms(value: Option<&str>) -> Option<i64> {
+    value
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp_millis())
+}
+
+fn read_text_tail(path: &Path, max_bytes: u64) -> Result<String, String> {
+    let mut file =
+        File::open(path).map_err(|error| format!("failed_to_open_codex_transcript: {error}"))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("failed_to_stat_codex_transcript: {error}"))?
+        .len();
+    let start = file_len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| format!("failed_to_seek_codex_transcript: {error}"))?;
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("failed_to_read_codex_transcript: {error}"))?;
+
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if start > 0 {
+        if let Some(newline_index) = text.find('\n') {
+            text = text.split_off(newline_index + 1);
+        } else {
+            return Ok(String::new());
+        }
+    }
+
+    Ok(text)
+}
+
+fn find_matching_file(root: &Path, needle: &str, remaining_depth: usize) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            directories.push(path);
+        } else {
+            files.push(path);
+        }
+    }
+
+    files.sort();
+    directories.sort();
+
+    for file_path in files {
+        let matches = file_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| value.ends_with(".jsonl") && value.contains(needle))
+            .unwrap_or(false);
+        if matches {
+            return Some(file_path);
+        }
+    }
+
+    if remaining_depth == 0 {
+        return None;
+    }
+
+    for directory in directories {
+        if let Some(path) = find_matching_file(&directory, needle, remaining_depth - 1) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn resolve_codex_transcript_path(session_id: &str, updated_at: Option<&str>) -> Option<PathBuf> {
+    let root = home_dir()?.join(".codex").join("sessions");
+
+    if let Some(updated_at) = updated_at.and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+    {
+        let day_dir = root
+            .join(format!("{:04}", updated_at.year()))
+            .join(format!("{:02}", updated_at.month()))
+            .join(format!("{:02}", updated_at.day()));
+        if let Some(path) = find_matching_file(&day_dir, session_id, 0) {
+            return Some(path);
+        }
+    }
+
+    find_matching_file(&root, session_id, 4)
+}
+
+fn is_supported_local_codex_runtime(runtime: &LocalCodexRuntimeState) -> bool {
+    runtime.status.as_deref() == Some("running")
+        && runtime
+            .session_id
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+        && runtime
+            .terminal_app
+            .as_deref()
+            .map(|value| value.to_ascii_lowercase().contains("ghostty"))
+            .unwrap_or(false)
+        && runtime
+            .terminal_session_id
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+}
+
+fn parse_pending_local_codex_approval_call(
+    line: &str,
+    fallback_project_path: Option<&str>,
+) -> Option<PendingLocalCodexApprovalCall> {
+    let entry: Value = serde_json::from_str(line).ok()?;
+    let payload = entry.get("payload")?;
+    if entry.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+    if payload.get("type").and_then(Value::as_str) != Some("function_call")
+        || payload.get("name").and_then(Value::as_str) != Some("exec_command")
+    {
+        return None;
+    }
+
+    let arguments = payload.get("arguments").and_then(Value::as_str)?;
+    let args: Value = serde_json::from_str(arguments).ok()?;
+    if args.get("sandbox_permissions").and_then(Value::as_str) != Some("require_escalated") {
+        return None;
+    }
+
+    Some(PendingLocalCodexApprovalCall {
+        call_id: payload.get("call_id").and_then(Value::as_str)?.to_string(),
+        command: args
+            .get("cmd")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        workdir: args
+            .get("workdir")
+            .and_then(Value::as_str)
+            .or(fallback_project_path)
+            .unwrap_or_default()
+            .to_string(),
+        justification: args
+            .get("justification")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Codex command approval requested")
+            .to_string(),
+        created_at: entry
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn parse_local_codex_approval_log_entry(
+    log_id: i64,
+    ts_secs: i64,
+    _session_id: &str,
+    body: &str,
+) -> Option<PendingLocalCodexApprovalLogEntry> {
+    let marker = "ToolCall: exec_command ";
+    let start = body.find(marker)? + marker.len();
+    let end = body.rfind(" thread_id=").unwrap_or(body.len());
+    let raw_json = body.get(start..end)?.trim();
+    let payload: Value = serde_json::from_str(raw_json).ok()?;
+
+    if payload.get("sandbox_permissions").and_then(Value::as_str) != Some("require_escalated") {
+        return None;
+    }
+
+    Some(PendingLocalCodexApprovalLogEntry {
+        log_id,
+        command: payload
+            .get("cmd")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        workdir: payload
+            .get("workdir")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        justification: payload
+            .get("justification")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Codex command approval requested")
+            .to_string(),
+        created_at_ms: ts_secs.saturating_mul(1000),
+    })
+}
+
+fn effective_local_codex_workdir(raw_workdir: &str, fallback_project_path: Option<&str>) -> String {
+    let raw_workdir = raw_workdir.trim();
+    if !raw_workdir.is_empty() {
+        return raw_workdir.to_string();
+    }
+
+    fallback_project_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn extract_local_codex_resolved_call_id(line: &str) -> Option<String> {
+    let entry: Value = serde_json::from_str(line).ok()?;
+    let payload = entry.get("payload")?;
+
+    if entry.get("type").and_then(Value::as_str) == Some("response_item")
+        && payload.get("type").and_then(Value::as_str) == Some("function_call_output")
+    {
+        return payload
+            .get("call_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+
+    if entry.get("type").and_then(Value::as_str) == Some("event_msg")
+        && payload.get("type").and_then(Value::as_str) == Some("exec_command_end")
+    {
+        return payload
+            .get("call_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+
+    None
+}
+
+fn collect_local_codex_approval_transcript_snapshot(
+    tail: &str,
+    fallback_project_path: Option<&str>,
+) -> LocalCodexApprovalTranscriptSnapshot {
+    let mut pending_by_call_id = HashMap::new();
+    let mut resolved = Vec::new();
+
+    for line in tail.lines() {
+        if let Some(call) = parse_pending_local_codex_approval_call(line, fallback_project_path) {
+            pending_by_call_id.insert(call.call_id.clone(), call);
+            continue;
+        }
+
+        if let Some(call_id) = extract_local_codex_resolved_call_id(line) {
+            if let Some(call) = pending_by_call_id.remove(&call_id) {
+                resolved.push(call);
+            }
+        }
+    }
+
+    let mut pending = pending_by_call_id.into_values().collect::<Vec<_>>();
+    pending.sort_by_key(|call| parse_rfc3339_timestamp_ms(call.created_at.as_deref()).unwrap_or(0));
+    resolved
+        .sort_by_key(|call| parse_rfc3339_timestamp_ms(call.created_at.as_deref()).unwrap_or(0));
+
+    LocalCodexApprovalTranscriptSnapshot { pending, resolved }
+}
+
+#[cfg(test)]
+fn collect_pending_local_codex_approval_calls(
+    tail: &str,
+    fallback_project_path: Option<&str>,
+) -> Vec<PendingLocalCodexApprovalCall> {
+    collect_local_codex_approval_transcript_snapshot(tail, fallback_project_path).pending
+}
+
+fn build_local_host_approval_prompt(
+    participant_id: &str,
+    runtime: &LocalCodexRuntimeState,
+    transcript_path: PathBuf,
+    call: PendingLocalCodexApprovalCall,
+) -> LocalHostApprovalPrompt {
+    let participant_safe = safe_identifier(participant_id);
+    let call_safe = safe_identifier(&call.call_id);
+    let approval_id = format!("{LOCAL_CODEX_HOST_APPROVAL_PREFIX}{participant_safe}-{call_safe}");
+    let task_id = format!("local-host-approval-{participant_safe}-{call_safe}");
+    let thread_id = format!("local-host-approval-{participant_safe}");
+    let project_path = runtime
+        .project_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let workdir = call.workdir.trim();
+            if workdir.is_empty() {
+                None
+            } else {
+                Some(workdir.to_string())
+            }
+        });
+    let sort_key_ms = parse_rfc3339_timestamp_ms(call.created_at.as_deref())
+        .or_else(|| parse_rfc3339_timestamp_ms(runtime.updated_at.as_deref()))
+        .unwrap_or(0);
+
+    LocalHostApprovalPrompt {
+        approval_id,
+        task_id,
+        thread_id,
+        participant_id: participant_id.to_string(),
+        session_id: runtime.session_id.clone().unwrap_or_default(),
+        summary: call.justification,
+        detail_text: LOCAL_CODEX_APPROVAL_DETAIL_TEXT.to_string(),
+        command_title: "Codex".to_string(),
+        command_line: call.command,
+        command_preview: call.workdir,
+        terminal_app: runtime.terminal_app.clone().unwrap_or_default(),
+        terminal_session_id: runtime.terminal_session_id.clone().unwrap_or_default(),
+        runtime_source: runtime.source.clone(),
+        project_path,
+        transcript_path,
+        call_id: call.call_id,
+        sort_key_ms,
+    }
+}
+
+fn build_local_host_approval_prompt_from_log(
+    participant_id: &str,
+    runtime: &LocalCodexRuntimeState,
+    transcript_path: &Path,
+    entry: PendingLocalCodexApprovalLogEntry,
+) -> LocalHostApprovalPrompt {
+    let synthetic_call_id = format!("log-{}", entry.log_id);
+    let participant_safe = safe_identifier(participant_id);
+    let call_safe = safe_identifier(&synthetic_call_id);
+    let approval_id = format!("{LOCAL_CODEX_HOST_APPROVAL_PREFIX}{participant_safe}-{call_safe}");
+    let task_id = format!("local-host-approval-{participant_safe}-{call_safe}");
+    let thread_id = format!("local-host-approval-{participant_safe}");
+    let project_path = runtime
+        .project_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let workdir = entry.workdir.trim();
+            if workdir.is_empty() {
+                None
+            } else {
+                Some(workdir.to_string())
+            }
+        });
+
+    LocalHostApprovalPrompt {
+        approval_id,
+        task_id,
+        thread_id,
+        participant_id: participant_id.to_string(),
+        session_id: runtime.session_id.clone().unwrap_or_default(),
+        summary: entry.justification,
+        detail_text: LOCAL_CODEX_APPROVAL_DETAIL_TEXT.to_string(),
+        command_title: "Codex".to_string(),
+        command_line: entry.command,
+        command_preview: entry.workdir,
+        terminal_app: runtime.terminal_app.clone().unwrap_or_default(),
+        terminal_session_id: runtime.terminal_session_id.clone().unwrap_or_default(),
+        runtime_source: runtime.source.clone(),
+        project_path,
+        transcript_path: transcript_path.to_path_buf(),
+        call_id: synthetic_call_id,
+        sort_key_ms: entry.created_at_ms,
+    }
+}
+
+fn load_local_host_approvals() -> Vec<LocalHostApprovalPrompt> {
+    let Some(runtime_dir) = home_dir().map(|home| home.join(".intent-broker").join("codex")) else {
+        return Vec::new();
+    };
+
+    let Ok(entries) = fs::read_dir(runtime_dir) else {
+        return Vec::new();
+    };
+
+    let mut approvals = Vec::new();
+    let mut diagnostics = Vec::new();
+    let recent_resolution_fingerprints =
+        recent_local_codex_resolution_fingerprints(Utc::now().timestamp_millis());
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !file_name.ends_with(".runtime.json") {
+            continue;
+        }
+        let diagnostic_label = format!("file={file_name}");
+
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                diagnostics.push(format!("{diagnostic_label} skip=read-error error={error}"));
+                continue;
+            }
+        };
+        let runtime: LocalCodexRuntimeState = match serde_json::from_str(&content) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                diagnostics.push(format!("{diagnostic_label} skip=parse-error error={error}"));
+                continue;
+            }
+        };
+        if !is_supported_local_codex_runtime(&runtime) {
+            diagnostics.push(format!(
+                "{diagnostic_label} skip=unsupported status={} terminalApp={} hasSessionId={} hasTerminalSessionId={}",
+                runtime.status.as_deref().unwrap_or("-"),
+                runtime.terminal_app.as_deref().unwrap_or("-"),
+                runtime
+                    .session_id
+                    .as_deref()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false),
+                runtime
+                    .terminal_session_id
+                    .as_deref()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+            ));
+            continue;
+        }
+
+        let Some(session_id) = runtime.session_id.as_deref() else {
+            diagnostics.push(format!("{diagnostic_label} skip=missing-session-id"));
+            continue;
+        };
+        let transcript_path =
+            resolve_codex_transcript_path(session_id, runtime.updated_at.as_deref())
+                .unwrap_or_default();
+        let tail = if transcript_path.as_os_str().is_empty() {
+            String::new()
+        } else {
+            match read_text_tail(&transcript_path, LOCAL_CODEX_TRANSCRIPT_TAIL_BYTES) {
+                Ok(tail) => tail,
+                Err(_) => String::new(),
+            }
+        };
+        let participant_id = file_name.trim_end_matches(".runtime.json").to_string();
+        let transcript_snapshot = collect_local_codex_approval_transcript_snapshot(
+            &tail,
+            runtime.project_path.as_deref(),
+        );
+        let log_entries = load_recent_local_codex_approval_log_entries(session_id);
+        let merged_log_approvals = merge_log_backed_local_host_approvals(
+            &participant_id,
+            &runtime,
+            &transcript_path,
+            &log_entries,
+            &transcript_snapshot.pending,
+            &transcript_snapshot.resolved,
+            &recent_resolution_fingerprints,
+        );
+        diagnostics.push(format!(
+            "{diagnostic_label} session={} updatedAt={} transcript={} pending={} resolved={} logEntries={} merged={} projectPath={}",
+            session_id,
+            runtime.updated_at.as_deref().unwrap_or("-"),
+            truncate_local_codex_diagnostic(&transcript_path.to_string_lossy(), 120),
+            transcript_snapshot.pending.len(),
+            transcript_snapshot.resolved.len(),
+            log_entries.len(),
+            merged_log_approvals.len(),
+            truncate_local_codex_diagnostic(runtime.project_path.as_deref().unwrap_or("-"), 80)
+        ));
+
+        for call in transcript_snapshot.pending.iter().cloned() {
+            approvals.push(build_local_host_approval_prompt(
+                &participant_id,
+                &runtime,
+                transcript_path.clone(),
+                call,
+            ));
+        }
+
+        approvals.extend(merged_log_approvals);
+    }
+
+    let approvals = suppress_recently_resolved_local_host_approvals(
+        approvals,
+        &recent_resolution_fingerprints,
+    );
+    let approvals = filter_and_sort_local_host_approvals(approvals, Utc::now().timestamp_millis());
+    let top_approval = approvals
+        .first()
+        .map(|approval| {
+            format!(
+                "{} participant={} command={}",
+                approval.approval_id,
+                approval.participant_id,
+                truncate_local_codex_diagnostic(&approval.command_line, 100)
+            )
+        })
+        .unwrap_or_else(|| "none".to_string());
+    let summary_event = approvals.first().map(|approval| {
+        build_local_codex_approval_event(
+            "approval_detected",
+            Some(approval),
+            None,
+            Some(json!({
+                "approvalCount": approvals.len(),
+                "diagnosticSource": "local_approval_scan"
+            })),
+        )
+    });
+    maybe_log_local_codex_approval_diagnostic(
+        format!(
+            "[broker/local-approvals] total={} top={} {}",
+            approvals.len(),
+            top_approval,
+            diagnostics.join(" | ")
+        ),
+        summary_event,
+    );
+    approvals
+}
+
+fn normalize_approval_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.replace("\\n", "\n").replace("/n", "\n"))
+}
+
+fn approval_fingerprint(
+    participant_id: Option<&str>,
+    command_line: Option<&str>,
+    command_preview: Option<&str>,
+) -> Option<String> {
+    let participant_id = participant_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let command_line = normalize_approval_text(command_line)?;
+    let command_preview = normalize_approval_text(command_preview).unwrap_or_default();
+    Some(format!(
+        "{participant_id}\u{0}{command_line}\u{0}{command_preview}"
+    ))
+}
+
+fn local_host_approval_fingerprint(approval: &LocalHostApprovalPrompt) -> Option<String> {
+    approval_fingerprint(
+        Some(&approval.participant_id),
+        Some(&approval.command_line),
+        Some(&approval.command_preview),
+    )
+}
+
+fn local_codex_call_fingerprint(
+    participant_id: &str,
+    command: &str,
+    workdir: &str,
+) -> Option<String> {
+    approval_fingerprint(Some(participant_id), Some(command), Some(workdir))
+}
+
+fn load_recent_local_codex_approval_log_entries(
+    session_id: &str,
+) -> Vec<PendingLocalCodexApprovalLogEntry> {
+    let Some(log_path) = home_dir().map(|home| home.join(".codex").join("logs_2.sqlite")) else {
+        return Vec::new();
+    };
+    let connection = match Connection::open_with_flags(
+        &log_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(connection) => connection,
+        Err(_) => return Vec::new(),
+    };
+
+    let min_ts = Utc::now()
+        .timestamp()
+        .saturating_sub(LOCAL_CODEX_LOG_LOOKBACK_SECS);
+    let mut statement = match connection.prepare(
+        "
+        SELECT id, ts, feedback_log_body
+        FROM logs
+        WHERE thread_id = ?1
+          AND feedback_log_body IS NOT NULL
+          AND ts >= ?2
+          AND feedback_log_body LIKE '%ToolCall: exec_command %'
+        ORDER BY id DESC
+        LIMIT 64
+        ",
+    ) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+
+    let rows = match statement.query_map(params![session_id, min_ts], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+
+    rows.flatten()
+        .filter_map(|(log_id, ts_secs, body)| {
+            parse_local_codex_approval_log_entry(log_id, ts_secs, session_id, &body)
+        })
+        .collect()
+}
+
+fn recent_local_codex_resolution_fingerprints(now_ms: i64) -> HashSet<String> {
+    let Ok(mut recent_resolutions) = RECENT_LOCAL_CODEX_APPROVAL_RESOLUTIONS.lock() else {
+        return HashSet::new();
+    };
+
+    recent_resolutions.retain(|_, resolved_at_ms| {
+        now_ms.saturating_sub(*resolved_at_ms) <= LOCAL_CODEX_RESOLUTION_SUPPRESSION_TTL_MS
+    });
+
+    recent_resolutions.keys().cloned().collect()
+}
+
+fn remember_recent_local_codex_resolution(approval: &LocalHostApprovalPrompt) {
+    let Some(fingerprint) = local_host_approval_fingerprint(approval) else {
+        return;
+    };
+    let Ok(mut recent_resolutions) = RECENT_LOCAL_CODEX_APPROVAL_RESOLUTIONS.lock() else {
+        return;
+    };
+    recent_resolutions.insert(fingerprint, Utc::now().timestamp_millis());
+}
+
+fn suppress_recently_resolved_local_host_approvals(
+    approvals: Vec<LocalHostApprovalPrompt>,
+    recent_resolution_fingerprints: &HashSet<String>,
+) -> Vec<LocalHostApprovalPrompt> {
+    if recent_resolution_fingerprints.is_empty() {
+        return approvals;
+    }
+
+    approvals
+        .into_iter()
+        .filter(|approval| {
+            local_host_approval_fingerprint(approval)
+                .map(|fingerprint| !recent_resolution_fingerprints.contains(&fingerprint))
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+fn merge_log_backed_local_host_approvals(
+    participant_id: &str,
+    runtime: &LocalCodexRuntimeState,
+    transcript_path: &Path,
+    log_entries: &[PendingLocalCodexApprovalLogEntry],
+    transcript_pending: &[PendingLocalCodexApprovalCall],
+    transcript_resolved: &[PendingLocalCodexApprovalCall],
+    recent_resolution_fingerprints: &HashSet<String>,
+) -> Vec<LocalHostApprovalPrompt> {
+    let pending_fingerprints: HashSet<String> = transcript_pending
+        .iter()
+        .filter_map(|call| {
+            local_codex_call_fingerprint(participant_id, &call.command, &call.workdir)
+        })
+        .collect();
+    let resolved_fingerprints: HashSet<String> = transcript_resolved
+        .iter()
+        .filter_map(|call| {
+            local_codex_call_fingerprint(participant_id, &call.command, &call.workdir)
+        })
+        .collect();
+    let mut newest_log_by_fingerprint = HashMap::new();
+
+    for entry in log_entries {
+        let effective_workdir =
+            effective_local_codex_workdir(&entry.workdir, runtime.project_path.as_deref());
+        let Some(fingerprint) =
+            local_codex_call_fingerprint(participant_id, &entry.command, &effective_workdir)
+        else {
+            continue;
+        };
+        if pending_fingerprints.contains(&fingerprint)
+            || resolved_fingerprints.contains(&fingerprint)
+            || recent_resolution_fingerprints.contains(&fingerprint)
+        {
+            continue;
+        }
+
+        let should_replace = newest_log_by_fingerprint
+            .get(&fingerprint)
+            .map(|existing: &PendingLocalCodexApprovalLogEntry| {
+                entry.created_at_ms > existing.created_at_ms || entry.log_id > existing.log_id
+            })
+            .unwrap_or(true);
+        if should_replace {
+            newest_log_by_fingerprint.insert(fingerprint, entry.clone());
+        }
+    }
+
+    let mut approvals = newest_log_by_fingerprint
+        .into_values()
+        .map(|entry| {
+            build_local_host_approval_prompt_from_log(
+                participant_id,
+                runtime,
+                transcript_path,
+                PendingLocalCodexApprovalLogEntry {
+                    workdir: effective_local_codex_workdir(
+                        &entry.workdir,
+                        runtime.project_path.as_deref(),
+                    ),
+                    ..entry
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    approvals.sort_by_key(|approval| approval.sort_key_ms);
+    approvals
+}
+
+fn nested_value_object<'a>(
+    source: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    source.get(key).and_then(Value::as_object)
+}
+
+fn nested_value_string<'a>(
+    source: Option<&'a serde_json::Map<String, Value>>,
+    key: &str,
+) -> Option<&'a str> {
+    source
+        .and_then(|source| source.get(key))
+        .and_then(Value::as_str)
+}
+
+fn is_mirrored_codex_hook_payload(payload: &serde_json::Map<String, Value>) -> bool {
+    let delivery_source = nested_value_object(payload, "delivery")
+        .and_then(|delivery| delivery.get("source"))
+        .and_then(Value::as_str);
+    if delivery_source == Some("codex-hook-approval") {
+        return true;
+    }
+
+    nested_value_object(payload, "nativeHookApproval")
+        .and_then(|approval| approval.get("agentTool"))
+        .and_then(Value::as_str)
+        .map(|agent_tool| agent_tool.trim().eq_ignore_ascii_case("codex"))
+        .unwrap_or(false)
+}
+
+fn codex_hook_event_fingerprint(event: &Value) -> Option<String> {
+    let event_kind = event
+        .get("kind")
+        .or_else(|| event.get("type"))
+        .and_then(Value::as_str);
+    if event_kind != Some("request_approval") {
+        return None;
+    }
+
+    let payload = event.get("payload").and_then(Value::as_object)?;
+    if !is_mirrored_codex_hook_payload(payload) {
+        return None;
+    }
+
+    let body = nested_value_object(payload, "body");
+    approval_fingerprint(
+        nested_value_string(body, "participantId")
+            .or_else(|| nested_value_string(Some(payload), "participantId")),
+        nested_value_string(body, "commandLine")
+            .or_else(|| nested_value_string(Some(payload), "commandLine")),
+        nested_value_string(body, "commandPreview")
+            .or_else(|| nested_value_string(Some(payload), "commandPreview")),
+    )
+}
+
+fn find_matching_codex_hook_approvals(
+    events: &[Value],
+    approval: &LocalHostApprovalPrompt,
+) -> Vec<(String, String)> {
+    let Some(local_fingerprint) = local_host_approval_fingerprint(approval) else {
+        return Vec::new();
+    };
+
+    let responded_approval_ids: HashSet<String> = events
+        .iter()
+        .filter_map(|event| {
+            let event_kind = event
+                .get("kind")
+                .or_else(|| event.get("type"))
+                .and_then(Value::as_str);
+            if event_kind != Some("respond_approval") {
+                return None;
+            }
+
+            event
+                .get("payload")
+                .and_then(Value::as_object)
+                .and_then(|payload| payload.get("approvalId"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+
+    let mut matches = Vec::new();
+    let mut seen = HashSet::new();
+
+    for event in events {
+        if codex_hook_event_fingerprint(event).as_deref() != Some(local_fingerprint.as_str()) {
+            continue;
+        }
+
+        let payload = match event.get("payload").and_then(Value::as_object) {
+            Some(payload) => payload,
+            None => continue,
+        };
+        let Some(approval_id) = payload.get("approvalId").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(task_id) = event.get("taskId").and_then(Value::as_str) else {
+            continue;
+        };
+        if responded_approval_ids.contains(approval_id) || !seen.insert(approval_id.to_string()) {
+            continue;
+        }
+
+        matches.push((approval_id.to_string(), task_id.to_string()));
+    }
+
+    matches
+}
+
+fn local_host_approval_to_json(approval: &LocalHostApprovalPrompt) -> Value {
+    let mut body = json!({
+        "summary": approval.summary.clone(),
+        "commandTitle": approval.command_title.clone(),
+        "commandLine": approval.command_line.clone(),
+        "commandPreview": approval.command_preview.clone(),
+        "participantId": approval.participant_id.clone(),
+        "localHostApproval": {
+            "source": "codex",
+            "sessionId": approval.session_id.clone(),
+            "callId": approval.call_id.clone(),
+            "projectPath": approval.project_path.clone(),
+            "terminalApp": approval.terminal_app.clone(),
+            "terminalSessionId": approval.terminal_session_id.clone(),
+            "transcriptPath": approval.transcript_path.to_string_lossy().to_string()
+        },
+        "delivery": {
+            "semantic": "actionable",
+            "source": "hexdeck-local-host-approval"
+        }
+    });
+    if !approval.detail_text.trim().is_empty() {
+        body["detailText"] = json!(approval.detail_text.clone());
+    }
+    if let Some(runtime_source) = approval.runtime_source.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        body["localHostApproval"]["runtimeSource"] = json!(runtime_source);
+    }
+
+    let mut item = json!({
+        "approvalId": approval.approval_id.clone(),
+        "taskId": approval.task_id.clone(),
+        "threadId": approval.thread_id.clone(),
+        "createdAt": DateTime::<Utc>::from_timestamp_millis(approval.sort_key_ms)
+            .map(|timestamp| timestamp.to_rfc3339()),
+        "summary": approval.summary.clone(),
+        "decision": "pending",
+        "participantId": approval.participant_id.clone(),
+        "actions": [
+            { "label": "Allow once", "decisionMode": "yes" },
+            { "label": "Reject", "decisionMode": "no" }
+        ],
+        "commandTitle": approval.command_title.clone(),
+        "commandLine": approval.command_line.clone(),
+        "commandPreview": approval.command_preview.clone(),
+        "body": body
+    });
+    if !approval.detail_text.trim().is_empty() {
+        item["detailText"] = json!(approval.detail_text.clone());
+    }
+
+    item
+}
+
+pub(crate) fn latest_local_host_approval_item_value() -> Option<Value> {
+    load_local_host_approvals()
+        .first()
+        .map(local_host_approval_to_json)
+}
+
+#[tauri::command]
+pub fn load_latest_local_host_approval_item() -> Result<Option<Value>, String> {
+    Ok(latest_local_host_approval_item_value())
+}
+
+fn filter_and_sort_local_host_approvals(
+    approvals: Vec<LocalHostApprovalPrompt>,
+    now_ms: i64,
+) -> Vec<LocalHostApprovalPrompt> {
+    let min_sort_key_ms = now_ms.saturating_sub(LOCAL_CODEX_APPROVAL_MAX_AGE_MS);
+    let mut approvals = approvals
+        .into_iter()
+        .filter(|approval| approval.sort_key_ms >= min_sort_key_ms)
+        .collect::<Vec<_>>();
+    approvals.sort_by(|left, right| {
+        right
+            .sort_key_ms
+            .cmp(&left.sort_key_ms)
+            .then_with(|| left.approval_id.cmp(&right.approval_id))
+    });
+    approvals
+}
+
+fn escape_applescript(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn execute_osascript(script: &str) -> Result<String, String> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|error| format!("failed_to_launch_osascript: {error}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            "osascript_failed".to_string()
+        } else {
+            stderr
+        })
+    }
+}
+
+fn local_codex_host_terminal_command(
+    decision: &str,
+    decision_mode: Option<&str>,
+) -> Result<String, String> {
+    fn ghostty_keypress_command(key: &str) -> String {
+        format!(
+            concat!(
+                "send key \"{key}\" action press to targetTerminal\n",
+                "    delay 0.02\n",
+                "    send key \"{key}\" action release to targetTerminal"
+            ),
+            key = escape_applescript(key)
+        )
+    }
+
+    fn ghostty_confirm_command() -> String {
+        "input text linefeed to targetTerminal".to_string()
+    }
+
+    match decision {
+        "denied" => Ok(ghostty_keypress_command("n")),
+        "approved" => {
+            let _ = decision_mode;
+            Ok(ghostty_confirm_command())
+        }
+        other => Err(format!("unsupported_local_host_approval_decision {other}")),
+    }
+}
+
+fn send_local_codex_host_approval_decision(
+    approval: &LocalHostApprovalPrompt,
+    decision: &str,
+    decision_mode: Option<&str>,
+) -> Result<(), String> {
+    append_activity_card_diagnostics_log(&format!(
+        "[local-approval/respond] approvalId={} participantId={} decision={} decisionMode={} terminalSessionId={}",
+        truncate_local_codex_diagnostic(&approval.approval_id, 120),
+        truncate_local_codex_diagnostic(&approval.participant_id, 80),
+        decision,
+        decision_mode.unwrap_or("-"),
+        truncate_local_codex_diagnostic(&approval.terminal_session_id, 80)
+    ));
+    append_local_codex_approval_event(
+        "approval_transport_started",
+        Some(approval),
+        None,
+        Some(json!({
+            "decision": decision,
+            "decisionMode": decision_mode,
+            "terminalApp": approval.terminal_app.clone(),
+            "terminalSessionId": approval.terminal_session_id.clone(),
+            "transport": "ghostty"
+        })),
+    );
+
+    if !approval
+        .terminal_app
+        .to_ascii_lowercase()
+        .contains("ghostty")
+    {
+        let error = format!(
+            "unsupported_local_host_approval_terminal {}",
+            approval.terminal_app
+        );
+        append_local_codex_approval_event(
+            "approval_failed",
+            Some(approval),
+            None,
+            Some(json!({
+                "error": error,
+                "failureStage": "approval_transport_started"
+            })),
+        );
+        return Err(error);
+    }
+    if approval.terminal_session_id.trim().is_empty() {
+        let error = "missing_local_host_approval_terminal_session_id".to_string();
+        append_local_codex_approval_event(
+            "approval_failed",
+            Some(approval),
+            None,
+            Some(json!({
+                "error": error,
+                "failureStage": "approval_transport_started"
+            })),
+        );
+        return Err(error);
+    }
+
+    let approve_command = match local_codex_host_terminal_command(decision, decision_mode) {
+        Ok(command) => command,
+        Err(error) => {
+            append_local_codex_approval_event(
+                "approval_failed",
+                Some(approval),
+                None,
+                Some(json!({
+                    "error": error,
+                    "failureStage": "approval_transport_command"
+                })),
+            );
+            return Err(error);
+        }
+    };
+    let terminal_id = escape_applescript(&approval.terminal_session_id);
+    let project_path = escape_applescript(approval.project_path.as_deref().unwrap_or(""));
+    let script = format!(
+        r#"
+tell application "Ghostty"
+    set targetWindow to missing value
+    set targetTab to missing value
+    set targetTerminal to missing value
+    repeat with aWindow in windows
+        repeat with aTab in tabs of aWindow
+            repeat with aTerminal in terminals of aTab
+                if (id of aTerminal as text) is "{terminal_id}" then
+                    set targetWindow to aWindow
+                    set targetTab to aTab
+                    set targetTerminal to aTerminal
+                    exit repeat
+                end if
+            end repeat
+            if targetTerminal is not missing value then exit repeat
+        end repeat
+        if targetTerminal is not missing value then exit repeat
+    end repeat
+    if targetTerminal is missing value and "{project_path}" is not "" then
+        repeat with aWindow in windows
+            repeat with aTab in tabs of aWindow
+                repeat with aTerminal in terminals of aTab
+                    if (working directory of aTerminal as text) is "{project_path}" then
+                        set targetWindow to aWindow
+                        set targetTab to aTab
+                        set targetTerminal to aTerminal
+                        exit repeat
+                    end if
+                end repeat
+                if targetTerminal is not missing value then exit repeat
+            end repeat
+            if targetTerminal is not missing value then exit repeat
+        end repeat
+    end if
+    if targetTerminal is missing value then return "missing-terminal"
+    activate
+    set targetTerminalID to (id of targetTerminal as text)
+    set focusMatched to false
+    repeat 4 times
+        activate window targetWindow
+        delay 0.05
+        select tab targetTab
+        delay 0.05
+        focus targetTerminal
+        delay 0.08
+        try
+            if (id of focused terminal of selected tab of front window as text) is targetTerminalID then
+                set focusMatched to true
+                exit repeat
+            end if
+        end try
+    end repeat
+    if focusMatched is false then return "focus-mismatch"
+    {approve_command}
+    return "sent"
+end tell
+"#
+    );
+
+    let result = match execute_osascript(&script) {
+        Ok(result) => result,
+        Err(error) => {
+            append_local_codex_approval_event(
+                "approval_failed",
+                Some(approval),
+                None,
+                Some(json!({
+                    "error": error,
+                    "failureStage": "approval_transport_osascript"
+                })),
+            );
+            return Err(error);
+        }
+    };
+    append_activity_card_diagnostics_log(&format!(
+        "[local-approval/respond-result] approvalId={} result={}",
+        truncate_local_codex_diagnostic(&approval.approval_id, 120),
+        truncate_local_codex_diagnostic(&result, 80)
+    ));
+    append_local_codex_approval_event(
+        "ghostty_input_sent",
+        Some(approval),
+        None,
+        Some(json!({
+            "transport": "ghostty",
+            "transportResult": result.clone()
+        })),
+    );
+    if result == "missing-terminal" {
+        let error = "missing_local_host_approval_terminal".to_string();
+        append_local_codex_approval_event(
+            "approval_failed",
+            Some(approval),
+            None,
+            Some(json!({
+                "error": error,
+                "failureStage": "approval_transport_result"
+            })),
+        );
+        return Err(error);
+    }
+    if result == "focus-mismatch" {
+        let error = "local_host_approval_terminal_focus_mismatch".to_string();
+        append_local_codex_approval_event(
+            "approval_failed",
+            Some(approval),
+            None,
+            Some(json!({
+                "error": error,
+                "failureStage": "approval_transport_result"
+            })),
+        );
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+async fn post_broker_approval_response(
+    broker_url: &str,
+    input: &BrokerApprovalResponsePayload,
+) -> Result<(), String> {
+    let url = format!(
+        "{}/approvals/{}/respond",
+        broker_url.trim_end_matches('/'),
+        urlencoding::encode(&input.approval_id)
+    );
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&json!({
+            "taskId": input.task_id,
+            "fromParticipantId": input.from_participant_id,
+            "decision": input.decision,
+            "decisionMode": input.decision_mode,
+            "nativeDecision": input.native_decision,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("broker_approval_failed {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "broker_approval_failed {}",
+            response.status().as_u16()
+        ));
+    }
+
+    Ok(())
+}
+
+async fn resolve_matching_codex_hook_approvals(
+    broker_url: &str,
+    approval: &LocalHostApprovalPrompt,
+    input: &BrokerApprovalResponsePayload,
+) -> Result<(), String> {
+    let events = load_all_replay_events(broker_url).await?;
+    let items = value_items(events, "items")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let matches = find_matching_codex_hook_approvals(&items, approval);
+    for (approval_id, task_id) in &matches {
+        let hook_response = BrokerApprovalResponsePayload {
+            approval_id: approval_id.clone(),
+            task_id: task_id.clone(),
+            from_participant_id: input.from_participant_id.clone(),
+            decision: input.decision.clone(),
+            decision_mode: input.decision_mode.clone(),
+            native_decision: input.native_decision.clone(),
+        };
+        post_broker_approval_response(broker_url, &hook_response).await?;
+    }
+    append_local_codex_approval_event(
+        "approval_response_mirrored",
+        Some(approval),
+        Some(input),
+        Some(json!({
+            "mirroredApprovalCount": matches.len(),
+            "mirrorTransport": "broker"
+        })),
+    );
+
+    Ok(())
+}
+
 fn heartbeat_error(heartbeat: &serde_json::Value) -> Option<String> {
     heartbeat
         .get("error")
@@ -320,7 +1834,10 @@ async fn collect_broker_runtime_status(
     ))
 }
 
-pub(crate) async fn broker_get_json(broker_url: &str, path: &str) -> Result<serde_json::Value, String> {
+pub(crate) async fn broker_get_json(
+    broker_url: &str,
+    path: &str,
+) -> Result<serde_json::Value, String> {
     let url = format!("{}{}", broker_url.trim_end_matches('/'), path);
     let response = reqwest::get(&url)
         .await
@@ -432,7 +1949,10 @@ fn merge_participants_with_presence(participants: Value, presence: Value) -> Val
                 continue;
             };
             object.insert("presence".to_string(), json!(status));
-            if let Some(metadata) = presence_metadata_by_participant.get(&participant_id).cloned() {
+            if let Some(metadata) = presence_metadata_by_participant
+                .get(&participant_id)
+                .cloned()
+            {
                 object.insert("presenceMetadata".to_string(), metadata);
             }
         }
@@ -453,7 +1973,10 @@ fn filter_events_for_project_participants(events: Value, participants: &Value) -
                 .map(str::to_string)
         })
         .collect();
-    let all_events = value_items(events, "items").as_array().cloned().unwrap_or_default();
+    let all_events = value_items(events, "items")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let mut project_approval_ids = HashSet::new();
     let mut project_approval_task_ids = HashSet::new();
 
@@ -548,7 +2071,7 @@ pub async fn load_broker_service_seed(
         "participants": merge_participants_with_presence(participants, presence),
         "workStates": value_items(work_states, "items"),
         "events": value_items(events, "items"),
-        "approvals": []
+        "approvals": Value::Array(vec![])
     }))
 }
 
@@ -638,29 +2161,103 @@ pub async fn respond_to_broker_approval(
     input: BrokerApprovalResponsePayload,
 ) -> Result<(), String> {
     let broker_url = broker_url.unwrap_or_else(|| "http://127.0.0.1:4318".to_string());
-    let url = format!(
-        "{}/approvals/{}/respond",
-        broker_url.trim_end_matches('/'),
-        urlencoding::encode(&input.approval_id)
+    append_approval_response_event(
+        "approval_response_posted",
+        &input,
+        Some(json!({
+            "transport": "broker"
+        })),
     );
-    let response = reqwest::Client::new()
-        .post(url)
-        .json(&json!({
-            "taskId": input.task_id,
-            "fromParticipantId": input.from_participant_id,
-            "decision": input.decision,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("broker_approval_failed {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!(
-            "broker_approval_failed {}",
-            response.status().as_u16()
-        ));
+    match post_broker_approval_response(&broker_url, &input).await {
+        Ok(()) => {
+            append_approval_response_event(
+                "approval_response_delivered",
+                &input,
+                Some(json!({
+                    "transport": "broker"
+                })),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            append_approval_response_event(
+                "approval_failed",
+                &input,
+                Some(json!({
+                    "error": error,
+                    "failureStage": "approval_response_delivered",
+                    "transport": "broker"
+                })),
+            );
+            Err(error)
+        }
     }
+}
 
+#[tauri::command]
+pub async fn respond_to_local_host_approval(
+    broker_url: Option<String>,
+    input: BrokerApprovalResponsePayload,
+) -> Result<(), String> {
+    append_activity_card_diagnostics_log(&format!(
+        "[local-approval/command] approvalId={} taskId={} decision={} decisionMode={}",
+        truncate_local_codex_diagnostic(&input.approval_id, 120),
+        truncate_local_codex_diagnostic(&input.task_id, 120),
+        truncate_local_codex_diagnostic(&input.decision, 40),
+        truncate_local_codex_diagnostic(input.decision_mode.as_deref().unwrap_or("-"), 40)
+    ));
+    append_approval_response_event(
+        "approval_command_received",
+        &input,
+        Some(json!({
+            "transport": "local-host"
+        })),
+    );
+
+    let approval = match load_local_host_approvals()
+        .into_iter()
+        .find(|approval| approval.approval_id == input.approval_id)
+    {
+        Some(approval) => approval,
+        None => {
+            let error = format!("local_host_approval_not_found {}", input.approval_id);
+            append_approval_response_event(
+                "approval_failed",
+                &input,
+                Some(json!({
+                    "error": error,
+                    "failureStage": "approval_lookup",
+                    "transport": "local-host"
+                })),
+            );
+            return Err(error);
+        }
+    };
+    append_local_codex_approval_event("approval_loaded", Some(&approval), Some(&input), None);
+
+    send_local_codex_host_approval_decision(&approval, &input.decision, input.decision_mode.as_deref())?;
+    remember_recent_local_codex_resolution(&approval);
+    append_local_codex_approval_event(
+        "approval_response_delivered",
+        Some(&approval),
+        Some(&input),
+        Some(json!({
+            "transport": "local-host"
+        })),
+    );
+
+    let broker_url = broker_url.unwrap_or_else(|| "http://127.0.0.1:4318".to_string());
+    if let Err(error) = resolve_matching_codex_hook_approvals(&broker_url, &approval, &input).await {
+        append_local_codex_approval_event(
+            "approval_failed",
+            Some(&approval),
+            Some(&input),
+            Some(json!({
+                "error": error,
+                "failureStage": "approval_response_mirrored"
+            })),
+        );
+    }
     Ok(())
 }
 
@@ -809,8 +2406,7 @@ async fn fetch_latest_broker_release_via_redirect(
     let version = tag.trim_start_matches('v').to_string();
     let download_url = format!(
         "https://codeload.github.com/{}/tar.gz/refs/tags/{}",
-        INTENT_BROKER_REPO,
-        tag
+        INTENT_BROKER_REPO, tag
     );
 
     maybe_log(
@@ -1114,7 +2710,8 @@ pub async fn restart_broker_runtime(app: AppHandle) -> Result<BrokerRuntimeStatu
             let runtime_paths = resolve_broker_runtime_paths(&installed_path);
             if broker_health_ok(broker_url).await {
                 if let Err(error) =
-                    stop_running_broker(log_path.as_path(), broker_url, &runtime_paths.heartbeat).await
+                    stop_running_broker(log_path.as_path(), broker_url, &runtime_paths.heartbeat)
+                        .await
                 {
                     append_bootstrap_log(
                         log_path.as_path(),
@@ -1565,10 +3162,7 @@ mod tests {
             info.download_url,
             "https://api.github.com/repos/kaisersong/intent-broker/tarball/v0.2.1"
         );
-        assert_eq!(
-            info.release_notes.as_deref(),
-            Some("Hook approval release")
-        );
+        assert_eq!(info.release_notes.as_deref(), Some("Hook approval release"));
     }
 
     #[test]
@@ -1622,10 +3216,19 @@ mod tests {
             .expect("events");
 
         assert_eq!(calls.lock().expect("calls").as_slice(), &[0, 100]);
-        let items = value_items(events, "items").as_array().cloned().expect("array");
+        let items = value_items(events, "items")
+            .as_array()
+            .cloned()
+            .expect("array");
         assert_eq!(items.len(), 101);
-        assert_eq!(items.first(), Some(&json!({ "eventId": 1, "kind": "report_progress" })));
-        assert_eq!(items.last(), Some(&json!({ "eventId": 101, "kind": "ask_clarification" })));
+        assert_eq!(
+            items.first(),
+            Some(&json!({ "eventId": 1, "kind": "report_progress" }))
+        );
+        assert_eq!(
+            items.last(),
+            Some(&json!({ "eventId": 101, "kind": "ask_clarification" }))
+        );
     }
 
     #[test]
@@ -1732,6 +3335,572 @@ mod tests {
                     }
                 }
             ])
+        );
+    }
+
+    #[test]
+    fn collect_pending_local_codex_approval_calls_keeps_only_unresolved_require_escalated_calls() {
+        let tail = r#"
+{"timestamp":"2026-04-22T06:46:03.464Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\",\"workdir\":\"/Users/song/projects/hexdeck/src-tauri\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Allow Cargo to run tests?\"}","call_id":"call_pending"}}
+{"timestamp":"2026-04-22T06:46:04.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"npm test\",\"workdir\":\"/Users/song/projects/hexdeck\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Allow npm to run tests?\"}","call_id":"call_resolved"}}
+{"timestamp":"2026-04-22T06:46:05.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_resolved","output":"ok"}}
+"#;
+
+        let approvals = collect_pending_local_codex_approval_calls(
+            tail.trim(),
+            Some("/Users/song/projects/hexdeck"),
+        );
+
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].call_id, "call_pending");
+        assert_eq!(approvals[0].command, "cargo test");
+        assert_eq!(
+            approvals[0].workdir,
+            "/Users/song/projects/hexdeck/src-tauri"
+        );
+        assert_eq!(approvals[0].justification, "Allow Cargo to run tests?");
+    }
+
+    #[test]
+    fn filter_and_sort_local_host_approvals_keeps_recent_items_newest_first() {
+        let now_ms = 1_776_900_000_000;
+        let approvals = vec![
+            LocalHostApprovalPrompt {
+                approval_id: "hexdeck-local-codex-host-old".to_string(),
+                task_id: "local-host-approval-old".to_string(),
+                thread_id: "local-host-thread-old".to_string(),
+                participant_id: "codex-session-old".to_string(),
+                session_id: "session-old".to_string(),
+                summary: "old".to_string(),
+                detail_text: "".to_string(),
+                command_title: "Codex".to_string(),
+                command_line: "mkdir /tmp/old".to_string(),
+                command_preview: "/Users/song/projects/hexdeck".to_string(),
+                terminal_app: "Ghostty".to_string(),
+                terminal_session_id: "ghostty-old".to_string(),
+                runtime_source: None,
+                project_path: Some("/Users/song/projects/hexdeck".to_string()),
+                transcript_path: PathBuf::from("/tmp/old.jsonl"),
+                call_id: "call_old".to_string(),
+                sort_key_ms: now_ms - 5_000,
+            },
+            LocalHostApprovalPrompt {
+                approval_id: "hexdeck-local-codex-host-new".to_string(),
+                task_id: "local-host-approval-new".to_string(),
+                thread_id: "local-host-thread-new".to_string(),
+                participant_id: "codex-session-new".to_string(),
+                session_id: "session-new".to_string(),
+                summary: "new".to_string(),
+                detail_text: "".to_string(),
+                command_title: "Codex".to_string(),
+                command_line: "mkdir /tmp/new".to_string(),
+                command_preview: "/Users/song/projects/hexdeck".to_string(),
+                terminal_app: "Ghostty".to_string(),
+                terminal_session_id: "ghostty-new".to_string(),
+                runtime_source: None,
+                project_path: Some("/Users/song/projects/hexdeck".to_string()),
+                transcript_path: PathBuf::from("/tmp/new.jsonl"),
+                call_id: "call_new".to_string(),
+                sort_key_ms: now_ms - 1_000,
+            },
+        ];
+
+        let filtered = filter_and_sort_local_host_approvals(approvals, now_ms);
+
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].approval_id, "hexdeck-local-codex-host-new");
+        assert_eq!(filtered[1].approval_id, "hexdeck-local-codex-host-old");
+    }
+
+    #[test]
+    fn filter_and_sort_local_host_approvals_drops_stale_items() {
+        let now_ms = 1_776_900_000_000;
+        let approvals = vec![
+            LocalHostApprovalPrompt {
+                approval_id: "hexdeck-local-codex-host-stale".to_string(),
+                task_id: "local-host-approval-stale".to_string(),
+                thread_id: "local-host-thread-stale".to_string(),
+                participant_id: "codex-session-stale".to_string(),
+                session_id: "session-stale".to_string(),
+                summary: "stale".to_string(),
+                detail_text: "".to_string(),
+                command_title: "Codex".to_string(),
+                command_line: "mkdir /tmp/stale".to_string(),
+                command_preview: "/Users/song/projects/hexdeck".to_string(),
+                terminal_app: "Ghostty".to_string(),
+                terminal_session_id: "ghostty-stale".to_string(),
+                runtime_source: None,
+                project_path: Some("/Users/song/projects/hexdeck".to_string()),
+                transcript_path: PathBuf::from("/tmp/stale.jsonl"),
+                call_id: "call_stale".to_string(),
+                sort_key_ms: now_ms - LOCAL_CODEX_APPROVAL_MAX_AGE_MS - 1,
+            },
+            LocalHostApprovalPrompt {
+                approval_id: "hexdeck-local-codex-host-fresh".to_string(),
+                task_id: "local-host-approval-fresh".to_string(),
+                thread_id: "local-host-thread-fresh".to_string(),
+                participant_id: "codex-session-fresh".to_string(),
+                session_id: "session-fresh".to_string(),
+                summary: "fresh".to_string(),
+                detail_text: "".to_string(),
+                command_title: "Codex".to_string(),
+                command_line: "mkdir /tmp/fresh".to_string(),
+                command_preview: "/Users/song/projects/hexdeck".to_string(),
+                terminal_app: "Ghostty".to_string(),
+                terminal_session_id: "ghostty-fresh".to_string(),
+                runtime_source: None,
+                project_path: Some("/Users/song/projects/hexdeck".to_string()),
+                transcript_path: PathBuf::from("/tmp/fresh.jsonl"),
+                call_id: "call_fresh".to_string(),
+                sort_key_ms: now_ms - LOCAL_CODEX_APPROVAL_MAX_AGE_MS + 1,
+            },
+        ];
+
+        let filtered = filter_and_sort_local_host_approvals(approvals, now_ms);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].approval_id, "hexdeck-local-codex-host-fresh");
+    }
+
+    #[test]
+    fn local_host_approval_to_json_uses_verified_codex_actions_and_omits_empty_detail_text() {
+        let approval = LocalHostApprovalPrompt {
+            approval_id: "hexdeck-local-codex-host-codex-session-1-call_1".to_string(),
+            task_id: "local-host-approval-codex-session-1-call_1".to_string(),
+            thread_id: "local-host-approval-codex-session-1".to_string(),
+            participant_id: "codex-session-1".to_string(),
+            session_id: "session-1".to_string(),
+            summary: "Do you want to allow this command?".to_string(),
+            detail_text: "".to_string(),
+            command_title: "Codex".to_string(),
+            command_line: "rm -f ~/Desktop/test.txt".to_string(),
+            command_preview: "/Users/song/projects/hexdeck".to_string(),
+            terminal_app: "Ghostty".to_string(),
+            terminal_session_id: "ghostty-1".to_string(),
+            runtime_source: Some("user-prompt-submit".to_string()),
+            project_path: Some("/Users/song/projects/hexdeck".to_string()),
+            transcript_path: PathBuf::from("/tmp/codex-session.jsonl"),
+            call_id: "call_1".to_string(),
+            sort_key_ms: 1,
+        };
+
+        let payload = local_host_approval_to_json(&approval);
+        let actions = payload
+            .get("actions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        assert_eq!(
+            actions,
+            vec![
+                json!({ "label": "Allow once", "decisionMode": "yes" }),
+                json!({ "label": "Reject", "decisionMode": "no" }),
+            ]
+        );
+        assert_eq!(
+            payload["body"]["localHostApproval"]["runtimeSource"],
+            json!("user-prompt-submit")
+        );
+        assert_eq!(
+            payload["body"]["localHostApproval"]["sessionId"],
+            json!("session-1")
+        );
+        assert!(payload.get("detailText").is_none());
+        assert!(payload
+            .get("body")
+            .and_then(Value::as_object)
+            .and_then(|body| body.get("detailText"))
+            .is_none());
+    }
+
+    #[test]
+    fn build_local_codex_approval_event_keeps_shared_identifiers() {
+        let approval = LocalHostApprovalPrompt {
+            approval_id: "hexdeck-local-codex-host-codex-session-1-call_1".to_string(),
+            task_id: "local-host-approval-codex-session-1-call_1".to_string(),
+            thread_id: "local-host-approval-codex-session-1".to_string(),
+            participant_id: "codex-session-1".to_string(),
+            session_id: "019dbb3a-1234".to_string(),
+            summary: "Do you want to allow this command?".to_string(),
+            detail_text: "".to_string(),
+            command_title: "Codex".to_string(),
+            command_line: "mkdir ~/Desktop/example".to_string(),
+            command_preview: "/Users/song/projects/hexdeck".to_string(),
+            terminal_app: "Ghostty".to_string(),
+            terminal_session_id: "ghostty-1".to_string(),
+            runtime_source: None,
+            project_path: Some("/Users/song/projects/hexdeck".to_string()),
+            transcript_path: PathBuf::from("/tmp/codex-session.jsonl"),
+            call_id: "call_1".to_string(),
+            sort_key_ms: 1,
+        };
+
+        let event = build_local_codex_approval_event(
+            "approval_detected",
+            Some(&approval),
+            None,
+            Some(json!({ "approvalCount": 1 })),
+        );
+
+        assert_eq!(event["kind"], json!("local_codex_approval"));
+        assert_eq!(event["stage"], json!("approval_detected"));
+        assert_eq!(event["approvalId"], json!(approval.approval_id));
+        assert_eq!(event["participantId"], json!(approval.participant_id));
+        assert_eq!(event["sessionId"], json!(approval.session_id));
+        assert_eq!(event["callId"], json!(approval.call_id));
+        assert_eq!(event["projectName"], json!("hexdeck"));
+        assert_eq!(event["approvalCount"], json!(1));
+    }
+
+    #[test]
+    fn parse_local_codex_approval_log_entry_extracts_require_escalated_exec_command() {
+        let body = concat!(
+            "session_loop{thread_id=019db354-9e87-7e73-8a40-b6a9d503a8bc}: ",
+            "ToolCall: exec_command ",
+            "{\"cmd\":\"touch ~/Desktop/hexdeck-approval-visible-20260422.txt\",",
+            "\"workdir\":\"/Users/song/projects/hexdeck\",",
+            "\"yield_time_ms\":1000,",
+            "\"max_output_tokens\":2000,",
+            "\"sandbox_permissions\":\"require_escalated\",",
+            "\"justification\":\"Allow Desktop touch?\"}",
+            " thread_id=019db354-9e87-7e73-8a40-b6a9d503a8bc"
+        );
+
+        let entry = parse_local_codex_approval_log_entry(
+            42,
+            1_776_853_075,
+            "019db354-9e87-7e73-8a40-b6a9d503a8bc",
+            body,
+        )
+        .expect("expected log-backed approval entry");
+
+        assert_eq!(entry.log_id, 42);
+        assert_eq!(
+            entry.command,
+            "touch ~/Desktop/hexdeck-approval-visible-20260422.txt"
+        );
+        assert_eq!(entry.workdir, "/Users/song/projects/hexdeck");
+        assert_eq!(entry.justification, "Allow Desktop touch?");
+        assert_eq!(entry.created_at_ms, 1_776_853_075_000);
+    }
+
+    #[test]
+    fn local_codex_runtime_state_accepts_terminal_session_id_alias() {
+        let runtime: LocalCodexRuntimeState = serde_json::from_str(
+            r#"{
+                "status": "running",
+                "sessionId": "019db354-9e87-7e73-8a40-b6a9d503a8bc",
+                "terminalApp": "Ghostty",
+                "projectPath": "/Users/song/projects/hexdeck",
+                "terminalSessionID": "DFCFDE26-762E-4742-9E9C-5DBC2CEACA5C",
+                "updatedAt": "2026-04-23T05:30:07.330Z"
+            }"#,
+        )
+        .expect("expected runtime json to deserialize");
+
+        assert_eq!(
+            runtime.terminal_session_id.as_deref(),
+            Some("DFCFDE26-762E-4742-9E9C-5DBC2CEACA5C")
+        );
+        assert!(is_supported_local_codex_runtime(&runtime));
+    }
+
+    #[test]
+    fn merge_log_backed_local_host_approvals_keeps_recent_log_only_when_transcript_has_not_caught_up(
+    ) {
+        let runtime = LocalCodexRuntimeState {
+            source: Some("user-prompt-submit".to_string()),
+            status: Some("running".to_string()),
+            session_id: Some("019db354-9e87-7e73-8a40-b6a9d503a8bc".to_string()),
+            terminal_app: Some("Ghostty".to_string()),
+            project_path: Some("/Users/song/projects/hexdeck".to_string()),
+            terminal_session_id: Some("ghostty-1".to_string()),
+            updated_at: Some("2026-04-22T10:18:23.831Z".to_string()),
+        };
+        let approvals = merge_log_backed_local_host_approvals(
+            "codex-session-019db354",
+            &runtime,
+            Path::new("/tmp/codex-session.jsonl"),
+            &[PendingLocalCodexApprovalLogEntry {
+                log_id: 42,
+                command: "touch ~/Desktop/hexdeck-approval-visible-20260422.txt".to_string(),
+                workdir: "/Users/song/projects/hexdeck".to_string(),
+                justification: "Allow Desktop touch?".to_string(),
+                created_at_ms: 1_776_853_075_000,
+            }],
+            &[],
+            &[],
+            &HashSet::new(),
+        );
+
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(
+            approvals[0].approval_id,
+            "hexdeck-local-codex-host-codex-session-019db354-log-42"
+        );
+        assert_eq!(
+            approvals[0].command_line,
+            "touch ~/Desktop/hexdeck-approval-visible-20260422.txt"
+        );
+        assert_eq!(approvals[0].summary, "Allow Desktop touch?");
+    }
+
+    #[test]
+    fn merge_log_backed_local_host_approvals_skips_duplicate_when_transcript_pending_exists() {
+        let runtime = LocalCodexRuntimeState {
+            source: Some("user-prompt-submit".to_string()),
+            status: Some("running".to_string()),
+            session_id: Some("019db354-9e87-7e73-8a40-b6a9d503a8bc".to_string()),
+            terminal_app: Some("Ghostty".to_string()),
+            project_path: Some("/Users/song/projects/hexdeck".to_string()),
+            terminal_session_id: Some("ghostty-1".to_string()),
+            updated_at: Some("2026-04-22T10:18:23.831Z".to_string()),
+        };
+        let approvals = merge_log_backed_local_host_approvals(
+            "codex-session-019db354",
+            &runtime,
+            Path::new("/tmp/codex-session.jsonl"),
+            &[PendingLocalCodexApprovalLogEntry {
+                log_id: 42,
+                command: "touch ~/Desktop/hexdeck-approval-visible-20260422.txt".to_string(),
+                workdir: "/Users/song/projects/hexdeck".to_string(),
+                justification: "Allow Desktop touch?".to_string(),
+                created_at_ms: 1_776_853_075_000,
+            }],
+            &[PendingLocalCodexApprovalCall {
+                call_id: "call_pending".to_string(),
+                command: "touch ~/Desktop/hexdeck-approval-visible-20260422.txt".to_string(),
+                workdir: "/Users/song/projects/hexdeck".to_string(),
+                justification: "Allow Desktop touch?".to_string(),
+                created_at: Some("2026-04-22T10:17:55.057Z".to_string()),
+            }],
+            &[],
+            &HashSet::new(),
+        );
+
+        assert!(approvals.is_empty());
+    }
+
+    #[test]
+    fn merge_log_backed_local_host_approvals_skips_recently_resolved_fingerprints() {
+        let runtime = LocalCodexRuntimeState {
+            source: Some("user-prompt-submit".to_string()),
+            status: Some("running".to_string()),
+            session_id: Some("019db354-9e87-7e73-8a40-b6a9d503a8bc".to_string()),
+            terminal_app: Some("Ghostty".to_string()),
+            project_path: Some("/Users/song/projects/hexdeck".to_string()),
+            terminal_session_id: Some("ghostty-1".to_string()),
+            updated_at: Some("2026-04-22T10:18:23.831Z".to_string()),
+        };
+        let mut recent = HashSet::new();
+        recent.insert(
+            approval_fingerprint(
+                Some("codex-session-019db354"),
+                Some("touch ~/Desktop/hexdeck-approval-visible-20260422.txt"),
+                Some("/Users/song/projects/hexdeck"),
+            )
+            .expect("expected approval fingerprint"),
+        );
+
+        let approvals = merge_log_backed_local_host_approvals(
+            "codex-session-019db354",
+            &runtime,
+            Path::new("/tmp/codex-session.jsonl"),
+            &[PendingLocalCodexApprovalLogEntry {
+                log_id: 42,
+                command: "touch ~/Desktop/hexdeck-approval-visible-20260422.txt".to_string(),
+                workdir: "/Users/song/projects/hexdeck".to_string(),
+                justification: "Allow Desktop touch?".to_string(),
+                created_at_ms: 1_776_853_075_000,
+            }],
+            &[],
+            &[],
+            &recent,
+        );
+
+        assert!(approvals.is_empty());
+    }
+
+    #[test]
+    fn merge_log_backed_local_host_approvals_matches_resolved_transcript_when_log_workdir_is_empty() {
+        let runtime = LocalCodexRuntimeState {
+            source: Some("user-prompt-submit".to_string()),
+            status: Some("running".to_string()),
+            session_id: Some("019db9bc-af6e-79d0-85ae-ec0693f71d16".to_string()),
+            terminal_app: Some("Ghostty".to_string()),
+            project_path: Some("/Users/song/projects/hexdeck".to_string()),
+            terminal_session_id: Some("ghostty-1".to_string()),
+            updated_at: Some("2026-04-23T10:11:18.802Z".to_string()),
+        };
+
+        let approvals = merge_log_backed_local_host_approvals(
+            "codex-session-019db9bc",
+            &runtime,
+            Path::new("/tmp/codex-session.jsonl"),
+            &[PendingLocalCodexApprovalLogEntry {
+                log_id: 16839635,
+                command: "mkdir ~/Desktop/hexdeck-codex-approval-check-210260431-x".to_string(),
+                workdir: "".to_string(),
+                justification: "Do you want to create the requested folder on your Desktop?"
+                    .to_string(),
+                created_at_ms: 1_776_939_082_000,
+            }],
+            &[],
+            &[PendingLocalCodexApprovalCall {
+                call_id: "call_CbSYMBOwNL7RChU7onx5t7QF".to_string(),
+                command: "mkdir ~/Desktop/hexdeck-codex-approval-check-210260431-x".to_string(),
+                workdir: "/Users/song/projects/hexdeck".to_string(),
+                justification: "Do you want to create the requested folder on your Desktop?"
+                    .to_string(),
+                created_at: Some("2026-04-23T10:11:22.974Z".to_string()),
+            }],
+            &HashSet::new(),
+        );
+
+        assert!(approvals.is_empty());
+    }
+
+    #[test]
+    fn suppress_recently_resolved_local_host_approvals_skips_transcript_backed_items() {
+        let approval = LocalHostApprovalPrompt {
+            approval_id: "hexdeck-local-codex-host-codex-session-1-call_1".to_string(),
+            task_id: "local-host-approval-codex-session-1-call_1".to_string(),
+            thread_id: "local-host-approval-codex-session-1".to_string(),
+            participant_id: "codex-session-1".to_string(),
+            session_id: "session-1".to_string(),
+            summary: "Do you want to allow this command?".to_string(),
+            detail_text: "".to_string(),
+            command_title: "Codex".to_string(),
+            command_line: "mkdir ~/Desktop/example".to_string(),
+            command_preview: "/Users/song/projects/hexdeck".to_string(),
+            terminal_app: "Ghostty".to_string(),
+            terminal_session_id: "ghostty-1".to_string(),
+            runtime_source: None,
+            project_path: Some("/Users/song/projects/hexdeck".to_string()),
+            transcript_path: PathBuf::from("/tmp/codex-session.jsonl"),
+            call_id: "call_1".to_string(),
+            sort_key_ms: 1_776_853_075_000,
+        };
+        let mut recent = HashSet::new();
+        recent.insert(
+            approval_fingerprint(
+                Some("codex-session-1"),
+                Some("mkdir ~/Desktop/example"),
+                Some("/Users/song/projects/hexdeck"),
+            )
+            .expect("expected approval fingerprint"),
+        );
+
+        let approvals =
+            suppress_recently_resolved_local_host_approvals(vec![approval], &recent);
+
+        assert!(approvals.is_empty());
+    }
+
+    #[test]
+    fn find_matching_codex_hook_approvals_matches_only_unresolved_duplicates() {
+        let approval = LocalHostApprovalPrompt {
+            approval_id: "hexdeck-local-codex-host-codex-session-1-call_1".to_string(),
+            task_id: "local-host-approval-codex-session-1-call_1".to_string(),
+            thread_id: "local-host-approval-codex-session-1".to_string(),
+            participant_id: "codex-session-1".to_string(),
+            session_id: "session-1".to_string(),
+            summary: "Do you want to allow this command?".to_string(),
+            detail_text: "".to_string(),
+            command_title: "Codex".to_string(),
+            command_line: "rm -f ~/Desktop/test.txt".to_string(),
+            command_preview: "/Users/song/projects/hexdeck".to_string(),
+            terminal_app: "Ghostty".to_string(),
+            terminal_session_id: "ghostty-1".to_string(),
+            runtime_source: None,
+            project_path: Some("/Users/song/projects/hexdeck".to_string()),
+            transcript_path: PathBuf::from("/tmp/codex-session.jsonl"),
+            call_id: "call_1".to_string(),
+            sort_key_ms: 1,
+        };
+        let events = vec![
+            json!({
+                "eventId": 1,
+                "kind": "request_approval",
+                "taskId": "hook-task-1",
+                "payload": {
+                    "approvalId": "hook-approval-1",
+                    "participantId": "codex-session-1",
+                    "delivery": { "source": "codex-hook-approval" },
+                    "nativeHookApproval": { "agentTool": "codex" },
+                    "body": {
+                        "summary": "Codex needs approval to run Bash.",
+                        "commandLine": "rm -f ~/Desktop/test.txt",
+                        "commandPreview": "/Users/song/projects/hexdeck"
+                    }
+                }
+            }),
+            json!({
+                "eventId": 2,
+                "kind": "request_approval",
+                "taskId": "hook-task-2",
+                "payload": {
+                    "approvalId": "hook-approval-2",
+                    "participantId": "codex-session-1",
+                    "delivery": { "source": "codex-hook-approval" },
+                    "nativeHookApproval": { "agentTool": "codex" },
+                    "body": {
+                        "summary": "Codex needs approval to run Bash.",
+                        "commandLine": "mkdir -p /tmp/example",
+                        "commandPreview": "/Users/song/projects/hexdeck"
+                    }
+                }
+            }),
+            json!({
+                "eventId": 3,
+                "kind": "respond_approval",
+                "taskId": "hook-task-1",
+                "payload": {
+                    "approvalId": "hook-approval-1",
+                    "participantId": "human.local",
+                    "decision": "approved"
+                }
+            }),
+            json!({
+                "eventId": 4,
+                "kind": "request_approval",
+                "taskId": "hook-task-3",
+                "payload": {
+                    "approvalId": "hook-approval-3",
+                    "participantId": "codex-session-1",
+                    "delivery": { "source": "codex-hook-approval" },
+                    "nativeHookApproval": { "agentTool": "codex" },
+                    "body": {
+                        "summary": "Codex needs approval to run Bash.",
+                        "commandLine": "rm -f ~/Desktop/test.txt",
+                        "commandPreview": "/Users/song/projects/hexdeck"
+                    }
+                }
+            }),
+        ];
+
+        let matches = find_matching_codex_hook_approvals(&events, &approval);
+
+        assert_eq!(
+            matches,
+            vec![("hook-approval-3".to_string(), "hook-task-3".to_string())]
+        );
+    }
+
+    #[test]
+    fn local_codex_host_terminal_command_uses_verified_codex_shortcuts() {
+        assert_eq!(
+            local_codex_host_terminal_command("approved", Some("always")).unwrap(),
+            "input text linefeed to targetTerminal"
+        );
+        assert_eq!(
+            local_codex_host_terminal_command("approved", Some("yes")).unwrap(),
+            "input text linefeed to targetTerminal"
+        );
+        assert_eq!(
+            local_codex_host_terminal_command("denied", None).unwrap(),
+            "send key \"n\" action press to targetTerminal\n    delay 0.02\n    send key \"n\" action release to targetTerminal"
         );
     }
 }

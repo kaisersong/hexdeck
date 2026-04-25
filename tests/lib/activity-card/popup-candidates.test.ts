@@ -91,4 +91,23 @@ describe('selectPopupSessionCards', () => {
 
     expect(cards.map((card) => card.cardId)).toEqual(['approval:1', 'completion:newer']);
   });
+
+  it('keeps newer approvals ahead of older approvals when they carry createdAtMs', () => {
+    const nowMs = 1_000_000;
+    const cards = selectPopupSessionCards(
+      [
+        {
+          ...makeApproval('approval:older'),
+          createdAtMs: nowMs - 20_000,
+        },
+        {
+          ...makeApproval('approval:newer'),
+          createdAtMs: nowMs - 5_000,
+        },
+      ],
+      nowMs,
+    );
+
+    expect(cards.map((card) => card.cardId)).toEqual(['approval:newer', 'approval:older']);
+  });
 });

@@ -7,8 +7,12 @@ export type ActivityCardPriority = 'critical' | 'attention' | 'ambient';
 
 export type ActivityCardApprovalActionMode = 'action';
 export interface ActivityCardApprovalAction {
+  key?: string;
   label: string;
   decisionMode: BrokerApprovalDecisionMode;
+  nativeDecision?: unknown;
+  disabled?: boolean;
+  unsupportedReason?: string | null;
 }
 
 export type ActivityCardQuestionSelectionMode = 'single-select';

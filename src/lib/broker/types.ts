@@ -50,12 +50,17 @@ export interface BrokerApprovalItem {
   approvalId: string;
   taskId: string;
   threadId?: string;
+  createdAt?: string;
   summary?: string;
-  decision?: 'approved' | 'denied' | 'pending';
+  decision?: 'approved' | 'denied' | 'cancelled' | 'pending';
   participantId?: string;
   actions?: Array<{
+    key?: string;
     label?: string;
     decisionMode?: BrokerApprovalDecisionMode;
+    nativeDecision?: unknown;
+    disabled?: boolean;
+    unsupportedReason?: string | null;
   }>;
   detailText?: string;
   commandTitle?: string;
@@ -64,14 +69,15 @@ export interface BrokerApprovalItem {
   body?: Record<string, unknown>;
 }
 
-export type BrokerApprovalDecisionMode = 'yes' | 'always' | 'no';
+export type BrokerApprovalDecisionMode = 'yes' | 'always' | 'no' | 'cancel';
 
 export interface BrokerApprovalResponseInput {
   approvalId: string;
   taskId: string;
   fromParticipantId: string;
-  decision: 'approved' | 'denied';
+  decision: 'approved' | 'denied' | 'cancelled';
   decisionMode?: BrokerApprovalDecisionMode;
+  nativeDecision?: unknown;
 }
 
 export interface BrokerClarificationAnswerInput {

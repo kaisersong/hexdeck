@@ -328,11 +328,71 @@
     flex-direction: column;
     align-items: flex-start;
   }
+
+  .settings-runtime-grid,
+  .settings-shortcut-row {
+    grid-template-columns: 1fr;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .settings-inline-save {
+    margin-left: 0;
+    width: 100%;
+  }
 }
 
 /* Settings Panel */
 .settings-panel {
   display: grid;
+  gap: 18px;
+}
+
+.settings-runtime-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.settings-form {
+  display: grid;
+  gap: 12px;
+}
+
+.settings-shortcut-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 16px;
+}
+
+.settings-field {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settings-field--grow {
+  flex: 1 1 auto;
+}
+
+.settings-field span {
+  font-size: 0.72rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.settings-inline-save {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.settings-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.settings-actions--spread {
   gap: 18px;
 }
 
@@ -1352,6 +1412,12 @@
   background: linear-gradient(180deg, #4a4a51, #36363c);
   color: rgba(247, 245, 240, 0.94);
   border-color: rgba(255, 255, 255, 0.16);
+}
+
+.floating-card .action-button--cancel {
+  background: linear-gradient(180deg, #6a4d6b, #523852);
+  color: rgba(255, 241, 252, 0.94);
+  border-color: rgba(235, 195, 237, 0.2);
 }
 
 .floating-card .action-button--question {

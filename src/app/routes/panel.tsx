@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { dedupeActivelyPresentParticipants, isParticipantActivelyPresent } from '../../lib/broker/liveness';
 import type { BrokerParticipant } from '../../lib/broker/types';
 import { buildJumpTarget } from '../../lib/jump/targets';
 import type { JumpTarget } from '../../lib/jump/types';
@@ -49,24 +50,14 @@ function toStateLabel(workState?: string): string {
   return workState ?? 'idle';
 }
 
-function isParticipantOnline(participant: BrokerParticipant, nowByParticipant: Map<string, AgentCardProjection>): boolean {
-  if (participant.presence === 'online') {
-    return true;
-  }
-
-  if (participant.presence === 'offline') {
-    return false;
-  }
-
-  return nowByParticipant.has(participant.participantId);
-}
-
 function buildProjectGroups(
   participants: BrokerParticipant[],
   currentProject: string,
   now: AgentCardProjection[]
 ): MenuGroups {
-  const agentParticipants = participants.filter(
+  const activeWorkStateParticipantIds = new Set(now.map((item) => item.participantId));
+  const dedupedParticipants = dedupeActivelyPresentParticipants(participants, activeWorkStateParticipantIds);
+  const agentParticipants = dedupedParticipants.filter(
     (participant) => participant.kind !== 'human' && participant.kind !== 'adapter'
   );
   const normalizedCurrentProject = currentProject.trim();
@@ -114,7 +105,7 @@ function buildProjectGroups(
   for (const participant of agentParticipants) {
     const groupName = participant.context?.projectName ?? currentProjectKey;
     const currentState = nowByParticipant.get(participant.participantId);
-    const isOnline = isParticipantOnline(participant, nowByParticipant);
+    const isOnline = isParticipantActivelyPresent(participant, activeWorkStateParticipantIds);
     const stateLabel = toStateLabel(currentState?.workState);
     const stateTone = toStateTone(currentState?.workState);
     const currentJumpTarget = currentState?.jumpTarget

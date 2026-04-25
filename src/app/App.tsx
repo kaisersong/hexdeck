@@ -8,11 +8,14 @@ import {
 } from '../lib/broker/runtime';
 import type {
   BrokerApprovalDecisionMode,
+  BrokerApprovalItem,
+  BrokerEvent,
   BrokerApprovalResponseInput,
   BrokerClarificationAnswerInput,
   BrokerParticipant,
   ProjectSeed,
 } from '../lib/broker/types';
+import { dedupeActivelyPresentParticipants, isParticipantActivelyPresent } from '../lib/broker/liveness';
 import type { JumpTarget } from '../lib/jump/types';
 import { buildActivityCardsFromSeed } from '../lib/activity-card/projections';
 import { selectPopupSessionCards } from '../lib/activity-card/popup-candidates';
@@ -24,7 +27,6 @@ import {
 } from '../lib/activity-card/popup-session';
 import type { ProjectSnapshotProjection } from '../lib/projections/types';
 import { buildProjectSnapshot } from '../lib/projections/project-snapshot';
-import { getCapabilityStatus } from '../lib/platform/capabilities';
 import { jumpToTarget } from '../lib/platform/jump';
 import { registerShortcut } from '../lib/platform/shortcut';
 import {
@@ -37,7 +39,7 @@ import { useAppStore } from '../lib/store/use-app-store';
 import { ensureBrokerReady } from '../lib/update/broker-updater';
 import { DragDemoRoute } from './routes/drag-demo';
 import { ActivityCardRoute, type ActivityCardDebugInfo } from './routes/activity-card';
-import { ExpandedRoute, type ExpandedSection } from './routes/expanded';
+import { ExpandedRoute } from './routes/expanded';
 import { PanelRoute } from './routes/panel';
 import '../styles/tokens.css';
 import '../styles/panel.css';
@@ -67,14 +69,6 @@ function getWindowMode(): 'panel' | 'expanded' | 'drag-demo' | 'activity-card' {
   return 'panel';
 }
 
-function getExpandedSection(): ExpandedSection {
-  if (typeof window === 'undefined') {
-    return 'overview';
-  }
-
-  return new URLSearchParams(window.location.search).get('section') === 'settings' ? 'settings' : 'overview';
-}
-
 function getActivityCardPreviewMode(): string | null {
   if (typeof window === 'undefined') {
     return null;
@@ -98,13 +92,201 @@ function getActivityCardProjectOverride(): string | null {
   return matchedProject ? decodeURIComponent(matchedProject).trim() || null : null;
 }
 
+function normalizeProjectIdentity(project: string | null | undefined): string | null {
+  const normalized = project?.trim().toLowerCase();
+  return normalized ? normalized : null;
+}
+
+function basenameFromPath(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const parts = trimmed.split(/[\\/]/).filter(Boolean);
+  return parts.at(-1) ?? null;
+}
+
+function isLocalCodexHostApprovalItem(approval: BrokerApprovalItem): boolean {
+  const body = approval.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return false;
+  }
+
+  const delivery = (body as Record<string, unknown>).delivery;
+  if (!delivery || typeof delivery !== 'object' || Array.isArray(delivery)) {
+    return false;
+  }
+
+  return (delivery as Record<string, unknown>).source === 'hexdeck-local-host-approval';
+}
+
+function isQueuedContextLocalApproval(approval: BrokerApprovalItem): boolean {
+  const body = approval.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return false;
+  }
+
+  const localHostApproval = (body as Record<string, unknown>).localHostApproval;
+  if (!localHostApproval || typeof localHostApproval !== 'object' || Array.isArray(localHostApproval)) {
+    return false;
+  }
+
+  return (localHostApproval as Record<string, unknown>).runtimeSource === 'queued-context';
+}
+
+function extractLocalApprovalProjectName(approval: BrokerApprovalItem): string | null {
+  const body = approval.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return null;
+  }
+
+  const localHostApproval = (body as Record<string, unknown>).localHostApproval;
+  if (!localHostApproval || typeof localHostApproval !== 'object' || Array.isArray(localHostApproval)) {
+    return null;
+  }
+
+  const projectPath = (localHostApproval as Record<string, unknown>).projectPath;
+  return typeof projectPath === 'string' ? basenameFromPath(projectPath) : null;
+}
+
+function shouldSuppressQueuedContextLocalApprovalForProject(
+  approval: BrokerApprovalItem,
+  currentProject: string
+): boolean {
+  if (!isLocalCodexHostApprovalItem(approval) || !isQueuedContextLocalApproval(approval)) {
+    return false;
+  }
+
+  const normalizedCurrentProject = normalizeProjectIdentity(currentProject);
+  if (!normalizedCurrentProject || normalizedCurrentProject === ALL_AGENTS_PROJECT) {
+    return false;
+  }
+
+  const approvalProject = normalizeProjectIdentity(extractLocalApprovalProjectName(approval));
+  return approvalProject !== null && approvalProject !== normalizedCurrentProject;
+}
+
+function filterPopupScopedLocalApprovals(seed: ProjectSeed, currentProject: string): ProjectSeed {
+  const suppressedApprovals = seed.approvals.filter((approval) => (
+    shouldSuppressQueuedContextLocalApprovalForProject(approval, currentProject)
+  ));
+  if (suppressedApprovals.length === 0) {
+    return seed;
+  }
+
+  const suppressedApprovalIds = new Set(suppressedApprovals.map((approval) => approval.approvalId));
+  const suppressedCallKeys = new Set(
+    suppressedApprovals
+      .map((approval) => buildQueuedContextApprovalCallKeyFromApproval(approval))
+      .filter((value): value is string => Boolean(value))
+  );
+
+  return {
+    ...seed,
+    approvals: seed.approvals.filter((approval) => !suppressedApprovalIds.has(approval.approvalId)),
+    events: seed.events.filter((event) => !isSuppressedQueuedContextNativeApprovalEvent(event, suppressedCallKeys)),
+  };
+}
+
+function buildQueuedContextApprovalCallKeyFromApproval(approval: BrokerApprovalItem): string | null {
+  const participantId = typeof approval.participantId === 'string' && approval.participantId.trim()
+    ? approval.participantId.trim()
+    : null;
+  const body = approval.body;
+  if (!participantId || !body || typeof body !== 'object' || Array.isArray(body)) {
+    return null;
+  }
+
+  const localHostApproval = (body as Record<string, unknown>).localHostApproval;
+  if (!localHostApproval || typeof localHostApproval !== 'object' || Array.isArray(localHostApproval)) {
+    return null;
+  }
+
+  const callId = (localHostApproval as Record<string, unknown>).callId;
+  return typeof callId === 'string' && callId.trim()
+    ? `${participantId}\u0000${callId.trim()}`
+    : null;
+}
+
+function buildQueuedContextApprovalCallKeyFromEvent(event: BrokerEvent): string | null {
+  const payload = event.payload;
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return null;
+  }
+
+  const participantId = typeof payload.participantId === 'string' && payload.participantId.trim()
+    ? payload.participantId.trim()
+    : typeof event.fromParticipantId === 'string' && event.fromParticipantId.trim()
+      ? event.fromParticipantId.trim()
+      : null;
+  if (!participantId) {
+    return null;
+  }
+
+  const nativeCodexApproval = payload.nativeCodexApproval;
+  if (!nativeCodexApproval || typeof nativeCodexApproval !== 'object' || Array.isArray(nativeCodexApproval)) {
+    return null;
+  }
+
+  const callId = (nativeCodexApproval as Record<string, unknown>).callId;
+  return typeof callId === 'string' && callId.trim()
+    ? `${participantId}\u0000${callId.trim()}`
+    : null;
+}
+
+function isBrokerOwnedCodexNativeApprovalEvent(event: BrokerEvent): boolean {
+  if (event.type !== 'request_approval') {
+    return false;
+  }
+
+  const payload = event.payload;
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return false;
+  }
+
+  const delivery = payload.delivery;
+  if (delivery && typeof delivery === 'object' && !Array.isArray(delivery)) {
+    const source = (delivery as Record<string, unknown>).source;
+    if (source === 'codex-native-approval') {
+      return true;
+    }
+  }
+
+  if (payload.nativeCodexApproval && typeof payload.nativeCodexApproval === 'object' && !Array.isArray(payload.nativeCodexApproval)) {
+    return true;
+  }
+
+  return (typeof payload.approvalId === 'string' && payload.approvalId.startsWith('codex-native-call_'))
+    || (typeof event.taskId === 'string' && event.taskId.startsWith('codex-native-call_'));
+}
+
+function isSuppressedQueuedContextNativeApprovalEvent(
+  event: BrokerEvent,
+  suppressedCallKeys: ReadonlySet<string>
+): boolean {
+  if (suppressedCallKeys.size === 0 || !isBrokerOwnedCodexNativeApprovalEvent(event)) {
+    return false;
+  }
+
+  const callKey = buildQueuedContextApprovalCallKeyFromEvent(event);
+  return callKey !== null && suppressedCallKeys.has(callKey);
+}
+
 async function debugLogActivityCardFrontend(message: string): Promise<void> {
   if (typeof window === 'undefined') {
     return;
   }
 
+  if (!('__TAURI_INTERNALS__' in window)) {
+    return;
+  }
+
   const params = new URLSearchParams(window.location.search);
-  const debugEnabled = params.has('debugLive') || params.get('debug') === 'activity-card';
+  const isActivityCardWindow = params.get('view') === 'activity-card';
+  const debugEnabled = isActivityCardWindow
+    || params.has('debugLive')
+    || params.get('debug') === 'activity-card';
   if (!debugEnabled) {
     return;
   }
@@ -117,12 +299,42 @@ async function debugLogActivityCardFrontend(message: string): Promise<void> {
   }
 }
 
+function debugErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
+}
+
+async function debugLogApprovalFlowEvent(event: Record<string, unknown>): Promise<void> {
+  await debugLogActivityCardFrontend(JSON.stringify({
+    kind: 'approval_flow',
+    source: 'frontend',
+    ...event,
+  }));
+}
+
+async function readCurrentWindowVisibleState(): Promise<boolean | null> {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  try {
+    const { getCurrentWindow } = await import('@tauri-apps/api/window');
+    return await getCurrentWindow().isVisible();
+  } catch {
+    return null;
+  }
+}
+
 function buildEmptySnapshot(participants: BrokerParticipant[], brokerHealthy = false): ProjectSnapshotProjection {
+  const dedupedParticipants = dedupeActivelyPresentParticipants(participants);
   return {
     overview: {
       brokerHealthy,
-      onlineCount: participants.filter(
-        (participant) => participant.presence === 'online' && isAgentParticipant(participant)
+      onlineCount: dedupedParticipants.filter(
+        (participant) => isAgentParticipant(participant) && isParticipantActivelyPresent(participant)
       ).length,
       busyCount: 0,
       blockedCount: 0,
@@ -159,6 +371,8 @@ const BOOTSTRAP_EPHEMERAL_CARD_FRESHNESS_MS = {
   question: 60_000,
   completion: 300_000,
 } as const;
+const ACTIVITY_CARD_LOCAL_APPROVAL_EVENT = 'activity-card-local-approval-requested';
+const ACTIVITY_CARD_REFRESH_EVENT = 'activity-card-refresh-requested';
 
 function isBootstrapActivityCardFresh(card: ActivityCardProjection, nowMs: number): boolean {
   if (card.kind === 'approval') {
@@ -189,6 +403,7 @@ export type AppActivityApprovalAction = {
   approvalId: string;
   taskId?: string;
   decisionMode: BrokerApprovalDecisionMode;
+  nativeDecision?: unknown;
 };
 
 export type AppActivityQuestionAction = {
@@ -245,8 +460,13 @@ export async function dispatchActivityCardAction(
       approvalId: action.approvalId,
       taskId: action.taskId,
       fromParticipantId,
-      decision: action.decisionMode === 'no' ? 'denied' : 'approved',
+      decision: action.decisionMode === 'no'
+        ? 'denied'
+        : action.decisionMode === 'cancel'
+          ? 'cancelled'
+          : 'approved',
       decisionMode: action.decisionMode,
+      nativeDecision: action.nativeDecision,
     });
     return;
   }
@@ -268,15 +488,17 @@ export function App() {
   const isExpandedWindow = windowMode === 'expanded';
   const isDragDemoWindow = windowMode === 'drag-demo';
   const store = useAppStore();
-  const capabilities = getCapabilityStatus();
   const [settings, setSettings] = useState(() => loadLocalSettings());
+  const activityCardProjectOverride = isActivityCardWindow ? getActivityCardProjectOverride() : null;
   const currentProjectSetting = isActivityCardWindow
-    ? getActivityCardProjectOverride() ?? ALL_AGENTS_PROJECT
+    ? activityCardProjectOverride ?? ALL_AGENTS_PROJECT
+    : settings.currentProject;
+  const popupApprovalProjectScope = isActivityCardWindow
+    ? activityCardProjectOverride ?? settings.currentProject
     : settings.currentProject;
   const [snapshot, setSnapshot] = useState<ProjectSnapshotProjection | null>(null);
   const [pendingApprovalIds, setPendingApprovalIds] = useState<Set<string>>(new Set());
   const [participants, setParticipants] = useState<BrokerParticipant[]>([]);
-  const [expandedSection, setExpandedSection] = useState<ExpandedSection>(getExpandedSection());
   const [connectionState, setConnectionState] = useState<'idle' | 'checking' | 'connected' | 'error'>('idle');
   const [connectionMessage, setConnectionMessage] = useState<string | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<BrokerRuntimeStatus | null>(null);
@@ -410,6 +632,7 @@ export function App() {
     const client = new BrokerClient({ brokerUrl: settings.brokerUrl });
     let refreshInFlight = false;
     let refreshQueued = false;
+    let disposeActivityCardRefresh: (() => void) | undefined;
 
     const refreshSnapshot = async () => {
       if (disposed) {
@@ -454,16 +677,17 @@ export function App() {
               setRuntimeStatus(null);
             }
 
-            const seed = await client.loadServiceSeed();
-            if (disposed) {
-              return;
-            }
+              const seed = await client.loadServiceSeed();
+              if (disposed) {
+                return;
+              }
 
-            const nowMs = Date.now();
-            const nextSnapshot = buildProjectSnapshot(seed);
-            const activitySeed = seed;
-            const activityCards = buildActivityCardsFromSeed(activitySeed);
-            await syncActivityCards(activitySeed, activityCards, nowMs);
+              const nowMs = Date.now();
+              const popupScopedSeed = filterPopupScopedLocalApprovals(seed, popupApprovalProjectScope);
+              const nextSnapshot = buildProjectSnapshot(seed);
+              const activitySeed = popupScopedSeed;
+              const activityCards = buildActivityCardsFromSeed(activitySeed);
+              await syncActivityCards(activitySeed, activityCards, nowMs);
             if (isActivityCardWindow) {
               const activeCard = store.getState().activityCards.activeCard;
               const latestEventId = activitySeed.events.reduce(
@@ -528,11 +752,43 @@ export function App() {
     };
 
     void refreshSnapshot();
+    if (isActivityCardWindow) {
+      void import('@tauri-apps/api/event')
+        .then(async ({ listen }) => {
+          const disposeRefresh = await listen<string>(ACTIVITY_CARD_REFRESH_EVENT, () => {
+            void refreshSnapshot();
+          });
+          const disposeLocalApproval = await listen<BrokerApprovalItem>(
+            ACTIVITY_CARD_LOCAL_APPROVAL_EVENT,
+            (event) => {
+              const approval = event.payload;
+              if (!approval || typeof approval !== 'object' || Array.isArray(approval)) {
+                return;
+              }
+              if (typeof approval.approvalId !== 'string' || !approval.approvalId.trim()) {
+                return;
+              }
+              void debugLogApprovalFlowEvent({
+                stage: 'approval_loaded',
+                approvalId: approval.approvalId,
+                participantId: approval.participantId ?? null,
+                taskId: approval.taskId ?? null,
+              });
+              void refreshSnapshot();
+            }
+          );
+          disposeActivityCardRefresh = () => {
+            disposeRefresh();
+            disposeLocalApproval();
+          };
+        })
+        .catch(() => undefined);
+    }
     const unsubscribe = isActivityCardWindow
       ? () => undefined
       : client.subscribe(() => {
-        void refreshSnapshot();
-      });
+          void refreshSnapshot();
+        });
     const disconnect = isActivityCardWindow ? () => undefined : client.connectRealtime();
     const intervalId = window.setInterval(() => {
       void refreshSnapshot();
@@ -540,23 +796,28 @@ export function App() {
     const handleFocus = () => {
       void refreshSnapshot();
     };
-    if (!isActivityCardWindow) {
-      window.addEventListener('focus', handleFocus);
-      document.addEventListener('visibilitychange', handleFocus);
-    }
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleFocus);
 
     return () => {
       disposed = true;
       allowImmediateEmptyActivityCardSyncRef.current = false;
+      disposeActivityCardRefresh?.();
       unsubscribe();
       disconnect();
       window.clearInterval(intervalId);
-      if (!isActivityCardWindow) {
-        window.removeEventListener('focus', handleFocus);
-        document.removeEventListener('visibilitychange', handleFocus);
-      }
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleFocus);
     };
-  }, [currentProjectSetting, isActivityCardPreviewWindow, isActivityCardWindow, reloadKey, settings.brokerUrl, store]);
+  }, [
+    currentProjectSetting,
+    isActivityCardPreviewWindow,
+    isActivityCardWindow,
+    popupApprovalProjectScope,
+    reloadKey,
+    settings.brokerUrl,
+    store
+  ]);
 
   useEffect(() => {
     if (isActivityCardPreviewWindow) {
@@ -612,20 +873,14 @@ export function App() {
         }
 
         store.dismissActivityCard(Date.now());
-        setActivityCardRenderKey((value) => value + 1);
         const nextActiveCard = store.getState().activityCards.activeCard;
         if (windowMode === 'activity-card') {
-          popupSessionRef.current = nextActiveCard
-            ? {
-                visibility: 'visible',
-                activeCard: nextActiveCard,
-                pendingLocalResolutionKey: null,
-              }
-            : createHiddenPopupSession();
-          setActivityCardWindowIntent(nextActiveCard ? 'keep' : 'hide');
+          dismissVisiblePopupBacklog();
+          void hideLiveActivityCardWindow();
           return;
         }
 
+        setActivityCardRenderKey((value) => value + 1);
         void syncActivityCardWindowVisibility(nextActiveCard, windowMode);
       }))
       .then((unlisten) => {
@@ -730,6 +985,33 @@ export function App() {
     await jumpToTarget(target);
   };
 
+  const dismissVisiblePopupBacklog = () => {
+    const activityCardState = store.getState().activityCards;
+    const visibleCards = activityCardState.activeCard
+      ? [activityCardState.activeCard, ...activityCardState.queue]
+      : activityCardState.queue;
+
+    if (visibleCards.length === 0) {
+      return;
+    }
+
+    store.primeActivityCards(visibleCards);
+  };
+
+  const hideLiveActivityCardWindow = async () => {
+    allowImmediateEmptyActivityCardSyncRef.current = false;
+    popupSessionRef.current = createHiddenPopupSession();
+    setActivityCardWindowIntent('hide');
+    setActivityCardRenderKey((value) => value + 1);
+
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      await Promise.resolve(invoke('hide_activity_card_window')).catch(() => undefined);
+    } catch {
+      // Ignore when not running in Tauri.
+    }
+  };
+
   const handleDismissActivityCard = async () => {
     if (isActivityCardPreviewWindow) {
       try {
@@ -744,26 +1026,16 @@ export function App() {
     const activeCardId = store.getState().activityCards.activeCard?.cardId ?? null;
     if (!activeCardId) {
       if (windowMode === 'activity-card') {
-        allowImmediateEmptyActivityCardSyncRef.current = false;
-        popupSessionRef.current = createHiddenPopupSession();
-        setActivityCardWindowIntent('hide');
+        await hideLiveActivityCardWindow();
       }
       return;
     }
 
     store.dismissActivityCard(Date.now());
-    setActivityCardRenderKey((value) => value + 1);
 
     if (windowMode === 'activity-card') {
-      const nextActiveCard = store.getState().activityCards.activeCard;
-      popupSessionRef.current = nextActiveCard
-        ? {
-            visibility: 'visible',
-            activeCard: nextActiveCard,
-            pendingLocalResolutionKey: null,
-          }
-        : createHiddenPopupSession();
-      setActivityCardWindowIntent(nextActiveCard ? 'keep' : 'hide');
+      dismissVisiblePopupBacklog();
+      await hideLiveActivityCardWindow();
 
       try {
         const [{ emit }] = await Promise.all([
@@ -786,12 +1058,39 @@ export function App() {
 
     const client = new BrokerClient({ brokerUrl: settings.brokerUrl });
     const activeCard = store.getState().activityCards.activeCard;
+    if (action.kind === 'approval' && windowMode === 'activity-card') {
+      const windowVisible = await readCurrentWindowVisibleState();
+      if (windowVisible === false) {
+        void debugLogApprovalFlowEvent({
+          stage: 'approval_ignored_hidden_window',
+          approvalId: action.approvalId,
+          taskId: action.taskId ?? null,
+          decisionMode: action.decisionMode,
+          activeCardId: activeCard?.cardId ?? null,
+          participantId: activeCard?.participantId ?? null,
+        });
+        return;
+      }
+    }
+
     if (action.kind === 'approval') {
       store.startApprovalAction(action.approvalId);
       setPendingApprovalIds(new Set(store.getState().pendingApprovalIds));
     }
 
     try {
+      if (action.kind === 'approval') {
+        void debugLogApprovalFlowEvent({
+          stage: 'approval_clicked',
+          approvalId: action.approvalId,
+          taskId: action.taskId ?? null,
+          decisionMode: action.decisionMode,
+          nativeDecision: action.nativeDecision ?? null,
+          activeCardId: activeCard?.cardId ?? null,
+          participantId: activeCard?.participantId ?? null,
+        });
+      }
+
       if (windowMode === 'activity-card' && activeCard) {
         popupSessionRef.current = markPopupSessionLocalAction(
           popupSessionRef.current,
@@ -802,6 +1101,15 @@ export function App() {
       }
 
       await dispatchActivityCardAction(client, action);
+      if (action.kind === 'approval') {
+        void debugLogApprovalFlowEvent({
+          stage: 'approval_response_posted',
+          approvalId: action.approvalId,
+          taskId: action.taskId ?? null,
+          decisionMode: action.decisionMode,
+          nativeDecision: action.nativeDecision ?? null,
+        });
+      }
 
       if (action.kind === 'question') {
         store.dismissActivityCard(Date.now());
@@ -815,6 +1123,26 @@ export function App() {
       store.setSnapshot(nextSnapshot);
       setSnapshot(nextSnapshot);
       setParticipants(seed.participants);
+      if (action.kind === 'approval') {
+        void debugLogApprovalFlowEvent({
+          stage: 'approval_refresh_synced',
+          approvalId: action.approvalId,
+          taskId: action.taskId ?? null,
+          participantCount: seed.participants.length,
+          approvalCount: seed.approvals.length,
+        });
+      }
+    } catch (error) {
+      if (action.kind === 'approval') {
+        void debugLogApprovalFlowEvent({
+          stage: 'approval_failed',
+          approvalId: action.approvalId,
+          taskId: action.taskId ?? null,
+          decisionMode: action.decisionMode,
+          error: debugErrorMessage(error),
+        });
+      }
+      throw error;
     } finally {
       if (action.kind === 'approval') {
         store.finishApprovalAction(action.approvalId);
@@ -823,27 +1151,8 @@ export function App() {
     }
   };
 
-  const updateExpandedHistory = (section: ExpandedSection) => {
-    if (typeof window === 'undefined' || !isExpandedWindow) {
-      return;
-    }
-
-    const next = new URLSearchParams(window.location.search);
-    next.set('view', 'expanded');
-    next.set('section', section);
-    window.history.replaceState({}, '', `${window.location.pathname}?${next.toString()}`);
-  };
-
-  const handleExpandedSectionChange = (section: ExpandedSection) => {
-    setExpandedSection(section);
-    updateExpandedHistory(section);
-  };
-
-  const openExpandedWindow = async (section: ExpandedSection) => {
-    setExpandedSection(section);
-
+  const openExpandedWindow = async () => {
     if (isExpandedWindow) {
-      updateExpandedHistory(section);
       return;
     }
 
@@ -852,7 +1161,7 @@ export function App() {
         import('@tauri-apps/api/core'),
         import('@tauri-apps/api/window'),
       ]);
-      await invoke('open_expanded_window', { section });
+      await invoke('open_expanded_window', { section: 'settings' });
       await getCurrentWindow().hide();
     } catch {
       // Ignore when not running in Tauri.
@@ -947,11 +1256,12 @@ export function App() {
         debugInfo={activityCardDebugInfo}
         onDismiss={() => void handleDismissActivityCard()}
         onJump={handleJump}
-        onApprovalAction={(card, decisionMode) => void handleActivityCardAction({
+        onApprovalAction={(card, approvalAction) => void handleActivityCardAction({
           kind: 'approval',
           approvalId: card.approvalId,
           taskId: card.taskId,
-          decisionMode,
+          decisionMode: approvalAction.decisionMode,
+          nativeDecision: approvalAction.nativeDecision,
         })}
         onQuestionAction={(card, option) => {
           if (!card.participantId) {
@@ -977,35 +1287,11 @@ export function App() {
   if (isExpandedWindow) {
     return (
       <ExpandedRoute
-        section={expandedSection}
-        onSectionChange={handleExpandedSectionChange}
-        snapshot={snapshot}
-        participants={participants}
-        currentProject={settings.currentProject}
         globalShortcut={settings.globalShortcut}
-        connectionState={connectionState}
-        connectionMessage={connectionMessage}
         runtimeStatus={runtimeStatus}
         onSaveSettings={handleSaveSettings}
         onRefreshBroker={handleRefreshBroker}
         onRestartBroker={handleRestartBroker}
-        capabilities={capabilities}
-        pendingApprovalIds={pendingApprovalIds}
-        onJump={handleJump}
-        onApprove={(approvalId, taskId) => void handleActivityCardAction({
-          kind: 'approval',
-          approvalId,
-          taskId,
-          decisionMode: 'yes',
-        })}
-        onDeny={(approvalId, taskId) => void handleActivityCardAction({
-          kind: 'approval',
-          approvalId,
-          taskId,
-          decisionMode: 'no',
-        })}
-        onMinimize={() => void minimizeCurrentWindow()}
-        onClose={() => void closeCurrentWindow()}
       />
     );
   }
@@ -1022,7 +1308,7 @@ export function App() {
         currentProject={settings.currentProject}
         brokerLive={brokerLive}
         onJump={handleJump}
-        onOpenSettings={() => void openExpandedWindow('settings')}
+        onOpenSettings={() => void openExpandedWindow()}
         onMinimize={() => void minimizeCurrentWindow()}
         onClose={() => void hidePanelWindow()}
       />

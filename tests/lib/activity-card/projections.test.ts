@@ -424,6 +424,50 @@ describe('buildActivityCardsFromSeed', () => {
     }));
   });
 
+  it('suppresses stop-fallback completion cards while the same participant is still actively working', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'agent-1',
+          alias: 'codex39',
+          kind: 'agent',
+          tool: 'codex',
+          context: {
+            projectName: 'xiaok-cli',
+          },
+        },
+      ],
+      workStates: [
+        {
+          participantId: 'agent-1',
+          status: 'implementing',
+          summary: 'Still running follow-up work',
+        },
+      ],
+      events: [
+        {
+          id: 901,
+          type: 'report_progress',
+          taskId: 'task-stop-fallback',
+          threadId: 'thread-stop-fallback',
+          payload: {
+            participantId: 'agent-1',
+            stage: 'completed',
+            summary: '✅ Spec compliant',
+            delivery: {
+              semantic: 'informational',
+              source: 'stop-fallback',
+            },
+          },
+        },
+      ],
+      approvals: [],
+    });
+
+    expect(cards).toEqual([]);
+  });
+
   it('keeps long completion report content in the card body instead of the title', () => {
     const longSummary = [
       '修复已经构建到本地主目录的 dist 里了。',
@@ -775,11 +819,11 @@ describe('buildActivityCardsFromSeed', () => {
     expect(cards).toContainEqual(expect.objectContaining({
       kind: 'approval',
       approvalId: 'approval-event-3',
-      actions: [
-        { label: 'Run Bash', decisionMode: 'yes' },
-        { label: 'Always allow Bash', decisionMode: 'always' },
-        { label: 'Deny', decisionMode: 'no' },
-      ],
+      actions: expect.arrayContaining([
+        expect.objectContaining({ label: 'Run Bash', decisionMode: 'yes' }),
+        expect.objectContaining({ label: 'Always allow Bash', decisionMode: 'always' }),
+        expect.objectContaining({ label: 'Deny', decisionMode: 'no' }),
+      ]),
     }));
   });
 
@@ -825,17 +869,17 @@ describe('buildActivityCardsFromSeed', () => {
       summary: '删除文件',
       actorLabel: '@claude2',
       projectLabel: 'projects',
-      actions: [
-        { label: '确认删除', decisionMode: 'yes' },
-        { label: '取消', decisionMode: 'no' },
-      ],
+      actions: expect.arrayContaining([
+        expect.objectContaining({ label: '确认删除', decisionMode: 'yes' }),
+        expect.objectContaining({ label: '取消', decisionMode: 'no' }),
+      ]),
       detailText: '即将删除最新文件\n此操作不可逆',
       commandTitle: 'Delete',
       commandLine: 'rm /tmp/example.txt',
     }));
   });
 
-  it('suppresses generic codex hook approval cards from request_approval events', () => {
+  it('keeps mirrored codex hook approval cards from request_approval events', () => {
     const cards = buildActivityCardsFromSeed({
       health: { ok: true },
       participants: [
@@ -867,17 +911,137 @@ describe('buildActivityCardsFromSeed', () => {
             },
             body: {
               summary: 'Codex needs approval to run Bash.',
+              detailText: 'Mirrored from the live Codex PreToolUse hook. Approving this card lets the hook continue.',
+              commandTitle: 'Codex',
+              commandLine: 'mkdir -p /tmp/important-dir',
             },
+            actions: [
+              { label: '允许一次', decisionMode: 'yes' },
+              { label: '拒绝', decisionMode: 'no' },
+            ],
           },
         },
       ],
       approvals: [],
     });
 
-    expect(cards).toEqual([]);
+    expect(cards).toContainEqual(expect.objectContaining({
+      kind: 'approval',
+      approvalId: 'approval-codex-noise',
+      summary: 'Codex needs approval to run Bash.',
+      detailText: 'Mirrored from the live Codex PreToolUse hook. Approving this card lets the hook continue.',
+      commandTitle: 'Codex',
+      commandLine: 'mkdir -p /tmp/important-dir',
+      actorLabel: '@codex3',
+      projectLabel: 'xiaok-cli',
+      actions: expect.arrayContaining([
+        expect.objectContaining({ label: '允许一次', decisionMode: 'yes' }),
+        expect.objectContaining({ label: '拒绝', decisionMode: 'no' }),
+      ]),
+    }));
   });
 
-  it('suppresses codex native terminal approval cards so they do not block real agent popups', () => {
+  it('prefers broker-owned Codex hook approvals over local fallback approvals for the same command', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'agent-1',
+          alias: 'codex3',
+          kind: 'agent',
+          tool: 'Codex',
+          metadata: {
+            terminalApp: 'Ghostty',
+            terminalSessionID: 'ghostty-1',
+            projectPath: '/Users/song/projects/hexdeck',
+          },
+          context: {
+            projectName: 'HexDeck',
+          },
+        },
+      ],
+      workStates: [],
+      events: [
+        {
+          id: 553,
+          type: 'request_approval',
+          taskId: 'codex-hook-approval-task',
+          payload: {
+            approvalId: 'codex-hook-approval-1',
+            participantId: 'agent-1',
+            delivery: {
+              semantic: 'actionable',
+              source: 'codex-hook-approval',
+            },
+            nativeHookApproval: {
+              agentTool: 'codex',
+            },
+            body: {
+              summary: 'Codex needs approval to run Bash.',
+              detailText: 'Mirrored from the live Codex PreToolUse hook. Approving this card lets the hook continue.',
+              commandTitle: 'Codex',
+              commandLine: 'rm -f ~/Desktop/hexdeck-approval-smoke.txt',
+              commandPreview: '/Users/song/projects/hexdeck',
+            },
+            actions: [
+              { label: '允许一次', decisionMode: 'yes' },
+              { label: '拒绝', decisionMode: 'no' },
+            ],
+          },
+        },
+      ],
+      approvals: [
+        {
+          approvalId: 'hexdeck-local-codex-host-agent-1-call_1',
+          taskId: 'local-host-approval-agent-1-call_1',
+          threadId: 'local-host-approval-agent-1',
+          createdAt: '2026-04-22T10:17:55.057Z',
+          summary: 'Do you want to allow this command?',
+          decision: 'pending',
+          participantId: 'agent-1',
+          actions: [
+            { label: 'Allow once', decisionMode: 'yes' },
+            { label: 'Reject', decisionMode: 'no' },
+          ],
+          body: {
+            summary: 'Do you want to allow this command?',
+            commandTitle: 'Codex',
+            commandLine: 'rm -f ~/Desktop/hexdeck-approval-smoke.txt',
+            commandPreview: '/Users/song/projects/hexdeck',
+            participantId: 'agent-1',
+            localHostApproval: {
+              source: 'codex',
+              callId: 'call_1',
+              terminalApp: 'Ghostty',
+              terminalSessionId: 'ghostty-1',
+            },
+            delivery: {
+              semantic: 'actionable',
+              source: 'hexdeck-local-host-approval',
+            },
+          },
+        },
+      ],
+    });
+
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({
+      kind: 'approval',
+      approvalId: 'codex-hook-approval-1',
+      summary: 'Codex needs approval to run Bash.',
+      detailText: 'Mirrored from the live Codex PreToolUse hook. Approving this card lets the hook continue.',
+      commandTitle: 'Codex',
+      commandLine: 'rm -f ~/Desktop/hexdeck-approval-smoke.txt',
+      actorLabel: '@codex3',
+      projectLabel: 'HexDeck',
+      actions: [
+        { label: '允许一次', decisionMode: 'yes' },
+        { label: '拒绝', decisionMode: 'no' },
+      ],
+    });
+  });
+
+  it('keeps broker-owned codex native approval cards visible', () => {
     const cards = buildActivityCardsFromSeed({
       health: { ok: true },
       participants: [
@@ -930,8 +1094,16 @@ describe('buildActivityCardsFromSeed', () => {
       approvals: [],
     });
 
-    expect(cards).toHaveLength(1);
+    expect(cards).toHaveLength(2);
     expect(cards[0]).toMatchObject({
+      kind: 'approval',
+      approvalId: 'codex-native-call_approval-noise',
+      summary: expect.stringContaining('Do you want to let me stop the stalled npm smoke-test install'),
+      detailText: 'Mirrored from the live Codex terminal approval prompt.',
+      actorLabel: '@codex3',
+      projectLabel: 'xiaok-cli',
+    });
+    expect(cards[1]).toMatchObject({
       kind: 'question',
       cardId: 'question:5522',
     });
@@ -976,6 +1148,73 @@ describe('buildActivityCardsFromSeed', () => {
     });
 
     expect(cards).toEqual([]);
+  });
+
+  it('keeps local codex host approvals even when they use the generic codex approval summary', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'agent-1',
+          alias: 'codex3',
+          kind: 'agent',
+          tool: 'Codex',
+          metadata: {
+            terminalApp: 'Ghostty',
+            terminalSessionID: 'ghostty-1',
+            projectPath: '/Users/song/projects/hexdeck',
+          },
+          context: {
+            projectName: 'HexDeck',
+          },
+        },
+      ],
+      workStates: [],
+      events: [],
+      approvals: [
+        {
+          approvalId: 'hexdeck-local-codex-host-agent-1-call_generic',
+          taskId: 'local-host-approval-agent-1-call_generic',
+          threadId: 'local-host-approval-agent-1',
+          createdAt: '2026-04-23T06:30:00.000Z',
+          summary: 'Codex needs approval to run Bash.',
+          decision: 'pending',
+          participantId: 'agent-1',
+          actions: [
+            { label: 'Allow once', decisionMode: 'yes' },
+            { label: 'Reject', decisionMode: 'no' },
+          ],
+          body: {
+            summary: 'Codex needs approval to run Bash.',
+            commandTitle: 'Codex',
+            commandLine: 'mkdir ~/Desktop/hexdeck-codex-approval-check-20260423-generic',
+            commandPreview: '/Users/song/projects/hexdeck',
+            participantId: 'agent-1',
+            localHostApproval: {
+              source: 'codex',
+              callId: 'call_generic',
+              terminalApp: 'Ghostty',
+              terminalSessionId: 'ghostty-1',
+            },
+            delivery: {
+              semantic: 'actionable',
+              source: 'hexdeck-local-host-approval',
+            },
+          },
+        },
+      ],
+    });
+
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({
+      kind: 'approval',
+      approvalId: 'hexdeck-local-codex-host-agent-1-call_generic',
+      summary: 'Codex needs approval to run Bash.',
+      commandTitle: 'Codex',
+      commandLine: 'mkdir ~/Desktop/hexdeck-codex-approval-check-20260423-generic',
+      actorLabel: '@codex3',
+      projectLabel: 'HexDeck',
+    });
   });
 
   it('keeps codex approval cards when the summary is a real user-facing confirmation', () => {
@@ -1027,10 +1266,10 @@ describe('buildActivityCardsFromSeed', () => {
       approvalId: 'approval-codex-real',
       summary: '删除最新文件',
       detailText: '即将删除 workspace 目录下最新文件',
-      actions: [
-        { label: '确认删除', decisionMode: 'yes' },
-        { label: '取消', decisionMode: 'no' },
-      ],
+      actions: expect.arrayContaining([
+        expect.objectContaining({ label: '确认删除', decisionMode: 'yes' }),
+        expect.objectContaining({ label: '取消', decisionMode: 'no' }),
+      ]),
       actorLabel: '@codex3',
       projectLabel: 'xiaok-cli',
     }));

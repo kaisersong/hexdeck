@@ -1,4 +1,6 @@
+import { useRef } from 'react';
 import type {
+  ActivityCardApprovalAction,
   ActivityCardApprovalProjection,
   ActivityCardQuestionOption,
   ActivityCardProjection,
@@ -11,11 +13,45 @@ import { ActivityCardMarkdown } from './ActivityCardMarkdown';
 export interface FloatingActivityCardProps {
   card: ActivityCardProjection;
   pendingApprovalIds?: Set<string>;
-  onApprovalDecision?: (mode: BrokerApprovalDecisionMode) => void;
+  onApprovalDecision?: (action: ActivityCardApprovalAction) => void;
   onQuestionSelect?: (option: ActivityCardQuestionOption) => void;
   onDismiss?: () => void;
   onJump?: (target: JumpTarget) => void;
   onHoverChange?: (hovered: boolean) => void;
+}
+
+const APPROVAL_POINTER_GUARD_WINDOW_MS = 1500;
+
+function isLiveTauriActivityCardWindow(): boolean {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+
+  if (!('__TAURI_INTERNALS__' in window)) {
+    return false;
+  }
+
+  const params = new URLSearchParams(window.location.search);
+  return params.get('view') === 'activity-card' && !params.get('preview');
+}
+
+async function debugLogFloatingCardEvent(event: Record<string, unknown>): Promise<void> {
+  if (!isLiveTauriActivityCardWindow()) {
+    return;
+  }
+
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('debug_log_activity_card_frontend', {
+      message: JSON.stringify({
+        kind: 'approval_flow',
+        source: 'floating-card',
+        ...event,
+      }),
+    });
+  } catch {
+    // Ignore when not running in Tauri.
+  }
 }
 
 function normalizeCardText(value: string | undefined): string {
@@ -111,19 +147,85 @@ function ApprovalActions({
 }: {
   card: ActivityCardApprovalProjection;
   pendingApprovalIds?: Set<string>;
-  onApprovalDecision?: (mode: BrokerApprovalDecisionMode) => void;
+  onApprovalDecision?: (action: ActivityCardApprovalAction) => void;
 }) {
   const isPending = pendingApprovalIds?.has(card.approvalId) ?? false;
+  const pointerGuardEnabled = isLiveTauriActivityCardWindow();
+  const lastPointerIntentRef = useRef<{
+    decisionMode: BrokerApprovalDecisionMode;
+    atMs: number;
+  } | null>(null);
 
   return (
     <div className="floating-card__actions">
       {card.actions.map((action) => (
         <button
-          key={action.decisionMode}
+          key={action.key ?? `${action.decisionMode}:${action.label}`}
           type="button"
           className={`action-button action-button--${action.decisionMode}`}
-          disabled={isPending}
-          onClick={() => onApprovalDecision?.(action.decisionMode)}
+          disabled={isPending || Boolean(action.disabled)}
+          title={action.unsupportedReason ?? undefined}
+          onPointerDown={(event) => {
+            if (!pointerGuardEnabled) {
+              return;
+            }
+
+            void debugLogFloatingCardEvent({
+              stage: 'approval_button_pointerdown',
+              approvalId: card.approvalId,
+              taskId: card.taskId ?? null,
+              decisionMode: action.decisionMode,
+              pointerType: event.pointerType || null,
+              button: event.button,
+              buttons: event.buttons,
+              clientX: event.clientX,
+              clientY: event.clientY,
+              pageX: event.pageX,
+              pageY: event.pageY,
+              isPrimary: event.isPrimary,
+              detail: event.detail,
+            });
+
+            lastPointerIntentRef.current = {
+              decisionMode: action.decisionMode,
+              atMs: Date.now(),
+            };
+          }}
+          onClick={(event) => {
+            if (pointerGuardEnabled) {
+              const pointerIntent = lastPointerIntentRef.current;
+              const pointerIntentMatches = Boolean(
+                pointerIntent
+                  && pointerIntent.decisionMode === action.decisionMode
+                  && Date.now() - pointerIntent.atMs <= APPROVAL_POINTER_GUARD_WINDOW_MS
+              );
+              lastPointerIntentRef.current = null;
+
+              if (!pointerIntentMatches) {
+                void debugLogFloatingCardEvent({
+                  stage: 'approval_button_ignored_non_pointer',
+                  approvalId: card.approvalId,
+                  taskId: card.taskId ?? null,
+                  decisionMode: action.decisionMode,
+                });
+                return;
+              }
+            }
+
+            if (pointerGuardEnabled) {
+              void debugLogFloatingCardEvent({
+                stage: 'approval_button_click',
+                approvalId: card.approvalId,
+                taskId: card.taskId ?? null,
+                decisionMode: action.decisionMode,
+                detail: event.detail,
+                clientX: event.clientX,
+                clientY: event.clientY,
+              });
+            }
+
+            onApprovalDecision?.(action);
+          }}
         >
           {action.label}
         </button>
