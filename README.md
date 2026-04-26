@@ -44,4 +44,4 @@ npm run tauri:dev
 
 ## Version
 
-Current release target: `0.2.4`
+Current release target: `0.2.5`

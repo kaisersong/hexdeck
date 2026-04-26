@@ -2,14 +2,14 @@
 
 ## 当前发布版本
 
-- App version: `0.2.4`
-- Tag: `v0.2.4`
+- App version: `0.2.5`
+- Tag: `v0.2.5`
 
-## 0.2.4 发布要点
+## 0.2.5 发布要点
 
-- Windows 下本地 broker `node --experimental-sqlite src/cli.js` 改为隐藏后台启动，不再弹出 node shell 窗口
-- `npm install`、`taskkill` 等 broker 管理命令统一走后台启动模式，避免管理流程再带出控制台窗口
-- 保留此前本地审批、审批投影和 broker 启动稳定性修复，作为这一版安装包基线
+- 补上 `public/hexdeck-menu-tray.png`，修复 GitHub macOS release 构建因缺失 tray 资源而失败的问题
+- Windows 下本地 broker `node --experimental-sqlite src/cli.js` 继续保持隐藏后台启动，不再弹出 node shell 窗口
+- `npm install`、`taskkill` 等 broker 管理命令继续走后台启动模式，作为这一版安装包基线
 
 ## GitHub Secrets 配置
 
@@ -58,8 +58,8 @@ git push
 1. 更新版本号
 2. 创建 tag 并推送:
    ```bash
-   git tag v0.2.4
-   git push origin v0.2.4
+   git tag v0.2.5
+   git push origin v0.2.5
    ```
 
 3. GitHub Actions 会自动:
