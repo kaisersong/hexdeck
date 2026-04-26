@@ -38,12 +38,14 @@ jobs:
           cat > "$RUNNER_TEMP/hexdeck.key" <<'EOF'
           ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           EOF
+          encoded_key="$(base64 < "$RUNNER_TEMP/hexdeck.key" | tr -d '\n')"
+          echo "TAURI_SIGNING_PRIVATE_KEY=$encoded_key" >> "$GITHUB_ENV"
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY_PATH: ${{ runner.temp }}/hexdeck.key
+          TAURI_SIGNING_PRIVATE_KEY: ${{ env.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}

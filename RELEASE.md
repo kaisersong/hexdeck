@@ -2,12 +2,12 @@
 
 ## 当前发布版本
 
-- App version: `0.2.7`
-- Tag: `v0.2.7`
+- App version: `0.2.8`
+- Tag: `v0.2.8`
 
-## 0.2.7 发布要点
+## 0.2.8 发布要点
 
-- GitHub release workflow 改为通过 `TAURI_SIGNING_PRIVATE_KEY_PATH` 读取签名私钥文件，兼容当前仓库里保存的原始 key 内容 secret
+- GitHub release workflow 改为先将原始 signing key secret 落盘，再 base64 注入 `TAURI_SIGNING_PRIVATE_KEY`，贴合 Tauri build 的 updater 签名读取路径
 - 启用 Tauri bundle 与 updater 产物生成，修复 GitHub release workflow 缺少 `.app.tar.gz` / `.sig` 资产的问题
 - 补上 `public/hexdeck-menu-tray.png`，修复 GitHub macOS release 构建因缺失 tray 资源而失败的问题
 - Windows 下本地 broker `node --experimental-sqlite src/cli.js` 继续保持隐藏后台启动，不再弹出 node shell 窗口
@@ -59,8 +59,8 @@ git push
 1. 更新版本号
 2. 创建 tag 并推送:
    ```bash
-   git tag v0.2.7
-   git push origin v0.2.7
+   git tag v0.2.8
+   git push origin v0.2.8
    ```
 
 3. GitHub Actions 会自动:
