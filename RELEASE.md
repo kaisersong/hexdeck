@@ -2,16 +2,14 @@
 
 ## 当前发布版本
 
-- App version: `0.2.3`
-- Tag: `v0.2.3`
+- App version: `0.2.4`
+- Tag: `v0.2.4`
 
-## 0.2.3 发布要点
+## 0.2.4 发布要点
 
-- 修复本地 broker bootstrap 并发启动，避免多个窗口重复拉起 broker / app-server
-- 修复旧 replay 审批事件被误投影成可点击假卡片
-- 修复 broker 审批投影只看前 100 条事件导致新审批不弹出的问题
-- Windows 下 `Codex CLI` 本地审批改为优先写入目标 console，不再把 `y` 误发到 `Codex Desktop` 输入框
-- macOS Ghostty 本地审批链路保留，未被这次 Windows 修复破坏
+- Windows 下本地 broker `node --experimental-sqlite src/cli.js` 改为隐藏后台启动，不再弹出 node shell 窗口
+- `npm install`、`taskkill` 等 broker 管理命令统一走后台启动模式，避免管理流程再带出控制台窗口
+- 保留此前本地审批、审批投影和 broker 启动稳定性修复，作为这一版安装包基线
 
 ## GitHub Secrets 配置
 
@@ -60,8 +58,8 @@ git push
 1. 更新版本号
 2. 创建 tag 并推送:
    ```bash
-   git tag v0.2.3
-   git push origin v0.2.3
+   git tag v0.2.4
+   git push origin v0.2.4
    ```
 
 3. GitHub Actions 会自动:

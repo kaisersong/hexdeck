@@ -31,6 +31,8 @@ const LOCAL_CODEX_LOG_LOOKBACK_SECS: i64 = 10 * 60;
 const LOCAL_CODEX_RESOLUTION_SUPPRESSION_TTL_MS: i64 = 60_000;
 #[cfg(target_os = "windows")]
 const LOCAL_CODEX_WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(target_os = "windows")]
+const LOCAL_CODEX_WINDOWS_DETACHED_PROCESS: u32 = 0x0000_0008;
 
 static RECENT_LOCAL_CODEX_APPROVAL_RESOLUTIONS: LazyLock<Mutex<HashMap<String, i64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -588,6 +590,17 @@ fn build_node_path_env() -> String {
         Ok(path) => path.to_string_lossy().to_string(),
         Err(_) => env::var("PATH").unwrap_or_default(),
     }
+}
+
+fn apply_background_command_mode(command: &mut Command) -> &mut Command {
+    #[cfg(target_os = "windows")]
+    {
+        command.creation_flags(
+            LOCAL_CODEX_WINDOWS_CREATE_NO_WINDOW | LOCAL_CODEX_WINDOWS_DETACHED_PROCESS,
+        );
+    }
+
+    command
 }
 
 fn failed_start_result(
@@ -2974,10 +2987,13 @@ async fn stop_running_broker(
             .map_err(|e| format!("failed_to_stop_broker: {}", e))?;
 
         #[cfg(target_os = "windows")]
-        let status = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status()
-            .map_err(|e| format!("failed_to_stop_broker: {}", e))?;
+        let status = {
+            let mut command = Command::new("taskkill");
+            apply_background_command_mode(&mut command)
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .status()
+                .map_err(|e| format!("failed_to_stop_broker: {}", e))?
+        };
 
         if !status.success() {
             return Err(format!("failed_to_stop_broker_pid_{}", pid));
@@ -3213,7 +3229,8 @@ async fn ensure_broker_dependencies(
     );
 
     tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let output = Command::new(&npm_path)
+        let mut command = Command::new(&npm_path);
+        let output = apply_background_command_mode(&mut command)
             .arg("install")
             .arg("--omit=dev")
             .current_dir(&install_path)
@@ -3521,7 +3538,8 @@ async fn start_broker_internal(
         ),
     );
 
-    let child = Command::new(&node_path)
+    let mut command = Command::new(&node_path);
+    let child = apply_background_command_mode(&mut command)
         .arg("--experimental-sqlite")
         .arg("src/cli.js")
         .current_dir(&installed_path)
