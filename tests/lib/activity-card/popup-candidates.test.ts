@@ -110,4 +110,17 @@ describe('selectPopupSessionCards', () => {
 
     expect(cards.map((card) => card.cardId)).toEqual(['approval:newer', 'approval:older']);
   });
+
+  it('excludes non-popup cards from the live popup queue', () => {
+    const nowMs = 1_000_000;
+    const cards = selectPopupSessionCards(
+      [
+        { ...makeApproval('approval:hidden'), popupEligible: false },
+        makeApproval('approval:visible'),
+      ],
+      nowMs,
+    );
+
+    expect(cards.map((card) => card.cardId)).toEqual(['approval:visible']);
+  });
 });

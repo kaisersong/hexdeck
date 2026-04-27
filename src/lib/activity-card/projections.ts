@@ -410,6 +410,24 @@ function isMirroredCodexHookApproval(source: Record<string, unknown> | null | un
   return typeof agentTool === 'string' && agentTool.trim().toLowerCase() === 'codex';
 }
 
+function isMirroredAgentHookApproval(source: Record<string, unknown> | null | undefined): boolean {
+  const delivery = source?.delivery;
+  if (delivery && typeof delivery === 'object' && !Array.isArray(delivery)) {
+    const deliverySource = (delivery as Record<string, unknown>).source;
+    if (
+      deliverySource === 'codex-hook-approval'
+      || deliverySource === 'claude-code-hook-approval'
+      || deliverySource === 'xiaok-code-hook-approval'
+      || deliverySource === 'agent-hook-approval'
+    ) {
+      return true;
+    }
+  }
+
+  const nativeHookApproval = source?.nativeHookApproval;
+  return Boolean(nativeHookApproval && typeof nativeHookApproval === 'object' && !Array.isArray(nativeHookApproval));
+}
+
 function isLocalCodexHostApproval(source: Record<string, unknown> | null | undefined): boolean {
   const delivery = source?.delivery;
   if (delivery && typeof delivery === 'object' && !Array.isArray(delivery)) {
@@ -426,6 +444,49 @@ function isLocalCodexHostApproval(source: Record<string, unknown> | null | undef
 
   const localSource = (localHostApproval as Record<string, unknown>).source;
   return typeof localSource === 'string' && localSource.trim().toLowerCase() === 'codex';
+}
+
+function isInternalLocalToolApproval(source: Record<string, unknown> | null | undefined): boolean {
+  if (!source || !isLocalCodexHostApproval(source)) {
+    return false;
+  }
+
+  const body = readPayloadBody(source);
+  const summary = normalizeDisplayText(
+    readStringValue(body, ['summary']) ?? readStringValue(source, ['summary'])
+  )?.toLowerCase();
+  const commandLine = normalizeDisplayText(
+    readStringValue(body, ['commandLine', 'command']) ?? readStringValue(source, ['commandLine', 'command'])
+  )?.toLowerCase();
+
+  if (!summary) {
+    return false;
+  }
+
+  const hasToolStyleJustification = (
+    summary.includes('outside the sandbox')
+    || summary.includes('so i can ')
+    || summary.includes('rerunning ')
+    || summary.includes('running targeted ')
+    || summary.includes('verify the ')
+    || summary.includes('build the updated ')
+  );
+
+  if (!hasToolStyleJustification) {
+    return false;
+  }
+
+  if (!commandLine) {
+    return true;
+  }
+
+  return (
+    commandLine.includes('$targetdir = join-path')
+    || commandLine.includes('cargo test')
+    || commandLine.includes('cargo build')
+    || commandLine.includes('npm test')
+    || commandLine.includes('npm run build')
+  );
 }
 
 function buildApprovalFingerprint(
@@ -648,6 +709,8 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
       approval.approvalId,
       approval.taskId
     );
+    const popupEligible = !isMirroredAgentHookApproval(approvalBody ?? approvalRecord)
+      && !isInternalLocalToolApproval(approvalBody ?? approvalRecord);
     if (isSuppressedApprovalSummary(approvalSummary) && !isLocalHostApproval && !isBrokerOwnedApproval) {
       continue;
     }
@@ -684,6 +747,7 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
       decision: approval.decision === 'approved' || approval.decision === 'denied'
         ? approval.decision
         : 'pending',
+      popupEligible,
       actions: buildApprovalActions(approvalRecord),
       ...buildApprovalPresentation(approvalSummary, approvalRecord, approvalBody, approvalDisplay.detailText),
       participantId: approvalParticipantId,
@@ -713,6 +777,8 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
       const summary = approvalDisplay.summary;
       const approvalResolutionKey = getTaskThreadResolutionKey(event);
       const isBrokerOwnedApproval = isBrokerOwnedCodexApproval(payload, approvalId, taskId);
+      const popupEligible = !isMirroredAgentHookApproval(payload)
+        && !isInternalLocalToolApproval(payload);
       if (
         (isSuppressedApprovalSummary(summary) && !isBrokerOwnedApproval)
         || isSuppressedApprovalIdentity(approvalId, taskId)
@@ -732,6 +798,7 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
           approvalId,
           taskId,
           decision: 'pending',
+          popupEligible,
           actions: buildApprovalActions(payload),
           ...buildApprovalPresentation(summary, payload, body, approvalDisplay.detailText),
           participantId,

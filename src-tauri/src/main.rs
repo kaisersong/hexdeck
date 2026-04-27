@@ -198,6 +198,24 @@ fn activity_card_window_starts_visible_for(preview: Option<&str>) -> bool {
     matches!(preview, Some(value) if !value.trim().is_empty() && !value.trim().starts_with('&'))
 }
 
+#[cfg(target_os = "windows")]
+fn activity_card_window_bootstraps_offscreen_for(preview: Option<&str>) -> bool {
+    let _ = preview;
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+fn activity_card_window_bootstraps_offscreen_for(_preview: Option<&str>) -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn activity_card_window_focuses_on_show_for(preview: Option<&str>) -> bool {
+    let _ = preview;
+    true
+}
+
+#[cfg(not(target_os = "windows"))]
 fn activity_card_window_focuses_on_show_for(preview: Option<&str>) -> bool {
     activity_card_window_starts_visible_for(preview)
 }
@@ -206,6 +224,13 @@ fn activity_card_window_focuses_on_show() -> bool {
     activity_card_window_focuses_on_show_for(activity_card_preview_mode().as_deref())
 }
 
+#[cfg(target_os = "windows")]
+fn activity_card_window_focusable_for(preview: Option<&str>) -> bool {
+    let _ = preview;
+    true
+}
+
+#[cfg(not(target_os = "windows"))]
 fn activity_card_window_focusable_for(preview: Option<&str>) -> bool {
     activity_card_window_focuses_on_show_for(preview)
 }
@@ -527,14 +552,17 @@ fn ensure_activity_card_window(app: &tauri::AppHandle) -> tauri::Result<WebviewW
 
     let (width, height) = activity_card_window_size();
     let location = activity_card_window_location();
-    if activity_card_preview_mode().is_some() {
+    let preview = activity_card_preview_mode();
+    let starts_visible = activity_card_window_starts_visible_for(preview.as_deref());
+    let bootstrap_offscreen = activity_card_window_bootstraps_offscreen_for(preview.as_deref());
+    if preview.is_some() {
         eprintln!("[activity-card-preview] location: {location}");
     }
-    WebviewWindowBuilder::new(app, "activity-card", WebviewUrl::App(location.into()))
+    let mut builder = WebviewWindowBuilder::new(app, "activity-card", WebviewUrl::App(location.into()))
         .title("HexDeck Activity Card")
         .inner_size(width, height)
         .resizable(activity_card_window_resizable())
-        .visible(false)
+        .visible(starts_visible || bootstrap_offscreen)
         .accept_first_mouse(activity_card_window_accepts_first_mouse())
         .focusable(activity_card_window_focusable())
         .always_on_top(true)
@@ -542,6 +570,18 @@ fn ensure_activity_card_window(app: &tauri::AppHandle) -> tauri::Result<WebviewW
         .decorations(false)
         .skip_taskbar(true)
         .background_throttling(BackgroundThrottlingPolicy::Disabled)
+        .on_page_load(|window, payload| {
+            append_activity_card_diagnostics_log(&format!(
+                "[native/page-load] label={} event={:?} url={}",
+                window.label(),
+                payload.event(),
+                payload.url()
+            ));
+        });
+    if bootstrap_offscreen {
+        builder = builder.position(-20_000.0, -20_000.0);
+    }
+    builder
         .build()
         .inspect(|window| {
             if activity_card_preview_mode().is_some() {
@@ -705,6 +745,13 @@ fn should_emit_activity_card_refresh(prepare_event_id: Option<u64>) -> bool {
     prepare_event_id.is_some()
 }
 
+fn should_show_activity_card_window(
+    window_action: ActivityCardWatcherWindowAction,
+    prepare_succeeded: bool,
+) -> bool {
+    matches!(window_action, ActivityCardWatcherWindowAction::Prepare) && prepare_succeeded
+}
+
 fn activity_card_watcher_window_action(
     window_visible: bool,
     prepare_event_id: Option<u64>,
@@ -737,6 +784,37 @@ fn prepare_activity_card_window_for_app(app: &tauri::AppHandle) -> tauri::Result
     window.set_focusable(activity_card_window_focusable())?;
     window.set_always_on_top(true)?;
     window.set_visible_on_all_workspaces(true)
+}
+
+#[cfg(target_os = "windows")]
+fn prime_activity_card_window_for_app(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let window = ensure_activity_card_window(app)?;
+    sync_window_location_if_needed(&window, &activity_card_window_location())?;
+    position_activity_card_window(app, &window)?;
+    window.set_focusable(true)?;
+    window.set_always_on_top(true)?;
+    window.set_visible_on_all_workspaces(true)?;
+    window.show()?;
+    append_activity_card_diagnostics_log("[native/prime] show-onscreen");
+
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let app_handle_for_hide = app_handle.clone();
+        let _ = app_handle.run_on_main_thread(move || {
+            if let Some(window) = app_handle_for_hide.get_webview_window("activity-card") {
+                let _ = window.hide();
+                append_activity_card_diagnostics_log("[native/prime] hide-onscreen");
+            }
+        });
+    });
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn prime_activity_card_window_for_app(_app: &tauri::AppHandle) -> tauri::Result<()> {
+    Ok(())
 }
 
 #[tauri::command]
@@ -1161,15 +1239,25 @@ async fn poll_activity_card_events(app: tauri::AppHandle) {
             };
             let _ = app_for_thread.run_on_main_thread(move || {
                 let mut prepare_result = "skipped".to_string();
-                let show_result = "skipped".to_string();
+                let mut prepare_succeeded = false;
                 match window_action {
                     ActivityCardWatcherWindowAction::Prepare => {
                         match prepare_activity_card_window_for_app(&app_for_window_action) {
-                            Ok(()) => prepare_result = "ok".to_string(),
+                            Ok(()) => {
+                                prepare_result = "ok".to_string();
+                                prepare_succeeded = true;
+                            }
                             Err(error) => prepare_result = format!("error:{error}"),
                         }
                     }
                     ActivityCardWatcherWindowAction::None => {}
+                }
+                let mut show_result = "skipped".to_string();
+                if should_show_activity_card_window(window_action, prepare_succeeded) {
+                    match show_activity_card_window_for_app(&app_for_window_action) {
+                        Ok(()) => show_result = "ok".to_string(),
+                        Err(error) => show_result = format!("error:{error}"),
+                    }
                 }
                 let mut emit_local_result = "skipped".to_string();
                 if let Some(payload) = local_approval_payload.clone() {
@@ -1813,6 +1901,7 @@ fn main() {
                 let _panel = ensure_panel_window(app.handle())?;
                 let _activity_card = ensure_activity_card_window(app.handle())?;
                 prepare_activity_card_window_for_app(app.handle())?;
+                prime_activity_card_window_for_app(app.handle())?;
                 start_activity_card_event_watcher(app.handle().clone());
             } else {
                 let _activity_card = ensure_activity_card_window(app.handle())?;
@@ -1949,6 +2038,9 @@ mod tests {
 
     #[test]
     fn activity_card_window_show_policy_does_not_focus() {
+        #[cfg(target_os = "windows")]
+        assert!(activity_card_window_focuses_on_show());
+        #[cfg(not(target_os = "windows"))]
         assert!(!activity_card_window_focuses_on_show());
     }
 
@@ -1964,9 +2056,19 @@ mod tests {
         assert!(!activity_card_window_starts_visible_for(Some(
             "&debugLive=1&project=hexdeck"
         )));
+        #[cfg(target_os = "windows")]
+        assert!(activity_card_window_focuses_on_show_for(Some(
+            "&debugLive=1&project=hexdeck"
+        )));
+        #[cfg(not(target_os = "windows"))]
         assert!(!activity_card_window_focuses_on_show_for(Some(
             "&debugLive=1&project=hexdeck"
         )));
+        #[cfg(target_os = "windows")]
+        assert!(activity_card_window_focusable_for(Some(
+            "&debugLive=1&project=hexdeck"
+        )));
+        #[cfg(not(target_os = "windows"))]
         assert!(!activity_card_window_focusable_for(Some(
             "&debugLive=1&project=hexdeck"
         )));
@@ -2244,6 +2346,30 @@ mod tests {
     #[test]
     fn activity_card_broker_watcher_emits_refresh_for_broker_popup_events() {
         assert!(should_emit_activity_card_refresh(Some(501)));
+    }
+
+    #[test]
+    fn activity_card_broker_watcher_shows_window_after_successful_prepare() {
+        assert!(should_show_activity_card_window(
+            ActivityCardWatcherWindowAction::Prepare,
+            true
+        ));
+    }
+
+    #[test]
+    fn activity_card_broker_watcher_skips_show_after_failed_prepare() {
+        assert!(!should_show_activity_card_window(
+            ActivityCardWatcherWindowAction::Prepare,
+            false
+        ));
+    }
+
+    #[test]
+    fn activity_card_broker_watcher_skips_show_without_prepare_action() {
+        assert!(!should_show_activity_card_window(
+            ActivityCardWatcherWindowAction::None,
+            true
+        ));
     }
 
     #[test]

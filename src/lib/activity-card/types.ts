@@ -24,6 +24,7 @@ export interface ActivityCardBaseProjection {
   summary: string;
   priority: ActivityCardPriority;
   createdAtMs?: number;
+  popupEligible?: boolean;
   participantId?: string;
   actorLabel?: string;
   projectLabel?: string;

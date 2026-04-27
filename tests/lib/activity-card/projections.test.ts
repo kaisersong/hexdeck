@@ -1415,4 +1415,115 @@ describe('buildActivityCardsFromSeed', () => {
 
     expect(cards.find((card) => card.kind === 'approval')).toBeUndefined();
   });
+
+  it('keeps mirrored hook approvals in the feed but marks them as non-popup cards', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'xiaok-code-session-sess_mof',
+          alias: 'xiaok',
+          kind: 'agent',
+          tool: 'xiaok-code',
+          context: {
+            projectName: 'projects',
+          },
+        },
+      ],
+      workStates: [],
+      events: [],
+      approvals: [
+        {
+          approvalId: 'xiaok-code-hook-PreToolUse-sess_mof45wnu_8qcuic-bash',
+          taskId: 'xiaok-code-hook-approval-sess_mof45wnu_8qcuic-bash',
+          decision: 'pending',
+          participantId: 'xiaok-code-session-sess_mof',
+          summary: 'xiaok needs approval to run bash.',
+          body: {
+            participantId: 'xiaok-code-session-sess_mof',
+            approvalId: 'xiaok-code-hook-PreToolUse-sess_mof45wnu_8qcuic-bash',
+            approvalScope: 'run_command',
+            body: {
+              summary: 'xiaok needs approval to run bash.',
+              commandTitle: 'xiaok',
+              commandLine: 'ls -la "C:\\Users\\song\\Downloads\\AI原生组织管理下云之家工作中枢设计推演.docx" "C:\\Users\\song\\Downloads\\云之家V12 企业世界模型映射.html"',
+              commandPreview: 'D:\\projects',
+            },
+            nativeHookApproval: {
+              agentTool: 'xiaok-code',
+              hookEventName: 'PreToolUse',
+              sessionId: 'sess_mof45wnu_8qcuic',
+              toolName: 'bash',
+              toolUseId: 'sess_mof45wnu_8qcuic-bash',
+            },
+            delivery: {
+              semantic: 'actionable',
+              source: 'xiaok-code-hook-approval',
+            },
+          },
+        },
+      ],
+    });
+
+    expect(cards).toContainEqual(expect.objectContaining({
+      kind: 'approval',
+      approvalId: 'xiaok-code-hook-PreToolUse-sess_mof45wnu_8qcuic-bash',
+      popupEligible: false,
+      participantId: 'xiaok-code-session-sess_mof',
+    }));
+  });
+
+  it('keeps internal local tool approvals in the feed but marks them as non-popup cards', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'codex-session-019dc3ee',
+          alias: 'codex2',
+          kind: 'agent',
+          tool: 'codex',
+          context: {
+            projectName: 'hexdeck',
+          },
+        },
+      ],
+      workStates: [],
+      events: [],
+      approvals: [
+        {
+          approvalId: 'hexdeck-local-codex-host-codex-session-019dc3ee-call_internal',
+          taskId: 'local-host-approval-codex-session-019dc3ee-call_internal',
+          decision: 'pending',
+          participantId: 'codex-session-019dc3ee',
+          summary: 'Do you want to allow rerunning a targeted HexDeck cargo test outside the sandbox after the compile fix so I can submit a verified commit?',
+          body: {
+            summary: 'Do you want to allow rerunning a targeted HexDeck cargo test outside the sandbox after the compile fix so I can submit a verified commit?',
+            participantId: 'codex-session-019dc3ee',
+            commandTitle: 'Codex',
+            commandLine: '$targetDir = Join-Path $env:LOCALAPPDATA (\'Temp\\\\hexdeck-cargo-check-1\'); cargo test --manifest-path src-tauri/Cargo.toml --target-dir $targetDir local_host_approval_still_pending -- --nocapture --test-threads=1 --color never',
+            commandPreview: 'D:\\projects\\hexdeck',
+            localHostApproval: {
+              source: 'codex',
+              sessionId: '019dc3ee-769f-7540-aae1-586d82cd0449',
+              callId: 'call_internal',
+              projectPath: 'D:\\projects\\hexdeck',
+              terminalApp: 'unknown',
+              runtimeSource: 'user-prompt-submit',
+            },
+            delivery: {
+              semantic: 'actionable',
+              source: 'hexdeck-local-host-approval',
+            },
+          },
+        },
+      ],
+    });
+
+    expect(cards).toContainEqual(expect.objectContaining({
+      kind: 'approval',
+      approvalId: 'hexdeck-local-codex-host-codex-session-019dc3ee-call_internal',
+      popupEligible: false,
+      participantId: 'codex-session-019dc3ee',
+    }));
+  });
 });

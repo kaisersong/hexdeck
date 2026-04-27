@@ -26,6 +26,7 @@ const LOCAL_CODEX_TRANSCRIPT_TAIL_BYTES: u64 = 1_048_576;
 const LOCAL_CODEX_APPROVAL_DETAIL_TEXT: &str = "";
 const LOCAL_CODEX_APPROVAL_MAX_AGE_MS: i64 = 30 * 60 * 1000;
 const LOCAL_CODEX_LOG_LOOKBACK_SECS: i64 = 10 * 60;
+const MINIMUM_REQUIRED_BROKER_VERSION: &str = "0.3.3";
 // Give transcript/log reconciliation enough time to observe that a local
 // approval was handled before surfacing the same prompt again.
 const LOCAL_CODEX_RESOLUTION_SUPPRESSION_TTL_MS: i64 = 60_000;
@@ -94,7 +95,7 @@ pub struct BrokerVersionInfo {
     pub release_notes: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokerManifest {
     pub version: String,
     pub path: String,
@@ -160,6 +161,19 @@ struct LocalCodexBridgeState {
     pid: Option<u32>,
     parent_pid: Option<u32>,
     session_id: Option<String>,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Deserialize)]
+struct LocalCodexWindowsProcessEntry {
+    #[serde(rename = "ProcessId")]
+    process_id: Option<u32>,
+    #[serde(rename = "ParentProcessId")]
+    parent_process_id: Option<u32>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "CommandLine")]
+    command_line: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +260,28 @@ async fn read_broker_manifest(app: &AppHandle) -> Result<Option<BrokerManifest>,
         serde_json::from_str(&content).map_err(|e| format!("failed_to_parse_manifest: {}", e))?;
 
     Ok(Some(manifest))
+}
+
+fn parse_broker_version_components(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn broker_version_is_older(version: &str, minimum: &str) -> bool {
+    match (
+        parse_broker_version_components(version),
+        parse_broker_version_components(minimum),
+    ) {
+        (Some(current), Some(required)) => current < required,
+        _ => version.trim() != minimum.trim(),
+    }
+}
+
+fn broker_manifest_requires_upgrade(manifest: &BrokerManifest) -> bool {
+    broker_version_is_older(&manifest.version, MINIMUM_REQUIRED_BROKER_VERSION)
 }
 
 fn resolve_broker_runtime_paths(installed_path: &PathBuf) -> BrokerRuntimePaths {
@@ -775,7 +811,9 @@ fn load_local_codex_bridge_state(participant_id: &str) -> Result<LocalCodexBridg
 }
 
 #[cfg(target_os = "windows")]
-fn resolve_local_codex_console_target_pid(approval: &LocalHostApprovalPrompt) -> Result<u32, String> {
+fn resolve_local_codex_console_target_pid_from_bridge(
+    approval: &LocalHostApprovalPrompt,
+) -> Result<u32, String> {
     let bridge = load_local_codex_bridge_state(&approval.participant_id)?;
     if let Some(session_id) = bridge.session_id.as_deref() {
         let expected = approval.session_id.trim();
@@ -793,6 +831,178 @@ fn resolve_local_codex_console_target_pid(approval: &LocalHostApprovalPrompt) ->
         .or(bridge.pid)
         .filter(|pid| *pid > 0)
         .ok_or_else(|| "missing_local_codex_bridge_parent_pid".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_local_codex_windows_process_name(value: Option<&str>) -> String {
+    value.unwrap_or_default().trim().to_ascii_lowercase()
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_local_codex_windows_command_line(value: Option<&str>) -> String {
+    value
+        .unwrap_or_default()
+        .trim()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+#[cfg(target_os = "windows")]
+fn local_codex_windows_process_entry_by_pid<'a>(
+    entries: &'a [LocalCodexWindowsProcessEntry],
+    pid: u32,
+) -> Option<&'a LocalCodexWindowsProcessEntry> {
+    entries
+        .iter()
+        .find(|entry| entry.process_id.filter(|candidate| *candidate == pid).is_some())
+}
+
+#[cfg(target_os = "windows")]
+fn local_codex_windows_process_entry_is_cli_wrapper(
+    entry: &LocalCodexWindowsProcessEntry,
+) -> bool {
+    let name = normalize_local_codex_windows_process_name(entry.name.as_deref());
+    let command_line = normalize_local_codex_windows_command_line(entry.command_line.as_deref());
+
+    ((name == "node.exe" || name == "node")
+        && command_line.contains("/@openai/codex/bin/codex.js"))
+        || ((name == "codex.exe" || name == "codex")
+            && command_line.contains("/@openai/codex-win32-x64/")
+            && !command_line.contains(" app-server"))
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_local_codex_console_host_pid_from_entries(
+    entries: &[LocalCodexWindowsProcessEntry],
+    start_pid: u32,
+) -> Option<u32> {
+    let mut current_pid = start_pid;
+    let mut visited = std::collections::HashSet::new();
+
+    while visited.insert(current_pid) {
+        let entry = local_codex_windows_process_entry_by_pid(entries, current_pid)?;
+        if !local_codex_windows_process_entry_is_cli_wrapper(entry) {
+            return Some(current_pid);
+        }
+        current_pid = entry.parent_process_id.filter(|pid| *pid > 0)?;
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn load_local_codex_windows_process_entries() -> Result<Vec<LocalCodexWindowsProcessEntry>, String> {
+    let output = execute_hidden_powershell(
+        "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress",
+    )?;
+    let parsed: Value = serde_json::from_str(&output)
+        .map_err(|error| format!("failed_to_parse_windows_process_list: {error}"))?;
+    let items = match parsed {
+        Value::Array(items) => items,
+        Value::Object(_) => vec![parsed],
+        _ => Vec::new(),
+    };
+
+    Ok(items
+        .into_iter()
+        .filter_map(|item| serde_json::from_value::<LocalCodexWindowsProcessEntry>(item).ok())
+        .collect())
+}
+
+#[cfg(target_os = "windows")]
+fn local_codex_windows_process_entries_include_pid(
+    entries: &[LocalCodexWindowsProcessEntry],
+    pid: u32,
+) -> bool {
+    entries
+        .iter()
+        .filter_map(|entry| entry.process_id)
+        .any(|candidate| candidate == pid)
+}
+
+#[cfg(target_os = "windows")]
+fn local_codex_console_target_from_process_entry(
+    entry: &LocalCodexWindowsProcessEntry,
+) -> Option<(u8, u32, u32)> {
+    let source_pid = entry.process_id.filter(|pid| *pid > 0)?;
+    let target_pid = entry
+        .parent_process_id
+        .filter(|pid| *pid > 0)
+        .unwrap_or(source_pid);
+    let name = normalize_local_codex_windows_process_name(entry.name.as_deref());
+    let command_line = normalize_local_codex_windows_command_line(entry.command_line.as_deref());
+
+    if (name == "node.exe" || name == "node")
+        && command_line.contains("/@openai/codex/bin/codex.js")
+    {
+        return Some((0, target_pid, source_pid));
+    }
+
+    if (name == "codex.exe" || name == "codex")
+        && command_line.contains("/@openai/codex-win32-x64/")
+        && !command_line.contains(" app-server")
+    {
+        return Some((1, target_pid, source_pid));
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn discover_local_codex_console_target_pid_from_entries(
+    entries: &[LocalCodexWindowsProcessEntry],
+) -> Result<u32, String> {
+    let mut candidates = entries
+        .iter()
+        .filter_map(local_codex_console_target_from_process_entry)
+        .collect::<Vec<_>>();
+
+    if candidates.is_empty() {
+        return Err("missing_local_codex_cli_process".to_string());
+    }
+
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| right.2.cmp(&left.2)));
+    let best_rank = candidates[0].0;
+    let mut best_targets = candidates
+        .into_iter()
+        .filter(|candidate| candidate.0 == best_rank)
+        .map(|candidate| candidate.1)
+        .collect::<Vec<_>>();
+    best_targets.sort_unstable();
+    best_targets.dedup();
+
+    if best_targets.len() > 1 {
+        return Err(format!(
+            "ambiguous_local_codex_cli_targets {}",
+            best_targets
+                .into_iter()
+                .map(|pid| pid.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+
+    best_targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| "missing_local_codex_cli_target".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_local_codex_console_target_pid(approval: &LocalHostApprovalPrompt) -> Result<u32, String> {
+    let process_entries = load_local_codex_windows_process_entries()?;
+
+    if let Ok(target_pid) = resolve_local_codex_console_target_pid_from_bridge(approval) {
+        if let Some(console_host_pid) =
+            resolve_local_codex_console_host_pid_from_entries(&process_entries, target_pid)
+        {
+            if local_codex_windows_process_entries_include_pid(&process_entries, console_host_pid) {
+                return Ok(console_host_pid);
+            }
+        }
+    }
+
+    discover_local_codex_console_target_pid_from_entries(&process_entries)
 }
 
 fn parse_rfc3339_timestamp_ms(value: Option<&str>) -> Option<i64> {
@@ -828,8 +1038,15 @@ fn read_text_tail(path: &Path, max_bytes: u64) -> Result<String, String> {
     Ok(text)
 }
 
-fn find_matching_file(root: &Path, needle: &str, remaining_depth: usize) -> Option<PathBuf> {
-    let entries = fs::read_dir(root).ok()?;
+fn collect_matching_files(
+    root: &Path,
+    needle: &str,
+    remaining_depth: usize,
+    matches: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
     let mut files = Vec::new();
     let mut directories = Vec::new();
 
@@ -846,31 +1063,53 @@ fn find_matching_file(root: &Path, needle: &str, remaining_depth: usize) -> Opti
     directories.sort();
 
     for file_path in files {
-        let matches = file_path
+        let matches_needle = file_path
             .file_name()
             .and_then(|value| value.to_str())
             .map(|value| value.ends_with(".jsonl") && value.contains(needle))
             .unwrap_or(false);
-        if matches {
-            return Some(file_path);
+        if matches_needle {
+            matches.push(file_path);
         }
     }
 
     if remaining_depth == 0 {
-        return None;
+        return;
     }
 
     for directory in directories {
-        if let Some(path) = find_matching_file(&directory, needle, remaining_depth - 1) {
-            return Some(path);
-        }
+        collect_matching_files(&directory, needle, remaining_depth - 1, matches);
     }
-
-    None
 }
 
-fn resolve_codex_transcript_path(session_id: &str, updated_at: Option<&str>) -> Option<PathBuf> {
-    let root = home_dir()?.join(".codex").join("sessions");
+fn find_latest_matching_file(root: &Path, needle: &str, remaining_depth: usize) -> Option<PathBuf> {
+    let mut matches = Vec::new();
+    collect_matching_files(root, needle, remaining_depth, &mut matches);
+    matches.sort();
+    matches.pop()
+}
+
+fn local_codex_runtime_participant_session_hint(participant_id: &str) -> Option<&str> {
+    participant_id
+        .strip_prefix("codex-session-")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_codex_transcript_path_from_root(
+    root: &Path,
+    participant_id: &str,
+    session_id: &str,
+    updated_at: Option<&str>,
+) -> Option<PathBuf> {
+    let mut needles = Vec::new();
+    if let Some(participant_hint) = local_codex_runtime_participant_session_hint(participant_id) {
+        needles.push(participant_hint.to_string());
+    }
+    let session_id = session_id.trim();
+    if !session_id.is_empty() && !needles.iter().any(|needle| needle == session_id) {
+        needles.push(session_id.to_string());
+    }
 
     if let Some(updated_at) = updated_at.and_then(|value| DateTime::parse_from_rfc3339(value).ok())
     {
@@ -878,21 +1117,56 @@ fn resolve_codex_transcript_path(session_id: &str, updated_at: Option<&str>) -> 
             .join(format!("{:04}", updated_at.year()))
             .join(format!("{:02}", updated_at.month()))
             .join(format!("{:02}", updated_at.day()));
-        if let Some(path) = find_matching_file(&day_dir, session_id, 0) {
+        for needle in &needles {
+            if let Some(path) = find_latest_matching_file(&day_dir, needle, 0) {
+                return Some(path);
+            }
+        }
+    }
+
+    for needle in &needles {
+        if let Some(path) = find_latest_matching_file(root, needle, 4) {
             return Some(path);
         }
     }
 
-    find_matching_file(&root, session_id, 4)
+    None
 }
 
-fn is_supported_local_codex_runtime(runtime: &LocalCodexRuntimeState) -> bool {
-    runtime.status.as_deref() == Some("running")
-        && runtime
-            .session_id
-            .as_deref()
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false)
+fn resolve_codex_transcript_path(
+    participant_id: &str,
+    session_id: &str,
+    updated_at: Option<&str>,
+) -> Option<PathBuf> {
+    let root = home_dir()?.join(".codex").join("sessions");
+    resolve_codex_transcript_path_from_root(&root, participant_id, session_id, updated_at)
+}
+
+fn local_codex_runtime_has_session_id(runtime: &LocalCodexRuntimeState) -> bool {
+    runtime
+        .session_id
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn is_supported_local_codex_runtime(runtime: &LocalCodexRuntimeState, now_ms: i64) -> bool {
+    if !local_codex_runtime_has_session_id(runtime) {
+        return false;
+    }
+
+    if runtime.status.as_deref() == Some("running") {
+        return true;
+    }
+
+    if runtime.status.as_deref() != Some("idle") || runtime.source.as_deref() != Some("stop-hook") {
+        return false;
+    }
+
+    let recent_cutoff_ms = now_ms.saturating_sub(LOCAL_CODEX_APPROVAL_MAX_AGE_MS);
+    parse_rfc3339_timestamp_ms(runtime.updated_at.as_deref())
+        .map(|updated_at_ms| updated_at_ms >= recent_cutoff_ms)
+        .unwrap_or(false)
 }
 
 fn parse_pending_local_codex_approval_call(
@@ -1169,6 +1443,7 @@ fn load_local_host_approvals() -> Vec<LocalHostApprovalPrompt> {
         return Vec::new();
     };
 
+    let now_ms = Utc::now().timestamp_millis();
     let mut approvals = Vec::new();
     let mut diagnostics = Vec::new();
     let recent_resolution_fingerprints =
@@ -1198,16 +1473,12 @@ fn load_local_host_approvals() -> Vec<LocalHostApprovalPrompt> {
                 continue;
             }
         };
-        if !is_supported_local_codex_runtime(&runtime) {
+        if !is_supported_local_codex_runtime(&runtime, now_ms) {
             diagnostics.push(format!(
                 "{diagnostic_label} skip=unsupported status={} terminalApp={} hasSessionId={} hasTerminalSessionId={}",
                 runtime.status.as_deref().unwrap_or("-"),
                 runtime.terminal_app.as_deref().unwrap_or("-"),
-                runtime
-                    .session_id
-                    .as_deref()
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(false),
+                local_codex_runtime_has_session_id(&runtime),
                 runtime
                     .terminal_session_id
                     .as_deref()
@@ -1217,12 +1488,13 @@ fn load_local_host_approvals() -> Vec<LocalHostApprovalPrompt> {
             continue;
         }
 
+        let participant_id = file_name.trim_end_matches(".runtime.json").to_string();
         let Some(session_id) = runtime.session_id.as_deref() else {
             diagnostics.push(format!("{diagnostic_label} skip=missing-session-id"));
             continue;
         };
         let transcript_path =
-            resolve_codex_transcript_path(session_id, runtime.updated_at.as_deref())
+            resolve_codex_transcript_path(&participant_id, session_id, runtime.updated_at.as_deref())
                 .unwrap_or_default();
         let tail = if transcript_path.as_os_str().is_empty() {
             String::new()
@@ -1232,7 +1504,6 @@ fn load_local_host_approvals() -> Vec<LocalHostApprovalPrompt> {
                 Err(_) => String::new(),
             }
         };
-        let participant_id = file_name.trim_end_matches(".runtime.json").to_string();
         let transcript_snapshot = collect_local_codex_approval_transcript_snapshot(
             &tail,
             runtime.project_path.as_deref(),
@@ -1273,7 +1544,7 @@ fn load_local_host_approvals() -> Vec<LocalHostApprovalPrompt> {
 
     let approvals =
         suppress_recently_resolved_local_host_approvals(approvals, &recent_resolution_fingerprints);
-    let approvals = filter_and_sort_local_host_approvals(approvals, Utc::now().timestamp_millis());
+    let approvals = filter_and_sort_local_host_approvals(approvals, now_ms);
     let top_approval = approvals
         .first()
         .map(|approval| {
@@ -1420,6 +1691,45 @@ fn remember_recent_local_codex_resolution(approval: &LocalHostApprovalPrompt) {
         return;
     };
     recent_resolutions.insert(fingerprint, Utc::now().timestamp_millis());
+}
+
+fn local_host_approval_still_pending(
+    approval: &LocalHostApprovalPrompt,
+    approvals: &[LocalHostApprovalPrompt],
+) -> bool {
+    let Some(target_fingerprint) = local_host_approval_fingerprint(approval) else {
+        return approvals
+            .iter()
+            .any(|candidate| candidate.approval_id == approval.approval_id);
+    };
+
+    approvals.iter().any(|candidate| {
+        candidate.approval_id == approval.approval_id
+            || local_host_approval_fingerprint(candidate)
+                .as_ref()
+                .is_some_and(|fingerprint| fingerprint == &target_fingerprint)
+    })
+}
+
+async fn wait_for_local_host_approval_resolution(
+    approval: &LocalHostApprovalPrompt,
+) -> Result<(), String> {
+    const LOCAL_CODEX_APPROVAL_RESOLUTION_VERIFY_ATTEMPTS: usize = 20;
+    const LOCAL_CODEX_APPROVAL_RESOLUTION_VERIFY_SLEEP_MS: u64 = 100;
+
+    for _ in 0..LOCAL_CODEX_APPROVAL_RESOLUTION_VERIFY_ATTEMPTS {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            LOCAL_CODEX_APPROVAL_RESOLUTION_VERIFY_SLEEP_MS,
+        ))
+        .await;
+
+        let approvals = load_local_host_approvals();
+        if !local_host_approval_still_pending(approval, &approvals) {
+            return Ok(());
+        }
+    }
+
+    Err("local_host_approval_not_acknowledged".to_string())
 }
 
 fn suppress_recently_resolved_local_host_approvals(
@@ -1820,11 +2130,6 @@ fn local_codex_host_terminal_command(
 }
 
 #[cfg(target_os = "windows")]
-fn escape_powershell_single_quoted(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
-#[cfg(target_os = "windows")]
 fn execute_hidden_powershell(script: &str) -> Result<String, String> {
     let output = Command::new("powershell.exe")
         .creation_flags(LOCAL_CODEX_WINDOWS_CREATE_NO_WINDOW)
@@ -1868,6 +2173,10 @@ using System;
 using System.Runtime.InteropServices;
 
 public static class HexdeckNativeConsole {
+    public const uint SHIFT_PRESSED = 0x0010;
+    public const uint LEFT_ALT_PRESSED = 0x0002;
+    public const uint LEFT_CTRL_PRESSED = 0x0008;
+
     [StructLayout(LayoutKind.Explicit, CharSet = CharSet.Unicode)]
     public struct INPUT_RECORD {
         [FieldOffset(0)] public ushort EventType;
@@ -1886,10 +2195,6 @@ public static class HexdeckNativeConsole {
 
     public const ushort KEY_EVENT = 0x0001;
     public const uint ATTACH_PARENT_PROCESS = 0xFFFFFFFF;
-    public const uint GENERIC_READ_WRITE = 0xC0000000;
-    public const uint FILE_SHARE_READ_WRITE = 0x00000003;
-    public const uint OPEN_EXISTING = 3;
-    public const uint NO_FILE_FLAGS = 0;
     public static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -1919,6 +2224,12 @@ public static class HexdeckNativeConsole {
         int nLength,
         out int lpNumberOfEventsWritten
     );
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern short VkKeyScanW(char ch);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint MapVirtualKeyW(uint uCode, uint uMapType);
 }
 "@
 
@@ -1926,6 +2237,29 @@ $targetPid = [uint32]__TARGET_PID__
 $virtualKeyCode = [uint16]__VKEY__
 $unicodeCharCode = [uint16]__UNICODE__
 $shortcutLabel = '__SHORTCUT_LABEL__'
+[uint32]$desiredAccess = 3221225472
+[uint32]$shareMode = 3
+[uint32]$openExisting = 3
+[uint32]$noFileFlags = 0
+[uint16]$scanCode = 0
+[uint32]$controlKeyState = 0
+if ($unicodeCharCode -ne 0) {
+    $vkInfo = [HexdeckNativeConsole]::VkKeyScanW([char]$unicodeCharCode)
+    if ($vkInfo -ge 0) {
+        $virtualKeyCode = [uint16]($vkInfo -band 0xFF)
+        $shiftState = [uint16](($vkInfo -shr 8) -band 0xFF)
+        if (($shiftState -band 1) -ne 0) {
+            $controlKeyState = $controlKeyState -bor [HexdeckNativeConsole]::SHIFT_PRESSED
+        }
+        if (($shiftState -band 2) -ne 0) {
+            $controlKeyState = $controlKeyState -bor [HexdeckNativeConsole]::LEFT_CTRL_PRESSED
+        }
+        if (($shiftState -band 4) -ne 0) {
+            $controlKeyState = $controlKeyState -bor [HexdeckNativeConsole]::LEFT_ALT_PRESSED
+        }
+    }
+}
+$scanCode = [uint16][HexdeckNativeConsole]::MapVirtualKeyW([uint32]$virtualKeyCode, 0)
 [void][HexdeckNativeConsole]::FreeConsole()
 if (-not [HexdeckNativeConsole]::AttachConsole($targetPid)) {
     throw ('failed_to_attach_console:' + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
@@ -1933,33 +2267,44 @@ if (-not [HexdeckNativeConsole]::AttachConsole($targetPid)) {
 $inputHandle = [IntPtr]::Zero
 $inputHandle = [HexdeckNativeConsole]::CreateFileW(
     'CONIN$',
-    [HexdeckNativeConsole]::GENERIC_READ_WRITE,
-    [HexdeckNativeConsole]::FILE_SHARE_READ_WRITE,
+    $desiredAccess,
+    $shareMode,
     [IntPtr]::Zero,
-    [HexdeckNativeConsole]::OPEN_EXISTING,
-    [HexdeckNativeConsole]::NO_FILE_FLAGS,
+    $openExisting,
+    $noFileFlags,
     [IntPtr]::Zero
 )
 if ($inputHandle -eq [IntPtr]::Zero -or $inputHandle -eq [HexdeckNativeConsole]::INVALID_HANDLE_VALUE) {
     throw ('failed_to_open_console_input:' + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
 }
 try {
-    $records = New-Object 'HexdeckNativeConsole+INPUT_RECORD[]' 2
-    $records[0].EventType = [HexdeckNativeConsole]::KEY_EVENT
-    $records[0].KeyEvent.bKeyDown = $true
-    $records[0].KeyEvent.wRepeatCount = 1
-    $records[0].KeyEvent.wVirtualKeyCode = $virtualKeyCode
-    $records[0].KeyEvent.wVirtualScanCode = 0
-    $records[0].KeyEvent.UnicodeChar = [char]$unicodeCharCode
-    $records[0].KeyEvent.dwControlKeyState = 0
-    $records[1] = $records[0]
-    $records[1].KeyEvent.bKeyDown = $false
+    $keyDown = New-Object 'HexdeckNativeConsole+INPUT_RECORD'
+    $keyDown.EventType = [HexdeckNativeConsole]::KEY_EVENT
+    $keyDown.KeyEvent.bKeyDown = $true
+    $keyDown.KeyEvent.wRepeatCount = 1
+    $keyDown.KeyEvent.wVirtualKeyCode = $virtualKeyCode
+    $keyDown.KeyEvent.wVirtualScanCode = $scanCode
+    $keyDown.KeyEvent.UnicodeChar = [char]$unicodeCharCode
+    $keyDown.KeyEvent.dwControlKeyState = $controlKeyState
 
-    $written = 0
-    if (-not [HexdeckNativeConsole]::WriteConsoleInputW($inputHandle, $records, $records.Length, [ref]$written)) {
+    $keyUp = New-Object 'HexdeckNativeConsole+INPUT_RECORD'
+    $keyUp.EventType = [HexdeckNativeConsole]::KEY_EVENT
+    $keyUp.KeyEvent.bKeyDown = $false
+    $keyUp.KeyEvent.wRepeatCount = 1
+    $keyUp.KeyEvent.wVirtualKeyCode = $virtualKeyCode
+    $keyUp.KeyEvent.wVirtualScanCode = $scanCode
+    $keyUp.KeyEvent.UnicodeChar = [char]0
+    $keyUp.KeyEvent.dwControlKeyState = $controlKeyState
+
+    $writtenDown = 0
+    if (-not [HexdeckNativeConsole]::WriteConsoleInputW($inputHandle, @($keyDown), 1, [ref]$writtenDown)) {
         throw ('failed_to_write_console_input:' + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
     }
-    Write-Output ('sent:' + $shortcutLabel + ':' + $targetPid + ':' + $written)
+    $writtenUp = 0
+    if (-not [HexdeckNativeConsole]::WriteConsoleInputW($inputHandle, @($keyUp), 1, [ref]$writtenUp)) {
+        throw ('failed_to_write_console_input:' + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+    }
+    Write-Output ('sent:' + $shortcutLabel + ':' + $targetPid + ':' + ($writtenDown + $writtenUp))
 } finally {
     if ($inputHandle -ne [IntPtr]::Zero -and $inputHandle -ne [HexdeckNativeConsole]::INVALID_HANDLE_VALUE) {
         [HexdeckNativeConsole]::CloseHandle($inputHandle) | Out-Null
@@ -2003,179 +2348,28 @@ fn send_windows_codex_console_approval_decision(
 }
 
 #[cfg(target_os = "windows")]
-fn build_windows_codex_desktop_approval_script(button_names: &[&str]) -> String {
-    let button_name_literals = button_names
-        .iter()
-        .map(|label| format!("'{}'", escape_powershell_single_quoted(label)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        r#"
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
-$target = Get-Process Codex -ErrorAction SilentlyContinue |
-    Where-Object {{ -not [string]::IsNullOrWhiteSpace($_.MainWindowTitle) }} |
-    Sort-Object StartTime |
-    Select-Object -First 1
-if ($null -eq $target) {{ throw 'missing_codex_window' }}
-$ws = New-Object -ComObject WScript.Shell
-if (-not $ws.AppActivate([int]$target.Id)) {{ throw 'failed_to_activate_codex_window' }}
-Start-Sleep -Milliseconds 150
-$root = [System.Windows.Automation.AutomationElement]::FromHandle($target.MainWindowHandle)
-if ($null -eq $root) {{ throw 'missing_codex_automation_root' }}
-$buttonNames = @({button_name_literals})
-$buttonCondition = New-Object System.Windows.Automation.PropertyCondition(
-    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-    [System.Windows.Automation.ControlType]::Button
-)
-$windowRect = $root.Current.BoundingRectangle
-$windowCenterX = $windowRect.X + ($windowRect.Width / 2.0)
-$windowCenterY = $windowRect.Y + ($windowRect.Height / 2.0)
-$deadline = (Get-Date).AddSeconds(2)
-$match = $null
-do {{
-    $buttons = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition)
-    $candidates = New-Object System.Collections.Generic.List[object]
-    for ($i = 0; $i -lt $buttons.Count; $i++) {{
-        $button = $buttons.Item($i)
-        $rawName = $button.Current.Name
-        if ($null -eq $rawName) {{
-            $name = ''
-        }} else {{
-            $name = [string]$rawName
-        }}
-        if ([string]::IsNullOrWhiteSpace($name)) {{ continue }}
-        $labelIndex = [Array]::IndexOf($buttonNames, $name)
-        if ($labelIndex -lt 0) {{ continue }}
-        if (-not $button.Current.IsEnabled -or $button.Current.IsOffscreen) {{ continue }}
-        $rect = $button.Current.BoundingRectangle
-        if ($rect.Width -le 0 -or $rect.Height -le 0) {{ continue }}
-        $centerX = $rect.X + ($rect.Width / 2.0)
-        $centerY = $rect.Y + ($rect.Height / 2.0)
-        $distance = [Math]::Abs($centerX - $windowCenterX) + [Math]::Abs($centerY - $windowCenterY)
-        $candidates.Add([PSCustomObject]@{{
-            Element = $button
-            Name = $name
-            LabelIndex = $labelIndex
-            Distance = $distance
-            X = $rect.X
-            Y = $rect.Y
-        }}) | Out-Null
-    }}
-    $match = $candidates |
-        Sort-Object LabelIndex, Distance, Y, X |
-        Select-Object -First 1
-    if ($null -eq $match) {{
-        Start-Sleep -Milliseconds 100
-    }}
-}} while ($null -eq $match -and (Get-Date) -lt $deadline)
-if ($null -eq $match) {{ throw ('missing_approval_button:' + ($buttonNames -join '|')) }}
-$invokePattern = $match.Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-if ($null -eq $invokePattern) {{ throw ('missing_invoke_pattern:' + $match.Name) }}
-([System.Windows.Automation.InvokePattern]$invokePattern).Invoke()
-Write-Output ('clicked:' + $match.Name + ':' + $target.Id)
-"#
-    )
-}
-
-#[cfg(target_os = "windows")]
-fn local_codex_host_windows_approval_button_names(
-    decision: &str,
-    decision_mode: Option<&str>,
-) -> Result<&'static [&'static str], String> {
-    match decision {
-        "approved" if decision_mode == Some("always") => Ok(&[
-            "Always",
-            "Allow for session",
-            "Allow this session",
-            "Always allow",
-            "始终允许",
-            "始终允许本次会话",
-            "始终允许此会话",
-        ]),
-        "approved" => Ok(&[
-            "Allow once",
-            "Allow",
-            "Approve",
-            "Yes",
-            "允许一次",
-            "允许",
-            "批准",
-            "是",
-        ]),
-        "denied" if decision_mode == Some("no") => Ok(&[
-            "Decline",
-            "Deny",
-            "Reject",
-            "No",
-            "拒绝",
-            "不允许",
-            "否",
-            "取消",
-        ]),
-        "denied" | "cancelled" => Ok(&[
-            "Cancel",
-            "Decline",
-            "Reject",
-            "Deny",
-            "No",
-            "取消",
-            "拒绝",
-            "不允许",
-            "否",
-        ]),
-        other => Err(format!("unsupported_local_host_approval_decision {other}")),
-    }
-}
-
-#[cfg(target_os = "windows")]
 fn send_windows_codex_desktop_approval_decision(
     approval: &LocalHostApprovalPrompt,
     decision: &str,
     decision_mode: Option<&str>,
 ) -> Result<(), String> {
-    match resolve_local_codex_console_target_pid(approval) {
-        Ok(target_pid) => {
-            if let Err(error) = send_windows_codex_console_approval_decision(
-                approval,
-                target_pid,
-                decision,
-                decision_mode,
-            ) {
-                append_local_codex_approval_event(
-                    "windows_console_transport_failed",
-                    Some(approval),
-                    None,
-                    Some(json!({
-                        "transport": "windows-console",
-                        "targetPid": target_pid,
-                        "error": error
-                    })),
-                );
-                return Err(error);
-            }
-            return Ok(());
-        }
-        Err(_) => {}
+    let target_pid = resolve_local_codex_console_target_pid(approval)?;
+    if let Err(error) =
+        send_windows_codex_console_approval_decision(approval, target_pid, decision, decision_mode)
+    {
+        append_local_codex_approval_event(
+            "windows_console_transport_failed",
+            Some(approval),
+            None,
+            Some(json!({
+                "transport": "windows-console",
+                "targetPid": target_pid,
+                "error": error
+            })),
+        );
+        return Err(error);
     }
 
-    let button_names = local_codex_host_windows_approval_button_names(decision, decision_mode)?;
-    let script = build_windows_codex_desktop_approval_script(button_names);
-    let result = execute_hidden_powershell(&script)?;
-    append_activity_card_diagnostics_log(&format!(
-        "[local-approval/respond-result] approvalId={} result={}",
-        truncate_local_codex_diagnostic(&approval.approval_id, 120),
-        truncate_local_codex_diagnostic(&result, 80)
-    ));
-    append_local_codex_approval_event(
-        "windows_uia_button_invoked",
-        Some(approval),
-        None,
-        Some(json!({
-            "transport": "windows-uia",
-            "transportResult": result
-        })),
-    );
     Ok(())
 }
 
@@ -2323,11 +2517,7 @@ fn send_local_codex_host_approval_decision(
     decision_mode: Option<&str>,
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
-    let transport = if resolve_local_codex_console_target_pid(approval).is_ok() {
-        "windows-console"
-    } else {
-        "windows-uia"
-    };
+    let transport = "windows-console";
     #[cfg(not(target_os = "windows"))]
     let transport = "ghostty";
 
@@ -2940,6 +3130,20 @@ pub async fn respond_to_local_host_approval(
         &input.decision,
         input.decision_mode.as_deref(),
     )?;
+    wait_for_local_host_approval_resolution(&approval)
+        .await
+        .inspect_err(|error| {
+            append_local_codex_approval_event(
+                "approval_failed",
+                Some(&approval),
+                Some(&input),
+                Some(json!({
+                    "error": error,
+                    "failureStage": "approval_resolution_not_acknowledged",
+                    "transport": "local-host"
+                })),
+            );
+        })?;
     remember_recent_local_codex_resolution(&approval);
     append_local_codex_approval_event(
         "approval_response_delivered",
@@ -3648,13 +3852,43 @@ pub async fn ensure_broker_ready(
         ),
     );
 
-    if broker_health_ok(&broker_url).await {
-        append_bootstrap_log(
-            log_path.as_path(),
-            "ensure_broker_ready: external broker already healthy, skipping install/start",
-        );
+    let manifest = match read_broker_manifest(&app).await {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            append_bootstrap_log(
+                log_path.as_path(),
+                &format!("ensure_broker_ready: manifest read failed error={}", error),
+            );
+            return Ok(failed_start_result(
+                log_path.as_path(),
+                String::new(),
+                error,
+            ));
+        }
+    };
 
-        return Ok(healthy_broker_start_result(log_path.as_path(), None));
+    let outdated_manifest = manifest
+        .as_ref()
+        .filter(|manifest| broker_manifest_requires_upgrade(manifest))
+        .cloned();
+
+    if broker_health_ok(&broker_url).await {
+        if let Some(manifest) = outdated_manifest.as_ref() {
+            append_bootstrap_log(
+                log_path.as_path(),
+                &format!(
+                    "ensure_broker_ready: healthy broker uses outdated installed version={}, upgrading to at least {}",
+                    manifest.version, MINIMUM_REQUIRED_BROKER_VERSION
+                ),
+            );
+        } else {
+            append_bootstrap_log(
+                log_path.as_path(),
+                "ensure_broker_ready: external broker already healthy, skipping install/start",
+            );
+
+            return Ok(healthy_broker_start_result(log_path.as_path(), None));
+        }
     }
 
     let _start_lease = match try_acquire_broker_start_lease() {
@@ -3693,23 +3927,18 @@ pub async fn ensure_broker_ready(
         return Ok(healthy_broker_start_result(log_path.as_path(), None));
     }
 
-    let manifest = match read_broker_manifest(&app).await {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            append_bootstrap_log(
-                log_path.as_path(),
-                &format!("ensure_broker_ready: manifest read failed error={}", error),
-            );
-            return Ok(failed_start_result(
-                log_path.as_path(),
-                String::new(),
-                error,
-            ));
-        }
-    };
+    let restart_runtime_paths = outdated_manifest.as_ref().and_then(|manifest| {
+        let installed_path = PathBuf::from(&manifest.path);
+        installed_path
+            .exists()
+            .then(|| resolve_broker_runtime_paths(&installed_path))
+    });
 
     let installed_path = match manifest {
-        Some(manifest) if PathBuf::from(&manifest.path).exists() => {
+        Some(manifest)
+            if PathBuf::from(&manifest.path).exists()
+                && !broker_manifest_requires_upgrade(&manifest) =>
+        {
             append_bootstrap_log(
                 log_path.as_path(),
                 &format!(
@@ -3718,6 +3947,56 @@ pub async fn ensure_broker_ready(
                 ),
             );
             manifest.path
+        }
+        Some(manifest) if broker_manifest_requires_upgrade(&manifest) => {
+            append_bootstrap_log(
+                log_path.as_path(),
+                &format!(
+                    "ensure_broker_ready: installed broker version={} is below minimum {}, upgrading",
+                    manifest.version, MINIMUM_REQUIRED_BROKER_VERSION
+                ),
+            );
+
+            let latest = match fetch_latest_broker_release_internal(Some(log_path.as_path())).await
+            {
+                Ok(info) => info,
+                Err(error) => {
+                    append_bootstrap_log(
+                        log_path.as_path(),
+                        &format!(
+                            "ensure_broker_ready: latest release fetch failed error={}",
+                            error
+                        ),
+                    );
+                    return Ok(failed_start_result(
+                        log_path.as_path(),
+                        manifest.path,
+                        error,
+                    ));
+                }
+            };
+
+            match install_broker_update_internal(
+                app.clone(),
+                &latest.download_url,
+                &latest.version,
+                Some(log_path.as_path()),
+            )
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    append_bootstrap_log(
+                        log_path.as_path(),
+                        &format!("ensure_broker_ready: install failed error={}", error),
+                    );
+                    return Ok(failed_start_result(
+                        log_path.as_path(),
+                        manifest.path,
+                        error,
+                    ));
+                }
+            }
         }
         Some(manifest) => {
             append_bootstrap_log(
@@ -3818,6 +4097,28 @@ pub async fn ensure_broker_ready(
         }
     };
 
+    if let Some(runtime_paths) = restart_runtime_paths.as_ref() {
+        if broker_health_ok(&broker_url).await {
+            append_bootstrap_log(
+                log_path.as_path(),
+                "ensure_broker_ready: stopping old broker after upgrade",
+            );
+            if let Err(error) =
+                stop_running_broker(log_path.as_path(), &broker_url, &runtime_paths.heartbeat).await
+            {
+                append_bootstrap_log(
+                    log_path.as_path(),
+                    &format!("ensure_broker_ready: stop old broker failed error={}", error),
+                );
+                return Ok(failed_start_result(
+                    log_path.as_path(),
+                    installed_path.clone(),
+                    error,
+                ));
+            }
+        }
+    }
+
     match start_broker_internal(app, broker_url, timeout_ms, Some(log_path.as_path())).await {
         Ok(result) => {
             append_bootstrap_log(
@@ -3847,7 +4148,9 @@ pub async fn ensure_broker_ready(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
     use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn build_runtime_status_reports_installed_healthy_runtime() {
@@ -4324,39 +4627,80 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn local_codex_host_windows_approval_button_names_cover_localized_allow_and_reject_labels() {
+    fn discover_local_codex_console_target_pid_from_entries_prefers_cli_parent_shell() {
+        let entries = vec![
+            LocalCodexWindowsProcessEntry {
+                process_id: Some(31232),
+                parent_process_id: Some(41772),
+                name: Some("codex.exe".to_string()),
+                command_line: Some("C:\\Users\\song\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\codex\\codex.exe".to_string()),
+            },
+            LocalCodexWindowsProcessEntry {
+                process_id: Some(41772),
+                parent_process_id: Some(5468),
+                name: Some("node.exe".to_string()),
+                command_line: Some("\"D:\\Program Files\\nodejs\\node.exe\" C:\\Users\\song\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js".to_string()),
+            },
+        ];
+
         assert_eq!(
-            local_codex_host_windows_approval_button_names("approved", Some("yes")),
-            Ok(&["Allow once", "Allow", "Approve", "Yes", "允许一次", "允许", "批准", "是"][..])
-        );
-        assert_eq!(
-            local_codex_host_windows_approval_button_names("approved", Some("always")),
-            Ok(&[
-                "Always",
-                "Allow for session",
-                "Allow this session",
-                "Always allow",
-                "始终允许",
-                "始终允许本次会话",
-                "始终允许此会话",
-            ][..])
-        );
-        assert_eq!(
-            local_codex_host_windows_approval_button_names("denied", Some("no")),
-            Ok(&["Decline", "Deny", "Reject", "No", "拒绝", "不允许", "否", "取消"][..])
+            discover_local_codex_console_target_pid_from_entries(&entries).unwrap(),
+            5468
         );
     }
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn build_windows_codex_desktop_approval_script_is_powershell5_compatible() {
-        let script = build_windows_codex_desktop_approval_script(&["Allow once", "允许一次"]);
+    fn resolve_local_codex_console_host_pid_from_entries_walks_up_from_bridge_wrapper_pid() {
+        let entries = vec![
+            LocalCodexWindowsProcessEntry {
+                process_id: Some(35864),
+                parent_process_id: Some(3628),
+                name: Some("codex.exe".to_string()),
+                command_line: Some("C:\\Users\\song\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\codex\\codex.exe".to_string()),
+            },
+            LocalCodexWindowsProcessEntry {
+                process_id: Some(3628),
+                parent_process_id: Some(5468),
+                name: Some("node.exe".to_string()),
+                command_line: Some("\"D:\\Program Files\\nodejs\\node.exe\" C:\\Users\\song\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js".to_string()),
+            },
+            LocalCodexWindowsProcessEntry {
+                process_id: Some(5468),
+                parent_process_id: Some(24812),
+                name: Some("pwsh.exe".to_string()),
+                command_line: Some("\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\"".to_string()),
+            },
+        ];
 
-        assert!(script.contains("$rawName = $button.Current.Name"));
-        assert!(script.contains("$name = [string]$rawName"));
-        assert!(script.contains("'Allow once'"));
-        assert!(script.contains("'允许一次'"));
-        assert!(!script.contains("??"));
+        assert_eq!(
+            resolve_local_codex_console_host_pid_from_entries(&entries, 35864),
+            Some(5468)
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn discover_local_codex_console_target_pid_from_entries_rejects_ambiguous_cli_targets() {
+        let entries = vec![
+            LocalCodexWindowsProcessEntry {
+                process_id: Some(41772),
+                parent_process_id: Some(5468),
+                name: Some("node.exe".to_string()),
+                command_line: Some("\"D:\\Program Files\\nodejs\\node.exe\" C:\\Users\\song\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js".to_string()),
+            },
+            LocalCodexWindowsProcessEntry {
+                process_id: Some(50000),
+                parent_process_id: Some(60000),
+                name: Some("node.exe".to_string()),
+                command_line: Some("\"D:\\Program Files\\nodejs\\node.exe\" C:\\Users\\song\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js".to_string()),
+            },
+        ];
+
+        assert_eq!(
+            discover_local_codex_console_target_pid_from_entries(&entries),
+            Err("ambiguous_local_codex_cli_targets 5468,60000".to_string())
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -4367,13 +4711,67 @@ mod tests {
 
         assert!(script.contains("AttachConsole($targetPid)"));
         assert!(script.contains("WriteConsoleInputW"));
+        assert!(script.contains("VkKeyScanW"));
+        assert!(script.contains("MapVirtualKeyW"));
+        assert!(script.contains("$scanCode = [uint16][HexdeckNativeConsole]::MapVirtualKeyW"));
+        assert!(script.contains("$controlKeyState = $controlKeyState -bor [HexdeckNativeConsole]::SHIFT_PRESSED"));
         assert!(script.contains("$targetPid = [uint32]33860"));
-        assert!(script.contains("[HexdeckNativeConsole]::GENERIC_READ_WRITE"));
-        assert!(script.contains("[HexdeckNativeConsole]::FILE_SHARE_READ_WRITE"));
+        assert!(script.contains("[uint32]$desiredAccess = 3221225472"));
+        assert!(script.contains("[uint32]$shareMode = 3"));
+        assert!(script.contains("[uint32]$openExisting = 3"));
+        assert!(script.contains("[uint32]$noFileFlags = 0"));
         assert!(script.contains("$inputHandle = [IntPtr]::Zero"));
         assert!(script.contains("$inputHandle -ne [IntPtr]::Zero"));
         assert!(script.contains("$shortcutLabel = 'y'"));
         assert!(!script.contains("??"));
+    }
+
+    #[test]
+    fn local_host_approval_still_pending_matches_by_fingerprint() {
+        let approval = LocalHostApprovalPrompt {
+            approval_id: "hexdeck-local-codex-host-codex-session-1-call_1".to_string(),
+            task_id: "local-host-approval-codex-session-1-call_1".to_string(),
+            thread_id: "local-host-approval-codex-session-1".to_string(),
+            participant_id: "codex-session-1".to_string(),
+            session_id: "session-1".to_string(),
+            summary: "Do you want to allow this command?".to_string(),
+            detail_text: "".to_string(),
+            command_title: "Codex".to_string(),
+            command_line: "whoami".to_string(),
+            command_preview: "D:\\projects\\hexdeck".to_string(),
+            terminal_app: "PowerShell".to_string(),
+            terminal_session_id: "".to_string(),
+            runtime_source: Some("queued-context".to_string()),
+            project_path: Some("D:\\projects\\hexdeck".to_string()),
+            transcript_path: PathBuf::from("C:\\tmp\\codex-session.jsonl"),
+            call_id: "call_1".to_string(),
+            sort_key_ms: 1,
+        };
+        let same_fingerprint_different_id = LocalHostApprovalPrompt {
+            approval_id: "hexdeck-local-codex-host-codex-session-1-call_2".to_string(),
+            task_id: "local-host-approval-codex-session-1-call_2".to_string(),
+            thread_id: "local-host-approval-codex-session-1".to_string(),
+            participant_id: "codex-session-1".to_string(),
+            session_id: "session-1".to_string(),
+            summary: "Do you want to allow this command?".to_string(),
+            detail_text: "".to_string(),
+            command_title: "Codex".to_string(),
+            command_line: "whoami".to_string(),
+            command_preview: "D:\\projects\\hexdeck".to_string(),
+            terminal_app: "PowerShell".to_string(),
+            terminal_session_id: "".to_string(),
+            runtime_source: Some("queued-context".to_string()),
+            project_path: Some("D:\\projects\\hexdeck".to_string()),
+            transcript_path: PathBuf::from("C:\\tmp\\codex-session-2.jsonl"),
+            call_id: "call_2".to_string(),
+            sort_key_ms: 2,
+        };
+
+        assert!(local_host_approval_still_pending(
+            &approval,
+            &[same_fingerprint_different_id]
+        ));
+        assert!(!local_host_approval_still_pending(&approval, &[]));
     }
 
     #[test]
@@ -4492,7 +4890,7 @@ mod tests {
             runtime.terminal_session_id.as_deref(),
             Some("DFCFDE26-762E-4742-9E9C-5DBC2CEACA5C")
         );
-        assert!(is_supported_local_codex_runtime(&runtime));
+        assert!(is_supported_local_codex_runtime(&runtime, 1_777_000_000_000));
     }
 
     #[test]
@@ -4508,7 +4906,24 @@ mod tests {
         )
         .expect("expected windows runtime json to deserialize");
 
-        assert!(is_supported_local_codex_runtime(&runtime));
+        assert!(is_supported_local_codex_runtime(&runtime, 1_777_000_000_000));
+    }
+
+    #[test]
+    fn local_codex_runtime_state_accepts_recent_idle_stop_hook_runtime() {
+        let runtime: LocalCodexRuntimeState = serde_json::from_str(
+            r#"{
+                "status": "idle",
+                "source": "stop-hook",
+                "sessionId": "019dc7c7-5dac-7582-acc8-552f30f50aab",
+                "terminalApp": "unknown",
+                "projectPath": "C:\\Users\\song\\.codex\\memories",
+                "updatedAt": "2026-04-26T03:17:00.973Z"
+            }"#,
+        )
+        .expect("expected stop-hook runtime json to deserialize");
+
+        assert!(is_supported_local_codex_runtime(&runtime, 1_777_173_000_000));
     }
 
     #[test]
@@ -4541,6 +4956,62 @@ mod tests {
             home_dir_from_sources(None, None, Some("C:".into()), Some("\\Users\\song".into()));
 
         assert_eq!(home, Some(PathBuf::from("C:\\Users\\song")));
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("hexdeck-broker-tests-{name}-{nonce}"))
+    }
+
+    #[test]
+    fn resolve_codex_transcript_path_prefers_runtime_participant_hint_when_session_id_drifts() {
+        let root = unique_test_dir("participant-hint");
+        let day_dir = root.join("2026").join("04").join("26");
+        fs::create_dir_all(&day_dir).expect("day dir");
+        let expected = day_dir.join(
+            "rollout-2026-04-26T11-13-20-019dc7c6-ff71-7b70-ae33-317d53683d82.jsonl",
+        );
+        fs::write(&expected, "{}").expect("transcript");
+
+        let resolved = resolve_codex_transcript_path_from_root(
+            &root,
+            "codex-session-019dc7c6",
+            "019dc7c7-5dac-7582-acc8-552f30f50aab",
+            Some("2026-04-26T03:13:51.293Z"),
+        );
+
+        assert_eq!(resolved, Some(expected.clone()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_codex_transcript_path_returns_latest_match() {
+        let root = unique_test_dir("latest-match");
+        let day_dir = root.join("2026").join("04").join("26");
+        fs::create_dir_all(&day_dir).expect("day dir");
+        let older = day_dir.join(
+            "rollout-2026-04-26T08-58-52-019dc74b-e3fb-7a81-8732-1749ae3a1733.jsonl",
+        );
+        let newer = day_dir.join(
+            "rollout-2026-04-26T10-41-04-019dc74b-e3fb-7a81-8732-1749ae3a1733.jsonl",
+        );
+        fs::write(&older, "{}").expect("older transcript");
+        fs::write(&newer, "{}").expect("newer transcript");
+
+        let resolved = resolve_codex_transcript_path_from_root(
+            &root,
+            "codex-session-019dc74b",
+            "019dc74b-e3fb-7a81-8732-1749ae3a1733",
+            Some("2026-04-26T11:00:00Z"),
+        );
+
+        assert_eq!(resolved, Some(newer.clone()));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

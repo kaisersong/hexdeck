@@ -65,6 +65,10 @@ export function selectPopupSessionCards(cards: ActivityCardProjection[], nowMs: 
   const retainedCards: Array<{ card: ActivityCardProjection; index: number }> = [];
 
   for (const [index, card] of cards.entries()) {
+    if (card.popupEligible === false) {
+      continue;
+    }
+
     if (card.kind !== 'completion') {
       retainedCards.push({ card, index });
       continue;
