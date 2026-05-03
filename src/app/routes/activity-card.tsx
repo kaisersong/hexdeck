@@ -408,7 +408,6 @@ export function ActivityCardRoute({
       previewCard
       || windowVisibility !== 'keep'
       || displayCard
-      || !hasShownActivityCardWindowRef.current
       || hasHiddenActivityCardWindowRef.current
     ) {
       return;

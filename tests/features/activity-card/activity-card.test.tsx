@@ -519,6 +519,33 @@ describe('FloatingActivityCard', () => {
     });
   });
 
+  it('accepts approval button clicks in the live Tauri activity-card window without requiring a prior pointerdown', () => {
+    const onApprovalDecision = vi.fn();
+    Object.defineProperty(window, '__TAURI_INTERNALS__', {
+      configurable: true,
+      value: {},
+    });
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    try {
+      render(
+        <FloatingActivityCard
+          card={makeApprovalCard()}
+          onApprovalDecision={onApprovalDecision}
+        />
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+
+      expect(onApprovalDecision).toHaveBeenCalledWith({
+        decisionMode: 'yes',
+        label: '确认删除',
+      });
+    } finally {
+      delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    }
+  });
+
   it('renders a manual close button for activity cards', () => {
     const onDismiss = vi.fn();
 
@@ -1195,6 +1222,24 @@ describe('ActivityCardRoute', () => {
     expect(hideWindowMock).not.toHaveBeenCalled();
   });
 
+  it('hides an initially empty keep-intent activity-card shell after the stale delay', async () => {
+    render(
+      <ActivityCardRoute
+        card={null}
+        windowVisibility="keep"
+      />
+    );
+
+    await new Promise((resolve) => {
+      window.setTimeout(resolve, 300);
+    });
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
+    });
+    expect(hideWindowMock).not.toHaveBeenCalled();
+  });
+
   it('reopens the live activity-card window when a new real card arrives after hiding', async () => {
     const { rerender } = render(<ActivityCardRoute card={makeApprovalCard('approval-1')} />);
 
@@ -1758,7 +1803,9 @@ describe('activity-card window routing', () => {
     expect(screen.getByText('Deploy approval needed')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Open Main Panel' })).not.toBeInTheDocument();
     expect(invokeMock).toHaveBeenCalledWith('hide_activity_card_window');
-    expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('show_activity_card_window');
+    });
   });
 
   it('keeps the live activity-card window stable across a transient empty refresh for the same broker card', async () => {

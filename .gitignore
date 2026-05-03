@@ -5,3 +5,9 @@ src-tauri/gen
 .tauri
 .gstack/
 docs
+.tmp/
+.tmp-debug/
+.tmp-intent-broker/
+.xiaok/
+.superpowers/
+test-approval-detection.sh

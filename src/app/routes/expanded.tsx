@@ -13,7 +13,7 @@ export function ExpandedRoute({
   runtimeStatus: BrokerRuntimeStatus | null;
   onSaveSettings: (input: { globalShortcut: string }) => void;
   onRefreshBroker: () => void;
-  onRestartBroker: () => void;
+  onRestartBroker: () => void | Promise<void>;
 }) {
   return (
     <main className="expanded-shell">

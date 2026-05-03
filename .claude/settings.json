@@ -1,0 +1,70 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(/Users/song/projects/intent-broker/**)",
+      "Edit(/Users/song/projects/intent-broker/**)",
+      "Write(/Users/song/projects/intent-broker/**)",
+      "Bash(cd /Users/song/projects/intent-broker*)",
+      "Bash(git*)"
+    ],
+    "additionalDirectories": [
+      "/Users/song/projects/intent-broker"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/Users/song/Library/Application Support/com.hexdeck.app/kernel/intent-broker-0.3.1-local-20260422-2151/adapters/claude-code-plugin/bin/claude-code-broker.js\" hook session-start"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/Users/song/Library/Application Support/com.hexdeck.app/kernel/intent-broker-0.3.1-local-20260422-2151/adapters/claude-code-plugin/bin/claude-code-broker.js\" hook user-prompt-submit"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/Users/song/Library/Application Support/com.hexdeck.app/kernel/intent-broker-0.3.1-local-20260422-2151/adapters/claude-code-plugin/bin/claude-code-broker.js\" hook permission-request",
+            "timeout": 86400
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/Users/song/Library/Application Support/com.hexdeck.app/kernel/intent-broker-0.3.1-local-20260422-2151/adapters/claude-code-plugin/bin/claude-code-broker.js\" hook stop"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/Users/song/Library/Application Support/com.hexdeck.app/kernel/intent-broker-0.3.1-local-20260422-2151/adapters/claude-code-plugin/bin/claude-code-broker.js\" hook pre-tool-use"
+          }
+        ]
+      }
+    ]
+  }
+}

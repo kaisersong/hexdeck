@@ -595,6 +595,69 @@
   font-size: 0.85rem;
 }
 
+.settings-channel-form {
+  display: grid;
+  gap: 14px;
+}
+
+.settings-channel-row {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.settings-channel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-channel-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--text);
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.settings-channel-toggle input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.settings-channel-badge {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border: 1px solid rgba(110, 231, 183, 0.35);
+  border-radius: 999px;
+  color: #6ee7b7;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.settings-channel-badge.muted {
+  border-color: rgba(139, 144, 160, 0.35);
+  color: var(--text-muted);
+}
+
+.settings-channel-path {
+  min-width: 0;
+  color: var(--text-muted);
+  font-family: monospace;
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .update-error {
   padding: 8px 12px;
   border: 1px solid rgba(255, 126, 126, 0.4);
@@ -818,7 +881,7 @@
 .menu-dropdown__groups {
   display: grid;
   gap: 0;
-  max-height: 382px;
+  max-height: 280px;
   overflow-y: auto;
   padding-right: 2px;
 }

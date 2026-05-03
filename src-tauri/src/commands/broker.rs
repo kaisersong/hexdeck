@@ -130,6 +130,26 @@ pub struct BrokerRuntimeStatus {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerChannelConfig {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub send_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerChannelSettings {
+    pub installed: bool,
+    pub config_path: Option<String>,
+    pub channels: HashMap<String, BrokerChannelConfig>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrokerApprovalResponsePayload {
@@ -3231,6 +3251,108 @@ pub async fn get_installed_broker_path(app: AppHandle) -> Result<Option<String>,
         .map(|manifest| manifest.path))
 }
 
+fn broker_local_config_path(manifest: &BrokerManifest) -> PathBuf {
+    PathBuf::from(&manifest.path).join("intent-broker.local.json")
+}
+
+fn read_broker_local_config_value(config_path: &Path) -> Result<Value, String> {
+    if !config_path.exists() {
+        return Ok(json!({}));
+    }
+
+    let content = fs::read_to_string(config_path)
+        .map_err(|error| format!("failed_to_read_broker_local_config: {}", error))?;
+    if content.trim().is_empty() {
+        return Ok(json!({}));
+    }
+
+    serde_json::from_str(&content)
+        .map_err(|error| format!("failed_to_parse_broker_local_config: {}", error))
+}
+
+fn broker_channel_settings_from_config(
+    installed: bool,
+    config_path: Option<&Path>,
+    config: &Value,
+) -> Result<BrokerChannelSettings, String> {
+    let channels = match config.get("channels") {
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|error| format!("failed_to_parse_broker_channels: {}", error))?,
+        None => HashMap::new(),
+    };
+
+    Ok(BrokerChannelSettings {
+        installed,
+        config_path: config_path.map(|path| path.to_string_lossy().to_string()),
+        channels,
+    })
+}
+
+fn merge_broker_channel_settings(
+    mut config: Value,
+    channels: HashMap<String, BrokerChannelConfig>,
+) -> Result<Value, String> {
+    if !config.is_object() {
+        return Err("broker_local_config_must_be_object".to_string());
+    }
+
+    let config_object = config
+        .as_object_mut()
+        .ok_or_else(|| "broker_local_config_must_be_object".to_string())?;
+    config_object.insert(
+        "channels".to_string(),
+        serde_json::to_value(channels)
+            .map_err(|error| format!("failed_to_serialize_broker_channels: {}", error))?,
+    );
+    Ok(config)
+}
+
+fn write_broker_local_config_value(config_path: &Path, config: &Value) -> Result<(), String> {
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed_to_create_broker_config_dir: {}", error))?;
+    }
+
+    let content = serde_json::to_string_pretty(config)
+        .map_err(|error| format!("failed_to_format_broker_local_config: {}", error))?;
+    let tmp_path = config_path.with_extension("json.tmp");
+    fs::write(&tmp_path, format!("{}\n", content))
+        .map_err(|error| format!("failed_to_write_broker_local_config: {}", error))?;
+    fs::rename(&tmp_path, config_path)
+        .map_err(|error| format!("failed_to_replace_broker_local_config: {}", error))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_broker_channel_settings(app: AppHandle) -> Result<BrokerChannelSettings, String> {
+    let Some(manifest) = read_broker_manifest(&app).await? else {
+        return Ok(BrokerChannelSettings {
+            installed: false,
+            config_path: None,
+            channels: HashMap::new(),
+        });
+    };
+
+    let config_path = broker_local_config_path(&manifest);
+    let config = read_broker_local_config_value(&config_path)?;
+    broker_channel_settings_from_config(true, Some(&config_path), &config)
+}
+
+#[tauri::command]
+pub async fn save_broker_channel_settings(
+    app: AppHandle,
+    channels: HashMap<String, BrokerChannelConfig>,
+) -> Result<BrokerChannelSettings, String> {
+    let manifest = read_broker_manifest(&app)
+        .await?
+        .ok_or_else(|| "broker_not_installed".to_string())?;
+    let config_path = broker_local_config_path(&manifest);
+    let config = read_broker_local_config_value(&config_path)?;
+    let next_config = merge_broker_channel_settings(config, channels)?;
+    write_broker_local_config_value(&config_path, &next_config)?;
+    broker_channel_settings_from_config(true, Some(&config_path), &next_config)
+}
+
 async fn fetch_latest_broker_release_internal(
     log_path: Option<&Path>,
 ) -> Result<BrokerVersionInfo, String> {
@@ -4252,6 +4374,64 @@ mod tests {
             info.download_url,
             "https://github.com/kaisersong/intent-broker/releases/download/v0.2.2/intent-broker-0.2.2.tar.gz"
         );
+    }
+
+    #[test]
+    fn merge_broker_channel_settings_preserves_unrelated_config() {
+        let config = json!({
+            "server": {
+                "host": "127.0.0.1",
+                "port": 4318
+            },
+            "channels": {
+                "legacy": {
+                    "enabled": true,
+                    "custom": "keep"
+                }
+            }
+        });
+        let mut channels = HashMap::new();
+        channels.insert(
+            "yunzhijia".to_string(),
+            BrokerChannelConfig {
+                enabled: true,
+                send_url: Some("https://www.yunzhijia.com/webhook".to_string()),
+                webhook_url: None,
+                extra: Map::new(),
+            },
+        );
+
+        let merged = merge_broker_channel_settings(config, channels).expect("merged config");
+
+        assert_eq!(merged["server"]["port"], json!(4318));
+        assert_eq!(
+            merged["channels"]["yunzhijia"]["sendUrl"],
+            json!("https://www.yunzhijia.com/webhook")
+        );
+    }
+
+    #[test]
+    fn broker_channel_settings_parses_unknown_channel_fields() {
+        let config = json!({
+            "channels": {
+                "dingtalk": {
+                    "enabled": false,
+                    "webhookUrl": "https://oapi.dingtalk.com/robot/send",
+                    "secret": "preserve"
+                }
+            }
+        });
+
+        let settings =
+            broker_channel_settings_from_config(true, None, &config).expect("channel settings");
+        let dingtalk = settings.channels.get("dingtalk").expect("dingtalk config");
+
+        assert!(!dingtalk.enabled);
+        assert_eq!(
+            dingtalk.webhook_url.as_deref(),
+            Some("https://oapi.dingtalk.com/robot/send")
+        );
+        assert_eq!(dingtalk.extra.get("secret"), Some(&json!("preserve")));
     }
 
     #[test]

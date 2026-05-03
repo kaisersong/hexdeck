@@ -1,4 +1,3 @@
-import { useRef } from 'react';
 import type {
   ActivityCardApprovalAction,
   ActivityCardApprovalProjection,
@@ -6,7 +5,6 @@ import type {
   ActivityCardProjection,
   ActivityCardQuestionProjection
 } from '../../lib/activity-card/types';
-import type { BrokerApprovalDecisionMode } from '../../lib/broker/types';
 import type { JumpTarget } from '../../lib/jump/types';
 import { ActivityCardMarkdown } from './ActivityCardMarkdown';
 
@@ -19,8 +17,6 @@ export interface FloatingActivityCardProps {
   onJump?: (target: JumpTarget) => void;
   onHoverChange?: (hovered: boolean) => void;
 }
-
-const APPROVAL_POINTER_GUARD_WINDOW_MS = 1500;
 
 function isLiveTauriActivityCardWindow(): boolean {
   if (typeof window === 'undefined') {
@@ -150,11 +146,7 @@ function ApprovalActions({
   onApprovalDecision?: (action: ActivityCardApprovalAction) => void;
 }) {
   const isPending = pendingApprovalIds?.has(card.approvalId) ?? false;
-  const pointerGuardEnabled = isLiveTauriActivityCardWindow();
-  const lastPointerIntentRef = useRef<{
-    decisionMode: BrokerApprovalDecisionMode;
-    atMs: number;
-  } | null>(null);
+  const liveTauriWindow = isLiveTauriActivityCardWindow();
 
   return (
     <div className="floating-card__actions">
@@ -166,7 +158,7 @@ function ApprovalActions({
           disabled={isPending || Boolean(action.disabled)}
           title={action.unsupportedReason ?? undefined}
           onPointerDown={(event) => {
-            if (!pointerGuardEnabled) {
+            if (!liveTauriWindow) {
               return;
             }
 
@@ -185,34 +177,9 @@ function ApprovalActions({
               isPrimary: event.isPrimary,
               detail: event.detail,
             });
-
-            lastPointerIntentRef.current = {
-              decisionMode: action.decisionMode,
-              atMs: Date.now(),
-            };
           }}
           onClick={(event) => {
-            if (pointerGuardEnabled) {
-              const pointerIntent = lastPointerIntentRef.current;
-              const pointerIntentMatches = Boolean(
-                pointerIntent
-                  && pointerIntent.decisionMode === action.decisionMode
-                  && Date.now() - pointerIntent.atMs <= APPROVAL_POINTER_GUARD_WINDOW_MS
-              );
-              lastPointerIntentRef.current = null;
-
-              if (!pointerIntentMatches) {
-                void debugLogFloatingCardEvent({
-                  stage: 'approval_button_ignored_non_pointer',
-                  approvalId: card.approvalId,
-                  taskId: card.taskId ?? null,
-                  decisionMode: action.decisionMode,
-                });
-                return;
-              }
-            }
-
-            if (pointerGuardEnabled) {
+            if (liveTauriWindow) {
               void debugLogFloatingCardEvent({
                 stage: 'approval_button_click',
                 approvalId: card.approvalId,
