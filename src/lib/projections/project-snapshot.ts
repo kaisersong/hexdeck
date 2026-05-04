@@ -91,7 +91,11 @@ function derivePendingApprovals(
 export function buildProjectSnapshot(seed: ProjectSeed): ProjectSnapshotProjection {
   const participantIds = new Set(seed.participants.map((participant) => participant.participantId));
   const workStateParticipantIds = new Set(seed.workStates.map((workState) => workState.participantId));
-  const dedupedParticipants = dedupeActivelyPresentParticipants(seed.participants, workStateParticipantIds);
+  const cliParticipants = seed.participants.filter((participant) => {
+    const source = (participant as { metadata?: Record<string, unknown> }).metadata?.source;
+    return source === undefined || source === null || source === 'cli';
+  });
+  const dedupedParticipants = dedupeActivelyPresentParticipants(cliParticipants, workStateParticipantIds);
   const byParticipant = new Map(dedupedParticipants.map((participant) => [participant.participantId, participant]));
   const agentParticipants = dedupedParticipants.filter(
     (participant) => participant.kind !== 'human' && participant.kind !== 'adapter'
