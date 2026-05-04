@@ -379,7 +379,7 @@ fn desktop_shell_uses_accessory_activation_policy() -> bool {
 }
 
 fn tray_icon_uses_template_image() -> bool {
-    false
+    true
 }
 
 #[cfg(target_os = "macos")]
