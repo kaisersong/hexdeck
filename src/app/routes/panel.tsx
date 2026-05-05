@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { dedupeActivelyPresentParticipants, isParticipantActivelyPresent } from '../../lib/broker/liveness';
 import type { BrokerParticipant } from '../../lib/broker/types';
 import { buildJumpTarget } from '../../lib/jump/targets';
@@ -254,6 +255,7 @@ export function PanelRoute({
   onClose?: () => void;
 }) {
   const [offlineExpanded, setOfflineExpanded] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement | null>(null);
   const firstOfflineRowRef = useRef<HTMLButtonElement | null>(null);
   const { onlineGroups, offlineAgents } = buildProjectGroups(participants, currentProject, snapshot.now);
   const attentionBadge = renderAttentionBadge(snapshot.attention);
@@ -261,6 +263,24 @@ export function PanelRoute({
   const brokerChipLabel = brokerStatusLive ? 'Live' : 'Degraded';
   const brokerFooterLabel = brokerStatusLive ? 'Healthy' : 'Degraded';
   const currentProjectLabel = currentProject.trim() || 'Current Project';
+
+  const setDropdownRef = (el: HTMLDivElement | null) => {
+    dropdownRef.current = el;
+  };
+
+  // Debounced resize: only resize once per data change
+  const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    const el = dropdownRef.current;
+    if (!el) return;
+    if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
+    resizeTimerRef.current = setTimeout(() => {
+      const rect = el.getBoundingClientRect();
+      const height = Math.ceil(Math.max(el.scrollHeight, rect.height));
+      invoke('resize_panel_to_content', { contentWidth: 320, contentHeight: height + 2 }).catch(() => {});
+    }, 100);
+    return () => { if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current); };
+  }, [onlineGroups.length, offlineAgents.length, offlineExpanded]);
 
   useEffect(() => {
     if (!offlineExpanded) {
@@ -273,7 +293,7 @@ export function PanelRoute({
   }, [offlineExpanded]);
 
   return (
-    <div className="menu-dropdown">
+    <div className="menu-dropdown" ref={setDropdownRef}>
       <div className="menu-dropdown__chrome" aria-hidden="true" />
       <header
         className="menu-dropdown__header panel-header--draggable"

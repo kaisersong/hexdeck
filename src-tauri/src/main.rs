@@ -159,7 +159,7 @@ fn jump_result(ok: bool, precision: &str, reason: Option<String>) -> JumpResultP
 }
 
 fn panel_window_size() -> (f64, f64) {
-    (344.0, 420.0)
+    (320.0, 540.0)
 }
 
 fn panel_window_resizable() -> bool {
@@ -632,6 +632,13 @@ fn show_panel_window(
         window.move_window_constrained(Position::TrayCenter)?;
     }
 
+    // Reset width to canonical 320px (in case window was resized by a previous session)
+    // Height will be adjusted by the frontend after layout
+    let (panel_width, _) = panel_window_size();
+    let _ = window.set_size(tauri::LogicalSize::new(panel_width, 540.0));
+
+    // Show window; frontend will measure content and call resize_panel_to_content
+    // to shrink the window to fit content height after layout
     window.show()?;
     window.set_focus()?;
     Ok(window)
@@ -820,6 +827,19 @@ fn prime_activity_card_window_for_app(_app: &tauri::AppHandle) -> tauri::Result<
 #[tauri::command]
 fn show_activity_card_window(app: tauri::AppHandle) -> Result<(), String> {
     show_activity_card_window_for_app(&app).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn resize_panel_to_content(app: tauri::AppHandle, content_width: f64, content_height: f64) -> Result<(), String> {
+    let window = app
+        .get_webview_window("panel")
+        .ok_or_else(|| "panel window not found".to_string())?;
+    let width = content_width.clamp(250.0, 420.0);
+    let height = content_height.clamp(200.0, 600.0);
+    window
+        .set_size(tauri::LogicalSize::new(width, height))
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1885,6 +1905,7 @@ fn main() {
             prepare_activity_card_window,
             show_activity_card_window,
             resize_activity_card_window,
+            resize_panel_to_content,
             hide_activity_card_window,
             debug_log_activity_card_frontend,
             jump_with_ghostty,
@@ -1947,7 +1968,7 @@ mod tests {
     #[test]
     fn panel_window_size_matches_compact_dropdown_shell() {
         let (width, height) = panel_window_size();
-        assert_eq!((width, height), (344.0, 540.0));
+        assert_eq!((width, height), (320.0, 540.0));
     }
 
     #[test]
