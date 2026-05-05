@@ -1038,6 +1038,25 @@ fn is_suppressed_activity_card_event(value: &serde_json::Value) -> bool {
             .unwrap_or(false)
 }
 
+fn broker_event_created_at(value: &serde_json::Value) -> Option<chrono::NaiveDateTime> {
+    value
+        .get("createdAt")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok())
+}
+
+fn is_event_fresh(value: &serde_json::Value, max_age_seconds: i64) -> bool {
+    let created_at = broker_event_created_at(value);
+    if created_at.is_none() {
+        // Events without createdAt are considered fresh (e.g., approvals)
+        return true;
+    }
+
+    let now = chrono::Utc::now().naive_utc();
+    let age_seconds = (now - created_at.unwrap()).num_seconds();
+    age_seconds <= max_age_seconds
+}
+
 fn is_popup_activity_card_event(value: &serde_json::Value) -> bool {
     if is_suppressed_activity_card_event(value) {
         return false;
@@ -1046,9 +1065,13 @@ fn is_popup_activity_card_event(value: &serde_json::Value) -> bool {
     match broker_event_kind(value) {
         Some("request_approval") | Some("ask_clarification") => true,
         Some("report_progress") => {
+            // Completion events only popup if fresh (within 5 minutes)
+            // Old completions from stop-fallback can have historical conversation content
+            // like lunch suggestions, which would be confusing to show as new
             broker_event_payload(value)
                 .and_then(|payload| payload.get("stage").and_then(serde_json::Value::as_str))
                 == Some("completed")
+                && is_event_fresh(value, 300) // 5 minutes
         }
         _ => false,
     }
