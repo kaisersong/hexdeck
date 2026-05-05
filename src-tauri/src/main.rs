@@ -823,6 +823,18 @@ fn show_activity_card_window(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn resize_panel_window(app: tauri::AppHandle, height: f64) -> Result<(), String> {
+    let window = app
+        .get_webview_window("panel")
+        .ok_or_else(|| "panel window not found".to_string())?;
+    let width = panel_window_size().0;
+    window
+        .set_size(tauri::LogicalSize::new(width, height))
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 fn resize_activity_card_window(
     app: tauri::AppHandle,
     width: f64,
@@ -1886,6 +1898,7 @@ fn main() {
             prepare_activity_card_window,
             show_activity_card_window,
             resize_activity_card_window,
+            resize_panel_window,
             hide_activity_card_window,
             debug_log_activity_card_frontend,
             jump_with_ghostty,
