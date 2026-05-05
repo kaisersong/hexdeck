@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { dedupeActivelyPresentParticipants, isParticipantActivelyPresent } from '../../lib/broker/liveness';
 import type { BrokerParticipant } from '../../lib/broker/types';
 import { buildJumpTarget } from '../../lib/jump/targets';
@@ -255,30 +254,8 @@ export function PanelRoute({
   onClose?: () => void;
 }) {
   const [offlineExpanded, setOfflineExpanded] = useState(false);
-  const dropdownRef = useRef<HTMLDivElement | null>(null);
   const firstOfflineRowRef = useRef<HTMLButtonElement | null>(null);
   const { onlineGroups, offlineAgents } = buildProjectGroups(participants, currentProject, snapshot.now);
-
-  // Resize panel window to fit content
-  useEffect(() => {
-    if (!dropdownRef.current) {
-      return;
-    }
-
-    const measureAndResize = () => {
-      const height = dropdownRef.current?.offsetHeight ?? 0;
-      if (height > 0) {
-        invoke('resize_panel_window', { height }).catch(() => {});
-      }
-    };
-
-    // Measure after render
-    measureAndResize();
-
-    // Re-measure when offline section expands/collapses
-    const timeout = setTimeout(measureAndResize, 100);
-    return () => clearTimeout(timeout);
-  }, [onlineGroups.length, offlineAgents.length, offlineExpanded]);
   const attentionBadge = renderAttentionBadge(snapshot.attention);
   const brokerStatusLive = brokerLive ?? snapshot.overview.brokerHealthy;
   const brokerChipLabel = brokerStatusLive ? 'Live' : 'Degraded';
@@ -296,7 +273,7 @@ export function PanelRoute({
   }, [offlineExpanded]);
 
   return (
-    <div className="menu-dropdown" ref={dropdownRef}>
+    <div className="menu-dropdown">
       <div className="menu-dropdown__chrome" aria-hidden="true" />
       <header
         className="menu-dropdown__header panel-header--draggable"

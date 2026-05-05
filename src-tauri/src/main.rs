@@ -379,7 +379,7 @@ fn desktop_shell_uses_accessory_activation_policy() -> bool {
 }
 
 fn tray_icon_uses_template_image() -> bool {
-    true
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -820,18 +820,6 @@ fn prime_activity_card_window_for_app(_app: &tauri::AppHandle) -> tauri::Result<
 #[tauri::command]
 fn show_activity_card_window(app: tauri::AppHandle) -> Result<(), String> {
     show_activity_card_window_for_app(&app).map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn resize_panel_window(app: tauri::AppHandle, height: f64) -> Result<(), String> {
-    let window = app
-        .get_webview_window("panel")
-        .ok_or_else(|| "panel window not found".to_string())?;
-    let width = panel_window_size().0;
-    window
-        .set_size(tauri::LogicalSize::new(width, height))
-        .map_err(|error| error.to_string())?;
-    Ok(())
 }
 
 #[tauri::command]
@@ -1898,7 +1886,6 @@ fn main() {
             prepare_activity_card_window,
             show_activity_card_window,
             resize_activity_card_window,
-            resize_panel_window,
             hide_activity_card_window,
             debug_log_activity_card_frontend,
             jump_with_ghostty,

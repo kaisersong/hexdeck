@@ -881,6 +881,7 @@
 .menu-dropdown__groups {
   display: grid;
   gap: 0;
+  max-height: 400px;
   overflow-y: auto;
   padding-right: 2px;
 }
