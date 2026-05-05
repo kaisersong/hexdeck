@@ -29,7 +29,7 @@ const ACTIVITY_CARD_LOCAL_APPROVAL_POLL_INTERVAL: std::time::Duration =
 const ACTIVITY_CARD_DIAGNOSTICS_LOG_NAME: &str = "hexdeck-activity-card-diagnostics.log";
 const ACTIVITY_CARD_DIAGNOSTICS_JSONL_NAME: &str = "hexdeck-activity-card-diagnostics.jsonl";
 #[cfg(target_os = "macos")]
-const MACOS_TRAY_ICON_PNG: &[u8] = include_bytes!("../../public/hexdeck-menu-tray.png");
+const MACOS_TRAY_ICON_PNG: &[u8] = include_bytes!("../icons/tray-icon-macos.png");
 
 // ============================================================================
 // CLI Subcommand Definitions
@@ -159,7 +159,7 @@ fn jump_result(ok: bool, precision: &str, reason: Option<String>) -> JumpResultP
 }
 
 fn panel_window_size() -> (f64, f64) {
-    (344.0, 540.0)
+    (344.0, 420.0)
 }
 
 fn panel_window_resizable() -> bool {
@@ -379,7 +379,7 @@ fn desktop_shell_uses_accessory_activation_policy() -> bool {
 }
 
 fn tray_icon_uses_template_image() -> bool {
-    false
+    true
 }
 
 #[cfg(target_os = "macos")]
@@ -1063,15 +1063,14 @@ fn is_popup_activity_card_event(value: &serde_json::Value) -> bool {
     }
 
     match broker_event_kind(value) {
-        Some("request_approval") | Some("ask_clarification") => true,
+        Some("request_approval") | Some("ask_clarification") => {
+            is_event_fresh(value, 300) // 5 minutes
+        }
         Some("report_progress") => {
-            // Completion events only popup if fresh (within 5 minutes)
-            // Old completions from stop-fallback can have historical conversation content
-            // like lunch suggestions, which would be confusing to show as new
             broker_event_payload(value)
                 .and_then(|payload| payload.get("stage").and_then(serde_json::Value::as_str))
                 == Some("completed")
-                && is_event_fresh(value, 300) // 5 minutes
+                && is_event_fresh(value, 300)
         }
         _ => false,
     }
