@@ -275,12 +275,27 @@ export function PanelRoute({
     if (!el) return;
     if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
     resizeTimerRef.current = setTimeout(() => {
-      const rect = el.getBoundingClientRect();
-      const height = Math.ceil(Math.max(el.scrollHeight, rect.height));
+      const height = Math.ceil(el.scrollHeight);
       invoke('resize_panel_to_content', { contentWidth: 320, contentHeight: height + 2 }).catch(() => {});
     }, 100);
     return () => { if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current); };
   }, [onlineGroups.length, offlineAgents.length, offlineExpanded]);
+
+  // Also resize when window becomes visible (show_panel_window resets to 540px)
+  useEffect(() => {
+    const onFocus = () => {
+      const el = dropdownRef.current;
+      if (!el) return;
+      setTimeout(() => {
+        const height = Math.ceil(el.scrollHeight);
+        invoke('resize_panel_to_content', { contentWidth: 320, contentHeight: height + 2 }).catch(() => {});
+      }, 50);
+    };
+    window.addEventListener('focus', onFocus);
+    // Initial resize on mount
+    onFocus();
+    return () => window.removeEventListener('focus', onFocus);
+  }, []);
 
   useEffect(() => {
     if (!offlineExpanded) {

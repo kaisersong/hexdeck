@@ -633,7 +633,7 @@ fn show_panel_window(
     }
 
     // Reset width to canonical 320px (in case window was resized by a previous session)
-    // Height will be adjusted by the frontend after layout
+    // Height starts at max; frontend ResizeObserver will shrink to fit content
     let (panel_width, _) = panel_window_size();
     let _ = window.set_size(tauri::LogicalSize::new(panel_width, 540.0));
 
@@ -752,6 +752,7 @@ fn should_emit_activity_card_refresh(prepare_event_id: Option<u64>) -> bool {
     prepare_event_id.is_some()
 }
 
+#[allow(dead_code)]
 fn should_show_activity_card_window(
     window_action: ActivityCardWatcherWindowAction,
     prepare_succeeded: bool,
@@ -1281,26 +1282,18 @@ async fn poll_activity_card_events(app: tauri::AppHandle) {
             };
             let _ = app_for_thread.run_on_main_thread(move || {
                 let mut prepare_result = "skipped".to_string();
-                let mut prepare_succeeded = false;
                 match window_action {
                     ActivityCardWatcherWindowAction::Prepare => {
                         match prepare_activity_card_window_for_app(&app_for_window_action) {
-                            Ok(()) => {
-                                prepare_result = "ok".to_string();
-                                prepare_succeeded = true;
-                            }
+                            Ok(()) => prepare_result = "ok".to_string(),
                             Err(error) => prepare_result = format!("error:{error}"),
                         }
                     }
                     ActivityCardWatcherWindowAction::None => {}
                 }
-                let mut show_result = "skipped".to_string();
-                if should_show_activity_card_window(window_action, prepare_succeeded) {
-                    match show_activity_card_window_for_app(&app_for_window_action) {
-                        Ok(()) => show_result = "ok".to_string(),
-                        Err(error) => show_result = format!("error:{error}"),
-                    }
-                }
+                // Removed explicit show_window call: frontend controls window visibility
+                // after receiving refresh event and preparing activity card data.
+                // Previously watcher would show empty window before frontend had activeCard ready.
                 let mut emit_local_result = "skipped".to_string();
                 if let Some(payload) = local_approval_payload.clone() {
                     emit_local_result = match app_for_window_action.emit_to(
@@ -1333,17 +1326,15 @@ async fn poll_activity_card_events(app: tauri::AppHandle) {
                     local_approval_payload.as_ref(),
                     Some(serde_json::json!({
                         "prepareResult": prepare_result.clone(),
-                        "showResult": show_result.clone(),
                         "emitLocalResult": emit_local_result.clone(),
                         "emitRefreshResult": emit_refresh_result.clone(),
                         "windowVisibleAfter": window_visible_after.clone()
                     })),
                 ));
                 append_activity_card_diagnostics_log(&format!(
-                    "[watcher/main-thread] action={:?} prepare={} show={} emitLocal={} emitRefresh={} windowVisibleAfter={} {}",
+                    "[watcher/main-thread] action={:?} prepare={} emitLocal={} emitRefresh={} windowVisibleAfter={} {}",
                     window_action,
                     prepare_result,
-                    show_result,
                     emit_local_result,
                     emit_refresh_result,
                     window_visible_after,

@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"/Users/song/Library/Application Support/com.hexdeck.app/kernel/intent-broker-0.3.1-local-20260422-2151/adapters/claude-code-plugin/bin/claude-code-broker.js\" hook session-start"
+            "command": "node \"/Users/song/projects/intent-broker/adapters/claude-code-plugin/bin/claude-code-broker.js\" hook session-start"
           }
         ]
       }
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"/Users/song/Library/Application Support/com.hexdeck.app/kernel/intent-broker-0.3.1-local-20260422-2151/adapters/claude-code-plugin/bin/claude-code-broker.js\" hook user-prompt-submit"
+            "command": "node \"/Users/song/projects/intent-broker/adapters/claude-code-plugin/bin/claude-code-broker.js\" hook user-prompt-submit"
           }
         ]
       }
@@ -39,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"/Users/song/Library/Application Support/com.hexdeck.app/kernel/intent-broker-0.3.1-local-20260422-2151/adapters/claude-code-plugin/bin/claude-code-broker.js\" hook permission-request",
+            "command": "node \"/Users/song/projects/intent-broker/adapters/claude-code-plugin/bin/claude-code-broker.js\" hook permission-request",
             "timeout": 86400
           }
         ]
@@ -50,7 +50,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"/Users/song/Library/Application Support/com.hexdeck.app/kernel/intent-broker-0.3.1-local-20260422-2151/adapters/claude-code-plugin/bin/claude-code-broker.js\" hook stop"
+            "command": "node \"/Users/song/projects/intent-broker/adapters/claude-code-plugin/bin/claude-code-broker.js\" hook stop"
           }
         ]
       }
@@ -61,7 +61,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"/Users/song/Library/Application Support/com.hexdeck.app/kernel/intent-broker-0.3.1-local-20260422-2151/adapters/claude-code-plugin/bin/claude-code-broker.js\" hook pre-tool-use"
+            "command": "node \"/Users/song/projects/intent-broker/adapters/claude-code-plugin/bin/claude-code-broker.js\" hook pre-tool-use",
+            "timeout": 120
           }
         ]
       }
