@@ -1931,6 +1931,9 @@ fn main() {
 
             setup_tray_icon(app.handle())?;
 
+            // Start background emitter for local approval change events
+            commands::broker::spawn_local_approval_emitter(app.handle().clone());
+
             if setup_creates_panel_window(preview.as_deref()) {
                 let _panel = ensure_panel_window(app.handle())?;
                 let _activity_card = ensure_activity_card_window(app.handle())?;

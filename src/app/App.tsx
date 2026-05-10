@@ -637,6 +637,7 @@ export function App() {
     let refreshInFlight = false;
     let refreshQueued = false;
     let disposeActivityCardRefresh: (() => void) | undefined;
+    let isFirstLoad = true;
 
     const refreshSnapshot = async () => {
       if (disposed) {
@@ -694,7 +695,8 @@ export function App() {
               }
             }
 
-            const seed = await client.loadServiceSeed();
+            // Skip local approval invoke on polls (received via Tauri event instead)
+            const seed = await client.loadServiceSeed({ skipLocalApprovals: !isFirstLoad });
             if (disposed) {
               return;
             }
@@ -731,6 +733,7 @@ export function App() {
             store.setSnapshot(nextSnapshot);
             setSnapshot(nextSnapshot);
             setParticipants(seed.participants);
+            isFirstLoad = false;
             setConnectionState('connected');
             setConnectionMessage(
               `${settings.brokerUrl === DEFAULT_BROKER_URL ? 'Local broker ready' : 'Broker ready'} · ${agentParticipants.length} agents · ${
@@ -769,6 +772,27 @@ export function App() {
     };
 
     void refreshSnapshot();
+
+    // Listen for local approval push events from Rust emitter
+    let disposeLocalApprovalPush: (() => void) | undefined;
+    import('@tauri-apps/api/event')
+      .then(async ({ listen }) => {
+        disposeLocalApprovalPush = await listen<BrokerApprovalItem[]>(
+          'local-approvals-changed',
+          (event) => {
+            const approvals = event.payload;
+            if (!Array.isArray(approvals)) return;
+
+            // Update snapshot approvals without full re-poll
+            setSnapshot((prev) => {
+              if (!prev) return prev;
+              return { ...prev, approvals };
+            });
+          }
+        );
+      })
+      .catch(() => undefined);
+
     if (isActivityCardWindow) {
       void import('@tauri-apps/api/event')
         .then(async ({ listen }) => {
@@ -820,6 +844,7 @@ export function App() {
       disposed = true;
       allowImmediateEmptyActivityCardSyncRef.current = false;
       disposeActivityCardRefresh?.();
+      disposeLocalApprovalPush?.();
       unsubscribe();
       disconnect();
       window.clearInterval(intervalId);

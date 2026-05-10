@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 use tar::Archive;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::time::{sleep, Duration};
 
 const REPLAY_PAGE_SIZE: usize = 100;
@@ -44,6 +44,8 @@ static BROKER_START_GUARD: LazyLock<Mutex<BrokerStartGuardState>> =
     LazyLock::new(|| Mutex::new(BrokerStartGuardState::default()));
 static METADATA_CACHE: LazyLock<Mutex<MetadataCache>> =
     LazyLock::new(|| Mutex::new(MetadataCache::default()));
+static LAST_EMITTED_APPROVAL_HASH: LazyLock<Mutex<u64>> =
+    LazyLock::new(|| Mutex::new(0));
 
 #[derive(Debug, Default)]
 struct BrokerStartGuardState {
@@ -1512,6 +1514,51 @@ fn load_local_host_approvals() -> Vec<LocalHostApprovalPrompt> {
         return Vec::new();
     };
     cache.poll()
+}
+
+/// Compute a cheap hash of the approval list for change detection.
+/// Hash is based on approval_id + count to avoid full comparison.
+fn compute_approval_hash(approvals: &[LocalHostApprovalPrompt]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    approvals.len().hash(&mut hasher);
+    for approval in approvals.iter().take(5) {
+        approval.approval_id.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Spawn a background task that polls for local approval changes and
+/// emits a Tauri event when data changes. Runs independently of
+/// the frontend's polling cycle.
+pub fn spawn_local_approval_emitter(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let Ok(mut cache) = METADATA_CACHE.lock() else { continue };
+            let approvals = cache.poll();
+
+            let hash = compute_approval_hash(&approvals);
+            let mut last_hash = match LAST_EMITTED_APPROVAL_HASH.lock() {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            if hash != *last_hash {
+                *last_hash = hash;
+                drop(last_hash);
+
+                // Serialize and emit
+                let approvals_json: Vec<Value> = approvals
+                    .iter()
+                    .map(local_host_approval_to_json)
+                    .collect();
+                let _ = app.emit("local-approvals-changed", &approvals_json);
+            }
+        }
+    });
 }
 
 /// Optimized poll using mtime/stat cache. Only reads file content when metadata changes.

@@ -329,11 +329,14 @@ export class BrokerClient {
     };
   }
 
-  async loadServiceSeed(): Promise<ProjectSeed> {
+  async loadServiceSeed(options?: { skipLocalApprovals?: boolean }): Promise<ProjectSeed> {
     if (isTauriEnvironment()) {
       const seed = normalizeProjectSeed(await invoke<ProjectSeed>('load_broker_service_seed', {
         brokerUrl: this.brokerUrl,
       }));
+      if (options?.skipLocalApprovals) {
+        return mergeLocalHostApprovalIntoSeed(seed, null);
+      }
       const localApproval = await invoke<BrokerApprovalItem | null>('load_latest_local_host_approval_item')
         .catch(() => null);
       return mergeLocalHostApprovalIntoSeed(seed, localApproval);
