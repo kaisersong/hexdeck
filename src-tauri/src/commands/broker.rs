@@ -13,6 +13,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 use tar::Archive;
 use tauri::{AppHandle, Manager};
 use tokio::time::{sleep, Duration};
@@ -41,10 +42,56 @@ static LAST_LOCAL_CODEX_APPROVAL_LOAD_DIAGNOSTIC: LazyLock<Mutex<Option<String>>
     LazyLock::new(|| Mutex::new(None));
 static BROKER_START_GUARD: LazyLock<Mutex<BrokerStartGuardState>> =
     LazyLock::new(|| Mutex::new(BrokerStartGuardState::default()));
+static METADATA_CACHE: LazyLock<Mutex<MetadataCache>> =
+    LazyLock::new(|| Mutex::new(MetadataCache::default()));
 
 #[derive(Debug, Default)]
 struct BrokerStartGuardState {
     in_progress: bool,
+}
+
+/// Metadata cache for broker polling optimization.
+/// Keyed by file path (not session_id) because:
+/// - Remove events give a path, not a JSON field
+/// - Multiple files can share a session_id
+/// - A single file can change session_ids
+/// See Codex adversarial review finding #7.
+struct MetadataCache {
+    by_path: HashMap<PathBuf, SessionCacheEntry>,
+    sqlite_generation: Option<SqliteGeneration>,
+    sqlite_entries: Option<Vec<PendingLocalCodexApprovalLogEntry>>,
+    last_merged: Option<(i64, Vec<LocalHostApprovalPrompt>)>,
+}
+
+impl Default for MetadataCache {
+    fn default() -> Self {
+        Self {
+            by_path: HashMap::new(),
+            sqlite_generation: None,
+            sqlite_entries: None,
+            last_merged: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SessionCacheEntry {
+    session_id: Option<String>,
+    status: Option<String>,
+    source: Option<String>,
+    updated_at: Option<String>,
+    runtime_mtime: SystemTime,
+    runtime_len: u64,
+    transcript_path: PathBuf,
+    transcript_mtime: Option<SystemTime>,
+    transcript_len: Option<u64>,
+    snapshot: Option<LocalCodexApprovalTranscriptSnapshot>,
+}
+
+#[derive(Debug)]
+struct SqliteGeneration {
+    wal_mtime: SystemTime,
+    max_id: i64,
 }
 
 fn try_acquire_broker_start_guard(state: &mut BrokerStartGuardState) -> bool {
@@ -1175,15 +1222,21 @@ fn is_supported_local_codex_runtime(runtime: &LocalCodexRuntimeState, now_ms: i6
         return false;
     }
 
+    let recent_cutoff_ms = now_ms.saturating_sub(LOCAL_CODEX_APPROVAL_MAX_AGE_MS);
+
     if runtime.status.as_deref() == Some("running") {
-        return true;
+        // Also require updatedAt to be recent. Stale "running" sessions
+        // (process dead, session timed out) should not enter the heavyweight
+        // transcript/SQLite path.
+        return parse_rfc3339_timestamp_ms(runtime.updated_at.as_deref())
+            .map(|updated_at_ms| updated_at_ms >= recent_cutoff_ms)
+            .unwrap_or(false);
     }
 
     if runtime.status.as_deref() != Some("idle") || runtime.source.as_deref() != Some("stop-hook") {
         return false;
     }
 
-    let recent_cutoff_ms = now_ms.saturating_sub(LOCAL_CODEX_APPROVAL_MAX_AGE_MS);
     parse_rfc3339_timestamp_ms(runtime.updated_at.as_deref())
         .map(|updated_at_ms| updated_at_ms >= recent_cutoff_ms)
         .unwrap_or(false)
@@ -1455,148 +1508,356 @@ fn build_local_host_approval_prompt_from_log(
 }
 
 fn load_local_host_approvals() -> Vec<LocalHostApprovalPrompt> {
-    let Some(runtime_dir) = home_dir().map(|home| home.join(".intent-broker").join("codex")) else {
+    let Ok(mut cache) = METADATA_CACHE.lock() else {
         return Vec::new();
     };
+    cache.poll()
+}
 
-    let Ok(entries) = fs::read_dir(runtime_dir) else {
-        return Vec::new();
-    };
-
-    let now_ms = Utc::now().timestamp_millis();
-    let mut approvals = Vec::new();
-    let mut diagnostics = Vec::new();
-    let recent_resolution_fingerprints =
-        recent_local_codex_resolution_fingerprints(Utc::now().timestamp_millis());
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
-            continue;
+/// Optimized poll using mtime/stat cache. Only reads file content when metadata changes.
+/// This is called from load_local_host_approvals via the global METADATA_CACHE.
+impl MetadataCache {
+    fn poll(&mut self) -> Vec<LocalHostApprovalPrompt> {
+        let Some(runtime_dir) = home_dir().map(|home| home.join(".intent-broker").join("codex"))
+        else {
+            return Vec::new();
         };
-        if !file_name.ends_with(".runtime.json") {
-            continue;
-        }
-        let diagnostic_label = format!("file={file_name}");
 
-        let content = match fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(error) => {
-                diagnostics.push(format!("{diagnostic_label} skip=read-error error={error}"));
+        let Ok(entries) = fs::read_dir(&runtime_dir) else {
+            return Vec::new();
+        };
+
+        let now_ms = Utc::now().timestamp_millis();
+        let mut diagnostics = Vec::new();
+        let recent_resolution_fingerprints =
+            recent_local_codex_resolution_fingerprints(now_ms);
+
+        // Collect current file paths to detect deletions
+        let mut current_paths: HashMap<PathBuf, String> = HashMap::new();
+
+        // Phase 1: stat-only scan of all runtime.json files
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|v| v.to_str()) else {
+                continue;
+            };
+            if !file_name.ends_with(".runtime.json") {
                 continue;
             }
-        };
-        let runtime: LocalCodexRuntimeState = match serde_json::from_str(&content) {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                diagnostics.push(format!("{diagnostic_label} skip=parse-error error={error}"));
-                continue;
-            }
-        };
-        if !is_supported_local_codex_runtime(&runtime, now_ms) {
-            diagnostics.push(format!(
-                "{diagnostic_label} skip=unsupported status={} terminalApp={} hasSessionId={} hasTerminalSessionId={}",
-                runtime.status.as_deref().unwrap_or("-"),
-                runtime.terminal_app.as_deref().unwrap_or("-"),
-                local_codex_runtime_has_session_id(&runtime),
-                runtime
-                    .terminal_session_id
+
+            let participant_id = file_name.trim_end_matches(".runtime.json").to_string();
+            current_paths.insert(path.clone(), participant_id.clone());
+
+            // Stat the file — no content read
+            let metadata = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    diagnostics.push(format!("file={file_name} skip=stat-error error={e}"));
+                    self.by_path.remove(&path);
+                    continue;
+                }
+            };
+            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let len = metadata.len();
+
+            // Check if content changed since last cache
+            let needs_parse = self.by_path.get(&path).map_or(true, |cached| {
+                cached.runtime_mtime != mtime || cached.runtime_len != len
+            });
+
+            let cache_entry = if needs_parse {
+                // Read and parse only when metadata changed
+                let content = match fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        diagnostics.push(format!("file={file_name} skip=read-error error={e}"));
+                        // Keep last known good entry, retry next poll
+                        continue;
+                    }
+                };
+                let runtime: LocalCodexRuntimeState = match serde_json::from_str(&content) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        diagnostics.push(format!("file={file_name} skip=parse-error error={e}"));
+                        // Keep last known good entry, retry next poll
+                        continue;
+                    }
+                };
+
+                let participant_id = file_name.trim_end_matches(".runtime.json").to_string();
+                let transcript_path = runtime
+                    .session_id
                     .as_deref()
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(false)
-            ));
-            continue;
-        }
+                    .and_then(|session_id| {
+                        resolve_codex_transcript_path(
+                            &participant_id,
+                            session_id,
+                            runtime.updated_at.as_deref(),
+                        )
+                    })
+                    .unwrap_or_default();
 
-        let participant_id = file_name.trim_end_matches(".runtime.json").to_string();
-        let Some(session_id) = runtime.session_id.as_deref() else {
-            diagnostics.push(format!("{diagnostic_label} skip=missing-session-id"));
-            continue;
-        };
-        let transcript_path =
-            resolve_codex_transcript_path(&participant_id, session_id, runtime.updated_at.as_deref())
-                .unwrap_or_default();
-        let tail = if transcript_path.as_os_str().is_empty() {
-            String::new()
-        } else {
-            match read_text_tail(&transcript_path, LOCAL_CODEX_TRANSCRIPT_TAIL_BYTES) {
-                Ok(tail) => tail,
-                Err(_) => String::new(),
+                // Check if transcript needs re-read
+                let transcript_meta = if !transcript_path.as_os_str().is_empty() {
+                    match fs::metadata(&transcript_path) {
+                        Ok(tm) => Some((
+                            tm.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                            tm.len(),
+                        )),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+
+                let existing = self.by_path.get(&path);
+                let transcript_changed = existing.map_or(true, |cached| {
+                    cached.transcript_path != transcript_path
+                        || cached.transcript_mtime != transcript_meta.as_ref().map(|(m, _)| *m)
+                        || cached.transcript_len != transcript_meta.as_ref().map(|(_, l)| *l)
+                });
+
+                let snapshot = if transcript_changed && transcript_meta.is_some() {
+                    let tail = read_text_tail(&transcript_path, LOCAL_CODEX_TRANSCRIPT_TAIL_BYTES)
+                        .unwrap_or_default();
+                    Some(collect_local_codex_approval_transcript_snapshot(
+                        &tail,
+                        runtime.project_path.as_deref(),
+                    ))
+                } else if let Some(existing) = existing {
+                    existing.snapshot.clone()
+                } else {
+                    None
+                };
+
+                Some(SessionCacheEntry {
+                    session_id: runtime.session_id.clone(),
+                    status: runtime.status.clone(),
+                    source: runtime.source.clone(),
+                    updated_at: runtime.updated_at.clone(),
+                    runtime_mtime: mtime,
+                    runtime_len: len,
+                    transcript_path,
+                    transcript_mtime: transcript_meta.as_ref().map(|(m, _)| *m),
+                    transcript_len: transcript_meta.as_ref().map(|(_, l)| *l),
+                    snapshot,
+                })
+            } else {
+                // Metadata unchanged — use cached entry
+                self.by_path.get(&path).map(|e| e.clone())
+            };
+
+            if let Some(entry) = cache_entry {
+                self.by_path.insert(path, entry);
             }
-        };
-        let transcript_snapshot = collect_local_codex_approval_transcript_snapshot(
-            &tail,
-            runtime.project_path.as_deref(),
-        );
-        let log_entries = load_recent_local_codex_approval_log_entries(session_id);
-        let merged_log_approvals = merge_log_backed_local_host_approvals(
-            &participant_id,
-            &runtime,
-            &transcript_path,
-            &log_entries,
-            &transcript_snapshot.pending,
-            &transcript_snapshot.resolved,
-            &recent_resolution_fingerprints,
-        );
-        diagnostics.push(format!(
-            "{diagnostic_label} session={} updatedAt={} transcript={} pending={} resolved={} logEntries={} merged={} projectPath={}",
-            session_id,
-            runtime.updated_at.as_deref().unwrap_or("-"),
-            truncate_local_codex_diagnostic(&transcript_path.to_string_lossy(), 120),
-            transcript_snapshot.pending.len(),
-            transcript_snapshot.resolved.len(),
-            log_entries.len(),
-            merged_log_approvals.len(),
-            truncate_local_codex_diagnostic(runtime.project_path.as_deref().unwrap_or("-"), 80)
-        ));
-
-        for call in transcript_snapshot.pending.iter().cloned() {
-            approvals.push(build_local_host_approval_prompt(
-                &participant_id,
-                &runtime,
-                transcript_path.clone(),
-                call,
-            ));
         }
 
-        approvals.extend(merged_log_approvals);
+        // Remove deleted files from cache
+        self.by_path.retain(|path, _| current_paths.contains_key(path));
+
+        // Phase 2: Build approvals from cache
+        let mut approvals = Vec::new();
+        let mut all_candidate_thread_ids: Vec<(String, String)> = Vec::new();
+
+        for (path, entry) in &self.by_path {
+            let file_name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
+            let participant_id = file_name.trim_end_matches(".runtime.json").to_string();
+
+            let runtime = LocalCodexRuntimeState {
+                source: entry.source.clone(),
+                status: entry.status.clone(),
+                session_id: entry.session_id.clone(),
+                terminal_app: None,
+                project_path: None,
+                terminal_session_id: None,
+                updated_at: entry.updated_at.clone(),
+            };
+
+            if !is_supported_local_codex_runtime(&runtime, now_ms) {
+                continue;
+            }
+
+            let Some(session_id) = &entry.session_id else {
+                continue;
+            };
+
+            all_candidate_thread_ids.push((participant_id.clone(), session_id.clone()));
+
+            if let Some(snapshot) = &entry.snapshot {
+                for call in &snapshot.pending {
+                    approvals.push(build_local_host_approval_prompt(
+                        &participant_id,
+                        &runtime,
+                        entry.transcript_path.clone(),
+                        call.clone(),
+                    ));
+                }
+            }
+        }
+
+        // Phase 3: Single SQLite connection for all candidate thread IDs
+        if !all_candidate_thread_ids.is_empty() {
+            let log_entries = load_log_entries_for_sessions(
+                &all_candidate_thread_ids.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>(),
+                now_ms,
+            );
+
+            for (participant_id, _session_id) in &all_candidate_thread_ids {
+                let path_key = PathBuf::from(format!(
+                    "{}/{}.runtime.json",
+                    runtime_dir.to_string_lossy(),
+                    participant_id
+                ));
+                if let Some(entry) = self.by_path.get(&path_key) {
+                    let runtime = LocalCodexRuntimeState {
+                        source: entry.source.clone(),
+                        status: entry.status.clone(),
+                        session_id: entry.session_id.clone(),
+                        terminal_app: None,
+                        project_path: None,
+                        terminal_session_id: None,
+                        updated_at: entry.updated_at.clone(),
+                    };
+                    if let Some(snapshot) = &entry.snapshot {
+                        let recent_resolution_fingerprints =
+                            recent_local_codex_resolution_fingerprints(now_ms);
+                        let merged = merge_log_backed_local_host_approvals(
+                            participant_id,
+                            &runtime,
+                            &entry.transcript_path,
+                            &log_entries,
+                            &snapshot.pending,
+                            &snapshot.resolved,
+                            &recent_resolution_fingerprints,
+                        );
+                        approvals.extend(merged);
+                    }
+                }
+            }
+        }
+
+        // Phase 4: Time-based expiry (reapplied every poll)
+        let approvals =
+            suppress_recently_resolved_local_host_approvals(approvals, &recent_resolution_fingerprints);
+        let approvals = filter_and_sort_local_host_approvals(approvals, now_ms);
+
+        // Diagnostics
+        let top_approval = approvals
+            .first()
+            .map(|approval| {
+                format!(
+                    "{} participant={} command={}",
+                    approval.approval_id,
+                    approval.participant_id,
+                    truncate_local_codex_diagnostic(&approval.command_line, 100)
+                )
+            })
+            .unwrap_or_else(|| "none".to_string());
+        let summary_event = approvals.first().map(|approval| {
+            build_local_codex_approval_event(
+                "approval_detected",
+                Some(approval),
+                None,
+                Some(json!({
+                    "approvalCount": approvals.len(),
+                    "diagnosticSource": "local_approval_scan",
+                    "cacheEntries": self.by_path.len()
+                })),
+            )
+        });
+        maybe_log_local_codex_approval_diagnostic(
+            format!(
+                "[broker/local-approvals] total={} top={} cache={} {}",
+                approvals.len(),
+                top_approval,
+                self.by_path.len(),
+                diagnostics.join(" | ")
+            ),
+            summary_event,
+        );
+
+        approvals
+    }
+}
+
+/// Load log entries for multiple session thread IDs using a single SQLite connection.
+fn load_log_entries_for_sessions(
+    thread_ids: &[&str],
+    _now_ms: i64,
+) -> Vec<PendingLocalCodexApprovalLogEntry> {
+    let Some(log_path) = home_dir().map(|home| home.join(".codex").join("logs_2.sqlite")) else {
+        return Vec::new();
+    };
+    let connection = match Connection::open_with_flags(
+        &log_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(connection) => connection,
+        Err(_) => return Vec::new(),
+    };
+
+    let min_ts = Utc::now()
+        .timestamp()
+        .saturating_sub(LOCAL_CODEX_LOG_LOOKBACK_SECS);
+
+    if thread_ids.is_empty() {
+        return Vec::new();
     }
 
-    let approvals =
-        suppress_recently_resolved_local_host_approvals(approvals, &recent_resolution_fingerprints);
-    let approvals = filter_and_sort_local_host_approvals(approvals, now_ms);
-    let top_approval = approvals
-        .first()
-        .map(|approval| {
-            format!(
-                "{} participant={} command={}",
-                approval.approval_id,
-                approval.participant_id,
-                truncate_local_codex_diagnostic(&approval.command_line, 100)
-            )
-        })
-        .unwrap_or_else(|| "none".to_string());
-    let summary_event = approvals.first().map(|approval| {
-        build_local_codex_approval_event(
-            "approval_detected",
-            Some(approval),
-            None,
-            Some(json!({
-                "approvalCount": approvals.len(),
-                "diagnosticSource": "local_approval_scan"
-            })),
-        )
-    });
-    maybe_log_local_codex_approval_diagnostic(
-        format!(
-            "[broker/local-approvals] total={} top={} {}",
-            approvals.len(),
-            top_approval,
-            diagnostics.join(" | ")
-        ),
-        summary_event,
+    // Build IN clause with parameterized query
+    let placeholders = thread_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    let min_ts_param_idx = thread_ids.len() + 1;
+
+    let query = format!(
+        "
+        SELECT id, ts, feedback_log_body
+        FROM logs
+        WHERE thread_id IN ({})
+          AND feedback_log_body IS NOT NULL
+          AND ts >= ?{}
+          AND (
+            feedback_log_body LIKE '%ToolCall: exec_command %'
+            OR feedback_log_body LIKE '%ToolCall: shell_command %'
+          )
+        ORDER BY id DESC
+        LIMIT 256
+        ",
+        placeholders, min_ts_param_idx
     );
-    approvals
+
+    let mut statement = match connection.prepare(&query) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut params_vec: Vec<&(dyn rusqlite::ToSql)> = Vec::new();
+    for tid in thread_ids {
+        params_vec.push(tid);
+    }
+    let min_ts_box: Box<dyn rusqlite::ToSql> = Box::new(min_ts);
+    params_vec.push(min_ts_box.as_ref());
+
+    let rows = match statement.query_map(params_vec.as_slice(), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+
+    rows.flatten()
+        .filter_map(|(log_id, ts_secs, body)| {
+            parse_local_codex_approval_log_entry(log_id, ts_secs, "unknown", &body)
+        })
+        .collect()
 }
 
 fn normalize_approval_text(value: Option<&str>) -> Option<String> {
@@ -1635,60 +1896,6 @@ fn local_codex_call_fingerprint(
     workdir: &str,
 ) -> Option<String> {
     approval_fingerprint(Some(participant_id), Some(command), Some(workdir))
-}
-
-fn load_recent_local_codex_approval_log_entries(
-    session_id: &str,
-) -> Vec<PendingLocalCodexApprovalLogEntry> {
-    let Some(log_path) = home_dir().map(|home| home.join(".codex").join("logs_2.sqlite")) else {
-        return Vec::new();
-    };
-    let connection = match Connection::open_with_flags(
-        &log_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) {
-        Ok(connection) => connection,
-        Err(_) => return Vec::new(),
-    };
-
-    let min_ts = Utc::now()
-        .timestamp()
-        .saturating_sub(LOCAL_CODEX_LOG_LOOKBACK_SECS);
-    let mut statement = match connection.prepare(
-        "
-        SELECT id, ts, feedback_log_body
-        FROM logs
-        WHERE thread_id = ?1
-          AND feedback_log_body IS NOT NULL
-          AND ts >= ?2
-          AND (
-            feedback_log_body LIKE '%ToolCall: exec_command %'
-            OR feedback_log_body LIKE '%ToolCall: shell_command %'
-          )
-        ORDER BY id DESC
-        LIMIT 64
-        ",
-    ) {
-        Ok(statement) => statement,
-        Err(_) => return Vec::new(),
-    };
-
-    let rows = match statement.query_map(params![session_id, min_ts], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    }) {
-        Ok(rows) => rows,
-        Err(_) => return Vec::new(),
-    };
-
-    rows.flatten()
-        .filter_map(|(log_id, ts_secs, body)| {
-            parse_local_codex_approval_log_entry(log_id, ts_secs, session_id, &body)
-        })
-        .collect()
 }
 
 fn recent_local_codex_resolution_fingerprints(now_ms: i64) -> HashSet<String> {
