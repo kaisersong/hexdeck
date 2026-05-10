@@ -1912,6 +1912,7 @@ fn main() {
             commands::load_broker_project_seed,
             commands::load_broker_pending_approvals,
             commands::load_latest_local_host_approval_item,
+            commands::check_local_approval_version,
             commands::register_broker_ui_participant,
             commands::respond_to_broker_approval,
             commands::respond_to_local_host_approval,

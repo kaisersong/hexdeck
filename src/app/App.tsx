@@ -622,6 +622,14 @@ export function App() {
     await syncActivityCardWindowVisibility(nextActiveCard, windowMode);
   };
 
+  // Helper: apply local approval updates to snapshot without full re-poll
+  const applyLocalApprovals = (approvals: BrokerApprovalItem[]) => {
+    setSnapshot((prev) => {
+      if (!prev) return prev;
+      return { ...prev, approvals };
+    });
+  };
+
   useEffect(() => {
     if (isActivityCardPreviewWindow) {
       return;
@@ -782,16 +790,33 @@ export function App() {
           (event) => {
             const approvals = event.payload;
             if (!Array.isArray(approvals)) return;
-
-            // Update snapshot approvals without full re-poll
-            setSnapshot((prev) => {
-              if (!prev) return prev;
-              return { ...prev, approvals };
-            });
+            applyLocalApprovals(approvals);
           }
         );
       })
       .catch(() => undefined);
+
+    // Fallback: poll version check every 3s — if hash changed and no event received,
+    // fetch full data. This covers emitter thread death scenarios.
+    let lastKnownApprovalHash = 0;
+    const fallbackCheckInterval = window.setInterval(async () => {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const hash = await invoke<number>('check_local_approval_version');
+        if (hash !== 0 && hash !== lastKnownApprovalHash) {
+          lastKnownApprovalHash = hash;
+          // Hash changed but no event received — fetch full data
+          const approvals = await invoke<BrokerApprovalItem[] | null>(
+            'load_latest_local_host_approval_item'
+          ).catch(() => null);
+          if (approvals && Array.isArray(approvals)) {
+            applyLocalApprovals(approvals);
+          }
+        }
+      } catch {
+        // Tauri not available — fallback poll unavailable
+      }
+    }, 3000);
 
     if (isActivityCardWindow) {
       void import('@tauri-apps/api/event')
@@ -845,6 +870,7 @@ export function App() {
       allowImmediateEmptyActivityCardSyncRef.current = false;
       disposeActivityCardRefresh?.();
       disposeLocalApprovalPush?.();
+      window.clearInterval(fallbackCheckInterval);
       unsubscribe();
       disconnect();
       window.clearInterval(intervalId);

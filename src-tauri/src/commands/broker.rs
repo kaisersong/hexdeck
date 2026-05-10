@@ -1532,25 +1532,50 @@ fn compute_approval_hash(approvals: &[LocalHostApprovalPrompt]) -> u64 {
 /// Spawn a background task that polls for local approval changes and
 /// emits a Tauri event when data changes. Runs independently of
 /// the frontend's polling cycle.
+///
+/// Resilience guarantees:
+/// - Mutex poisoning: replaces poisoned lock with a fresh one
+/// - Poll errors: logged, emitter continues on next tick
+/// - Panic recovery: loop is wrapped in catch_unwind, restarts on panic
 pub fn spawn_local_approval_emitter(app: tauri::AppHandle) {
-    tauri::async_runtime::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+    use std::panic::AssertUnwindSafe;
+
+    fn run_emitter_loop(app: &tauri::AppHandle) {
         loop {
-            interval.tick().await;
-            let Ok(mut cache) = METADATA_CACHE.lock() else { continue };
-            let approvals = cache.poll();
+            std::thread::sleep(Duration::from_secs(1));
+
+            // Recover from poisoned Mutex
+            let poll_result = loop {
+                match METADATA_CACHE.lock() {
+                    Ok(mut cache) => break Some(cache.poll()),
+                    Err(poisoned) => {
+                        // Mutex was poisoned by a previous panic — recover the guard
+                        eprintln!("[broker/emitter] METADATA_CACHE poisoned, recovering");
+                        let mut cache = poisoned.into_inner();
+                        break Some(cache.poll());
+                    }
+                }
+            };
+
+            let Some(approvals) = poll_result else { continue };
 
             let hash = compute_approval_hash(&approvals);
-            let mut last_hash = match LAST_EMITTED_APPROVAL_HASH.lock() {
-                Ok(h) => h,
-                Err(_) => continue,
+
+            // Recover from poisoned last_hash Mutex
+            let mut last_hash = loop {
+                match LAST_EMITTED_APPROVAL_HASH.lock() {
+                    Ok(h) => break h,
+                    Err(poisoned) => {
+                        eprintln!("[broker/emitter] LAST_EMITTED_APPROVAL_HASH poisoned, recovering");
+                        break poisoned.into_inner();
+                    }
+                }
             };
 
             if hash != *last_hash {
                 *last_hash = hash;
                 drop(last_hash);
 
-                // Serialize and emit
                 let approvals_json: Vec<Value> = approvals
                     .iter()
                     .map(local_host_approval_to_json)
@@ -1558,7 +1583,25 @@ pub fn spawn_local_approval_emitter(app: tauri::AppHandle) {
                 let _ = app.emit("local-approvals-changed", &approvals_json);
             }
         }
-    });
+    }
+
+    std::thread::Builder::new()
+        .name("hexdeck-approval-emitter".to_string())
+        .spawn(move || {
+            let app_clone = app.clone();
+            loop {
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    run_emitter_loop(&app);
+                }));
+                if result.is_err() {
+                    eprintln!("[broker/emitter] panic caught, restarting after 5s cooldown");
+                    std::thread::sleep(Duration::from_secs(5));
+                } else {
+                    break; // unreachable
+                }
+            }
+        })
+        .expect("failed to spawn approval emitter thread");
 }
 
 /// Optimized poll using mtime/stat cache. Only reads file content when metadata changes.
@@ -2284,6 +2327,15 @@ pub(crate) fn latest_local_host_approval_item_value() -> Option<Value> {
 #[tauri::command]
 pub fn load_latest_local_host_approval_item() -> Result<Option<Value>, String> {
     Ok(latest_local_host_approval_item_value())
+}
+
+/// Cheap version check — only computes hash, no file I/O.
+/// Used by frontend as fallback when event push is unavailable.
+#[tauri::command]
+pub fn check_local_approval_version() -> u64 {
+    let Ok(mut cache) = METADATA_CACHE.lock() else { return 0 };
+    let approvals = cache.poll();
+    compute_approval_hash(&approvals)
 }
 
 #[cfg(target_os = "windows")]
