@@ -10,4 +10,5 @@ docs
 .tmp-intent-broker/
 .xiaok/
 .superpowers/
+.worktrees/
 test-approval-detection.sh
