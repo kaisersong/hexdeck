@@ -3,4 +3,5 @@ dist
 src-tauri/target
 src-tauri/gen
 .tauri
-docs
+docs/*
+!docs/activity-card-live-debug-runbook.md

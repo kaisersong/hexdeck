@@ -1309,7 +1309,7 @@ describe('activity-card window routing', () => {
       expect(screen.getByRole('button', { name: 'Yes' })).toBeInTheDocument();
     });
 
-    expect(screen.getByText('Deploy approval needed')).toBeInTheDocument();
+    expect(screen.getByText('@codex4 · Deploy approval needed')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Open Main Panel' })).not.toBeInTheDocument();
     expect(invokeMock).not.toHaveBeenCalledWith('show_activity_card_window');
     expect(invokeMock).not.toHaveBeenCalledWith('hide_activity_card_window');
@@ -1486,7 +1486,7 @@ describe('activity-card window routing', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText('Project-scoped approval')).toBeInTheDocument();
+      expect(screen.getByText('@codex4 · Project-scoped approval')).toBeInTheDocument();
     });
 
     expect(screen.queryByText('Old service-wide approval')).not.toBeInTheDocument();
@@ -1613,6 +1613,85 @@ describe('activity-card window routing', () => {
     await waitFor(() => {
       expect(brokerClientInstance.loadProjectSeed).toHaveBeenCalledWith('hexdeck');
     });
+  });
+
+  it('boots the floating activity-card window from real structured replay without preview shortcuts', async () => {
+    brokerClientInstance = {
+      loadServiceSeed: vi.fn().mockResolvedValue({
+        health: { ok: true },
+        participants: [
+          {
+            participantId: 'claude.main',
+            alias: 'claude7',
+            kind: 'agent',
+            tool: 'Claude Code',
+            metadata: {
+              terminalApp: 'Ghostty',
+              terminalSessionID: 'ghostty-7',
+              projectPath: '/workspace/hexdeck',
+            },
+            context: { projectName: 'HexDeck' },
+          },
+        ],
+        workStates: [],
+        events: [
+          {
+            id: 700,
+            type: 'ask_clarification',
+            taskId: 'task-question-1',
+            threadId: 'thread-question-1',
+            payload: {
+              participantId: 'claude.main',
+              body: {
+                summary: '删除文件',
+                prompt: '是否确认永久删除此文件？',
+                selectionMode: 'single-select',
+                options: [
+                  { value: 'yes', label: '确认删除' },
+                  { value: 'no', label: '取消' },
+                ],
+              },
+            },
+          },
+          {
+            id: 701,
+            type: 'report_progress',
+            taskId: 'task-complete-1',
+            threadId: 'thread-complete-1',
+            payload: {
+              participantId: 'claude.main',
+              stage: 'completed',
+              body: { summary: 'Claude completed the task' },
+            },
+          },
+        ],
+        approvals: [
+          {
+            approvalId: 'approval-1',
+            taskId: 'task-approval-1',
+            summary: 'Claude wants to run Bash.',
+            decision: 'pending',
+          },
+        ],
+      }),
+      loadProjectSeed: vi.fn().mockResolvedValue(makeSeed()),
+      subscribe: vi.fn(() => () => undefined),
+      connectRealtime: vi.fn(() => () => undefined),
+      respondToApproval: vi.fn().mockResolvedValue(undefined),
+      answerClarification: vi.fn().mockResolvedValue(undefined),
+    };
+    brokerClientConstructorMock.mockImplementation(() => brokerClientInstance as never);
+
+    const { App } = await import('../../../src/app/App');
+    window.history.pushState({}, '', '/?view=activity-card');
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('@claude7 · Claude wants to run Bash.')).toBeInTheDocument();
+    });
+    expect(screen.queryByText('Claude completed the task')).not.toBeInTheDocument();
+    expect(screen.queryByText('是否确认永久删除此文件？')).not.toBeInTheDocument();
   });
 
   it('uses the activity-card project query override when running live debug', async () => {

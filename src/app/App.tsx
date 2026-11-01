@@ -129,6 +129,15 @@ function derivePreferredProject(participants: BrokerParticipant[], fallback: str
     ?.context?.projectName?.trim() ?? '';
 }
 
+function listVisibleAgentProjects(participants: BrokerParticipant[]): string[] {
+  return Array.from(new Set(
+    participants
+      .filter(isAgentParticipant)
+      .map((participant) => participant.context?.projectName?.trim())
+      .filter((projectName): projectName is string => Boolean(projectName))
+  ));
+}
+
 function activityCardPriorityRank(card: ActivityCardProjection): number {
   switch (card.priority) {
     case 'critical':
@@ -199,7 +208,21 @@ async function loadActivityCardSeed(
   }
 
   try {
-    return await client.loadProjectSeed(preferredProject);
+    const projectSeed = await client.loadProjectSeed(preferredProject);
+    if (buildActivityCardsFromSeed(projectSeed).length > 0) {
+      return projectSeed;
+    }
+
+    const visibleProjects = listVisibleAgentProjects(serviceSeed.participants);
+    if (
+      visibleProjects.length === 1
+      && visibleProjects[0]?.localeCompare(preferredProject, undefined, { sensitivity: 'accent' }) === 0
+      && buildActivityCardsFromSeed(serviceSeed).length > 0
+    ) {
+      return serviceSeed;
+    }
+
+    return projectSeed;
   } catch {
     return serviceSeed;
   }

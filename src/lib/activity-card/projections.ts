@@ -130,6 +130,14 @@ function buildParticipantJumpTarget(
   });
 }
 
+function readStructuredBody(
+  payload: Record<string, unknown>
+): Record<string, unknown> | null {
+  return payload.body && typeof payload.body === 'object' && !Array.isArray(payload.body)
+    ? payload.body as Record<string, unknown>
+    : null;
+}
+
 function isSingleSelectQuestionPayload(payload: Record<string, unknown>): payload is Record<string, unknown> & {
   selectionMode: 'single-select';
   options: Array<Record<string, unknown>>;
@@ -234,6 +242,14 @@ function buildApprovalActions(payload: Record<string, unknown> | null | undefine
 
 export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProjection[] {
   const participantsById = new Map(seed.participants.map((participant) => [participant.participantId, participant]));
+  const approvalParticipantIdsByTaskId = new Map(
+    seed.workStates
+      .filter((workState) => typeof workState.taskId === 'string' && typeof workState.participantId === 'string')
+      .map((workState) => [workState.taskId as string, workState.participantId as string])
+  );
+  const agentParticipantIds = seed.participants
+    .filter((participant) => participant.kind !== 'human' && participant.kind !== 'adapter')
+    .map((participant) => participant.participantId);
   const approvalCards: ActivityCardApprovalProjection[] = [];
   const questionCards: ActivityCardQuestionProjection[] = [];
   const completionCards: ActivityCardCompletionProjection[] = [];
@@ -245,6 +261,9 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
       continue;
     }
 
+    const participantId = approvalParticipantIdsByTaskId.get(approval.taskId)
+      ?? (agentParticipantIds.length === 1 ? agentParticipantIds[0] : undefined);
+
     approvalCardsById.set(approval.approvalId, {
       cardId: `approval:${approval.approvalId}`,
       kind: 'approval',
@@ -255,6 +274,9 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
       taskId: approval.taskId,
       decision: approval.decision ?? 'pending',
       actions: DEFAULT_APPROVAL_ACTIONS,
+      participantId,
+      ...buildParticipantLabels(participantId, participantsById),
+      jumpTarget: participantId ? buildParticipantJumpTarget(participantId, participantsById) : null,
     } satisfies ActivityCardApprovalProjection);
   }
 
@@ -268,9 +290,7 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
       const approvalId = typeof payload.approvalId === 'string' ? payload.approvalId : null;
       const taskId = typeof event.taskId === 'string' ? event.taskId : null;
       if (approvalId && taskId && !resolvedApprovalIds.has(approvalId) && !approvalCardsById.has(approvalId)) {
-        const body = payload.body && typeof payload.body === 'object' && !Array.isArray(payload.body)
-          ? payload.body as Record<string, unknown>
-          : null;
+        const body = readStructuredBody(payload);
         const summary = String(body?.summary ?? payload.summary ?? 'Approval requested');
         approvalCardsById.set(approvalId, {
           cardId: `approval:${approvalId}`,
@@ -298,10 +318,13 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
       }
     }
 
-    if (event.type === 'ask_clarification' && isSingleSelectQuestionPayload(payload)) {
+    const body = readStructuredBody(payload);
+    const questionPayload = body ?? payload;
+
+    if (event.type === 'ask_clarification' && isSingleSelectQuestionPayload(questionPayload)) {
       const questionId = `question:${event.id}`;
-      const summary = String(payload.summary ?? payload.prompt ?? 'Clarification requested');
-      const prompt = String(payload.prompt ?? payload.summary ?? 'Clarification requested');
+      const summary = String(questionPayload.summary ?? questionPayload.prompt ?? 'Clarification requested');
+      const prompt = String(questionPayload.prompt ?? questionPayload.summary ?? 'Clarification requested');
 
       questionCards.push({
         cardId: questionId,
@@ -311,7 +334,7 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
         summary,
         prompt,
         selectionMode: 'single-select',
-        options: toQuestionOptions(payload.options),
+        options: toQuestionOptions(questionPayload.options),
         participantId,
         ...participantLabels,
         jumpTarget,
@@ -328,7 +351,7 @@ export function buildActivityCardsFromSeed(seed: ProjectSeed): ActivityCardProje
         cardId: `completion:${event.id}`,
         kind: 'completion',
         priority: 'ambient',
-        summary: String(payload.summary ?? payload.message ?? 'Completed'),
+        summary: String(body?.summary ?? payload.summary ?? payload.message ?? 'Completed'),
         stage: 'completed',
         participantId,
         ...participantLabels,

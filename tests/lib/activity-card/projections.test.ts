@@ -62,12 +62,18 @@ describe('buildActivityCardsFromSeed', () => {
       approvalId: 'approval-1',
       actionMode: 'action',
       cardId: 'approval:approval-1',
+      participantId: 'agent-1',
+      actorLabel: '@codex4',
+      projectLabel: 'HexDeck',
+      toolLabel: 'Claude Code',
+      terminalLabel: 'Ghostty',
       actions: [
         { label: 'Yes', decisionMode: 'yes' },
         { label: 'Always', decisionMode: 'always' },
         { label: 'No', decisionMode: 'no' },
       ],
     });
+    expect(cards[0].jumpTarget?.participantId).toBe('agent-1');
     const questionCard = cards[1];
     if (questionCard.kind !== 'question') {
       throw new Error(`expected question card, got ${questionCard.kind}`);
@@ -250,6 +256,67 @@ describe('buildActivityCardsFromSeed', () => {
       toolLabel: 'Claude Code',
       terminalLabel: 'Ghostty',
     }));
+  });
+
+  it('maps only the three designed structured replay shapes into approval, question, and completion cards', () => {
+    const cards = buildActivityCardsFromSeed({
+      health: { ok: true },
+      participants: [
+        {
+          participantId: 'claude-1',
+          alias: 'claude7',
+          kind: 'agent',
+          tool: 'Claude Code',
+          metadata: { terminalApp: 'Ghostty', projectPath: '/workspace/hexdeck' },
+          context: { projectName: 'HexDeck' },
+        },
+      ],
+      workStates: [],
+      events: [
+        {
+          id: 500,
+          type: 'ask_clarification',
+          taskId: 'task-question-1',
+          threadId: 'thread-question-1',
+          payload: {
+            participantId: 'claude-1',
+            body: {
+              summary: '删除文件',
+              prompt: '是否确认永久删除此文件？',
+              selectionMode: 'single-select',
+              options: [
+                { value: 'yes', label: '确认删除' },
+                { value: 'no', label: '取消' },
+              ],
+            },
+          },
+        },
+        {
+          id: 501,
+          type: 'report_progress',
+          taskId: 'task-complete-1',
+          threadId: 'thread-complete-1',
+          payload: {
+            participantId: 'claude-1',
+            stage: 'completed',
+            body: { summary: 'Claude completed the task' },
+          },
+        },
+      ],
+      approvals: [
+        {
+          approvalId: 'approval-1',
+          taskId: 'task-approval-1',
+          summary: 'Claude wants to run Bash.',
+          decision: 'pending',
+        },
+      ],
+    });
+
+    expect(cards.map((card) => card.kind)).toEqual(['approval', 'question', 'completion']);
+    expect(cards[0]).toMatchObject({ kind: 'approval', approvalId: 'approval-1' });
+    expect(cards[1]).toMatchObject({ kind: 'question', summary: '删除文件', prompt: '是否确认永久删除此文件？' });
+    expect(cards[2]).toMatchObject({ kind: 'completion', summary: 'Claude completed the task', stage: 'completed' });
   });
 
   it('uses approval action labels provided by the agent payload', () => {
